@@ -124,6 +124,53 @@ class PipelineTests(unittest.TestCase):
         shutil.rmtree(output_path.parent, ignore_errors=True)
         shutil.rmtree(cache_dir, ignore_errors=True)
 
+    def test_candidate_scoring_writes_lexicon_score_column(self) -> None:
+        output_path = Path("tests") / "tmp_outputs" / "scores_lex.csv"
+        diagnostics_path = Path("tests") / "tmp_outputs" / "diagnostics_scores_lex.json"
+        cache_dir = Path("tests") / "tmp_cache_pipeline_scores_lex"
+        lexicon_path = Path("tests") / "tmp_outputs" / "lexicon.txt"
+
+        if output_path.parent.exists():
+            shutil.rmtree(output_path.parent, ignore_errors=True)
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        lexicon_path.write_text("ALPHA 10\nBETA 1\n", encoding="utf-8")
+
+        mocked_seed = SimpleNamespace(
+            diagnostics={
+                "candidates": [
+                    {"title": "Alpha topic", "depth": 1, "links_back_to_seed": True},
+                    {"title": "Beta topic", "depth": 1, "links_back_to_seed": True},
+                ],
+                "errors": [],
+            },
+            diagnostics_path=diagnostics_path,
+        )
+
+        def fake_extract(_self, title, intro_only=True):  # noqa: ARG001
+            return {"extract": f"{title} reference text"}
+
+        with (
+            patch("src.pipeline.run_seed_ingestion_stage", return_value=mocked_seed),
+            patch("src.pipeline.WikiClient.fetch_page_extract", side_effect=fake_extract),
+        ):
+            run_candidate_scoring_stage(
+                seed_title="Seed",
+                lang="en",
+                cache_dir=cache_dir,
+                diagnostics_path=diagnostics_path,
+                scores_path=output_path,
+                lexicon_path=lexicon_path,
+                lexicon_weight=0.5,
+            )
+
+        header = output_path.read_text(encoding="utf-8").splitlines()[0]
+        self.assertIn("lexicon_score", header)
+
+        shutil.rmtree(output_path.parent, ignore_errors=True)
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
     def test_k_selection_maps_selected_titles_by_candidate_index(self) -> None:
         output_path = Path("tests") / "tmp_outputs" / "selected_map.json"
         diagnostics_path = Path("tests") / "tmp_outputs" / "diagnostics_k_map.json"
@@ -233,6 +280,54 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertIn("passed", result)
         self.assertFalse(result["passed"])
+
+    def test_csp_stage_passes_composite_word_scores_to_solver(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "csp_word_scores"
+        diagnostics_path = tmp_dir / "diagnostics_csp.json"
+        grid_path = tmp_dir / "grid.json"
+        terms_path = tmp_dir / "terms.csv"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        terms_path.write_text(
+            "\n".join(
+                [
+                    "answer,normalized_answer,length,source_method,lead_bold_signal,source_titles,doc_frequency,theme_score,entity_type_score,crosswordability_score,lexicon_score,shape_penalty,answer_score",
+                    "Alpha,ALPHA,5,spacy,False,Test,1,0.2,0.0,0.4,0.2,0.0,0.6",
+                    "Beta,BETA,4,spacy,False,Test,1,0.2,0.0,0.8,0.1,0.0,0.3",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        with patch("src.pipeline.solve_crossword") as mocked_solver:
+            mocked_solver.return_value = {
+                "solved": False,
+                "assignments": {},
+                "steps": 0,
+                "restarts": 0,
+                "local_repair_applied": False,
+            }
+            run_csp_solve_stage(
+                seed_title="Test",
+                lang="en",
+                terms_path=terms_path,
+                diagnostics_path=diagnostics_path,
+                grid_path=grid_path,
+                size=5,
+                min_slot_len=3,
+                template_name="open",
+                max_steps=100,
+                require_gate=False,
+            )
+
+        scores = mocked_solver.call_args.kwargs["word_scores"]
+        self.assertIn("ALPHA", scores)
+        self.assertIn("BETA", scores)
+        self.assertAlmostEqual(scores["ALPHA"], (0.6 * 0.6) + (0.25 * 0.2) + (0.15 * 0.4), places=6)
+        self.assertAlmostEqual(scores["BETA"], (0.6 * 0.3) + (0.25 * 0.1) + (0.15 * 0.8), places=6)
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def test_rescue_ladder_promotes_borderline_from_csv(self) -> None:
         tmp_dir = Path("tests") / "tmp_outputs" / "rescue_csv"

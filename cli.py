@@ -137,6 +137,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Relevance threshold for BORDERLINE status",
     )
     score_parser.add_argument(
+        "--lexicon-path",
+        default="data/lexicon/scowl_wordfreq.txt",
+        help="Optional external lexicon file (word[,score])",
+    )
+    score_parser.add_argument(
+        "--lexicon-weight",
+        type=float,
+        default=0.08,
+        help="Weight of lexicon score in article candidate ranking",
+    )
+    score_parser.add_argument(
         "--expansion",
         default="one_hop_only",
         choices=["one_hop_only", "one_hop_plus_bounded_two_hop"],
@@ -224,6 +235,17 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         help="Relevance threshold for BORDERLINE status",
+    )
+    k_parser.add_argument(
+        "--lexicon-path",
+        default="data/lexicon/scowl_wordfreq.txt",
+        help="Optional external lexicon file (word[,score])",
+    )
+    k_parser.add_argument(
+        "--lexicon-weight",
+        type=float,
+        default=0.08,
+        help="Weight of lexicon score in article candidate ranking",
     )
     k_parser.add_argument(
         "--expansion",
@@ -315,6 +337,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--wikidata-cache-dir",
         default="data/cache/wikidata",
         help="Disk cache directory for Wikidata API calls",
+    )
+    term_parser.add_argument(
+        "--lexicon-path",
+        default="data/lexicon/scowl_wordfreq.txt",
+        help="Optional external lexicon file (word[,score])",
+    )
+    term_parser.add_argument(
+        "--lexicon-weight",
+        type=float,
+        default=0.15,
+        help="Weight of lexicon score in answer ranking",
     )
 
     gate_parser = subparsers.add_parser(
@@ -506,6 +539,23 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Disable AC-3 preprocessing",
     )
     csp_parser.add_argument(
+        "--beam-width",
+        type=int,
+        default=32,
+        help="Beam width for CSP search",
+    )
+    csp_parser.add_argument(
+        "--no-local-repair",
+        action="store_true",
+        help="Disable local repair pass after beam search",
+    )
+    csp_parser.add_argument(
+        "--repair-steps",
+        type=int,
+        default=300,
+        help="Step budget for local repair",
+    )
+    csp_parser.add_argument(
         "--min-domain",
         type=int,
         default=1,
@@ -600,6 +650,8 @@ def main() -> None:
             max_candidates=args.max_candidates,
             keep_threshold=args.keep_threshold,
             borderline_threshold=args.borderline_threshold,
+            lexicon_path=args.lexicon_path,
+            lexicon_weight=args.lexicon_weight,
         )
         print(f"Scores written: {result.scores_path}")
         print(f"Diagnostics written: {result.diagnostics_path}")
@@ -628,6 +680,8 @@ def main() -> None:
             m=args.m,
             size=args.grid_size,
             min_slot_len=args.min_slot_len,
+            lexicon_path=args.lexicon_path,
+            lexicon_weight=args.lexicon_weight,
         )
         print(f"Selected: {result.selected_path}")
         print(f"Trace: {result.trace_path}")
@@ -647,6 +701,8 @@ def main() -> None:
             nlp_backend=args.nlp_backend,
             entity_type_scoring=args.entity_type_scoring,
             wikidata_cache_dir=args.wikidata_cache_dir,
+            lexicon_path=args.lexicon_path,
+            lexicon_weight=args.lexicon_weight,
         )
         print(f"Terms written: {result.terms_path}")
         print(f"Diagnostics: {result.diagnostics_path}")
@@ -717,6 +773,9 @@ def main() -> None:
             max_restarts=args.max_restarts,
             random_seed=args.random_seed,
             use_ac3=not args.no_ac3,
+            beam_width=args.beam_width,
+            enable_local_repair=not args.no_local_repair,
+            repair_steps=args.repair_steps,
             require_gate=not args.skip_gate,
             gate_min=args.gate_min,
             gate_max=args.gate_max,

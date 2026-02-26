@@ -1,6 +1,7 @@
 import unittest
 
 from src.topology import (
+    auto_block_long_slots,
     build_grid,
     extract_slots,
     get_templates,
@@ -37,6 +38,14 @@ class TopologyTests(unittest.TestCase):
         )
         selection = select_best_template(words, size=15, min_len=4)
         self.assertEqual(selection["selected"], "symmetric_sparse")
+
+    def test_auto_block_reduces_overlong_slots(self) -> None:
+        template = next(template for template in get_templates(15) if template.name == "open")
+        grid = build_grid(template)
+        blocked = auto_block_long_slots(grid, max_slot_len=12, symmetric=True)
+        slots = extract_slots(blocked["grid"], min_len=1)
+        self.assertTrue(blocked["added_blocks"])
+        self.assertTrue(all(slot["length"] <= 12 for slot in slots))
 
 
 if __name__ == "__main__":

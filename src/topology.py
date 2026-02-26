@@ -131,6 +131,82 @@ def extract_slots(grid: list[list[str]], min_len: int = 3) -> list[dict]:
     return slots
 
 
+def auto_block_long_slots(
+    grid: list[list[str]],
+    *,
+    max_slot_len: int | None,
+    symmetric: bool = True,
+    max_added_blocks: int = 64,
+) -> dict:
+    adjusted = [row[:] for row in grid]
+    size = len(adjusted)
+
+    if max_slot_len is None or max_slot_len <= 0:
+        return {
+            "grid": adjusted,
+            "added_blocks": [],
+            "long_slots_before": [],
+            "long_slots_after": [],
+            "iterations": 0,
+        }
+
+    long_slots_before = [
+        slot for slot in extract_slots(adjusted, min_len=1) if slot["length"] > max_slot_len
+    ]
+    added_blocks: set[tuple[int, int]] = set()
+    iterations = 0
+
+    def try_place(cell: tuple[int, int]) -> bool:
+        placements = [cell]
+        if symmetric:
+            mirror = (size - 1 - cell[0], size - 1 - cell[1])
+            if mirror != cell:
+                placements.append(mirror)
+        changed = False
+        for r, c in placements:
+            if adjusted[r][c] == "#":
+                continue
+            adjusted[r][c] = "#"
+            added_blocks.add((r, c))
+            changed = True
+        return changed
+
+    while len(added_blocks) < max_added_blocks:
+        long_slots = [
+            slot for slot in extract_slots(adjusted, min_len=1) if slot["length"] > max_slot_len
+        ]
+        if not long_slots:
+            break
+        target = max(long_slots, key=lambda slot: slot["length"])
+        if target["length"] <= 2:
+            break
+        midpoint = target["length"] // 2
+        midpoint = max(1, min(target["length"] - 2, midpoint))
+        if try_place(target["cells"][midpoint]):
+            iterations += 1
+            continue
+
+        placed = False
+        for idx in range(1, target["length"] - 1):
+            if try_place(target["cells"][idx]):
+                iterations += 1
+                placed = True
+                break
+        if not placed:
+            break
+
+    long_slots_after = [
+        slot for slot in extract_slots(adjusted, min_len=1) if slot["length"] > max_slot_len
+    ]
+    return {
+        "grid": adjusted,
+        "added_blocks": sorted(added_blocks),
+        "long_slots_before": long_slots_before,
+        "long_slots_after": long_slots_after,
+        "iterations": iterations,
+    }
+
+
 TOPOLOGY_SCORE_WEIGHTS_DEFAULT: dict[str, float] = {
     "length_fit": 0.4,
     "anchor": 0.2,
@@ -204,9 +280,21 @@ def score_template_from_length_hist(
     min_len: int = 3,
     *,
     weights: dict[str, float] | None = None,
+    max_word_len: int | None = None,
+    auto_block_long_slots_enabled: bool = True,
 ) -> dict:
     w = {**TOPOLOGY_SCORE_WEIGHTS_DEFAULT, **(weights or {})}
-    grid = build_grid(template)
+    base_grid = build_grid(template)
+    auto_block = {
+        "grid": base_grid,
+        "added_blocks": [],
+        "long_slots_before": [],
+        "long_slots_after": [],
+        "iterations": 0,
+    }
+    if max_word_len is not None and auto_block_long_slots_enabled:
+        auto_block = auto_block_long_slots(base_grid, max_slot_len=max_word_len, symmetric=True)
+    grid = auto_block["grid"]
     slots = extract_slots(grid, min_len=min_len)
 
     slot_lengths: dict[int, int] = {}
@@ -240,6 +328,31 @@ def score_template_from_length_hist(
     )
     fill_conflict = 0.0 if total_slots == 0 else shortage_slots / total_slots
 
+    long_slot_penalty = 0.0
+    long_slot_count_before = 0
+    long_slot_count_after = 0
+    if max_word_len is not None:
+        if auto_block_long_slots_enabled:
+            long_slot_count_before = len(auto_block["long_slots_before"])
+            long_slot_count_after = len(auto_block["long_slots_after"])
+            overflow_letters = sum(
+                max(0, slot["length"] - max_word_len) for slot in auto_block["long_slots_before"]
+            )
+            total_letters = sum(
+                slot["length"] for slot in extract_slots(base_grid, min_len=1)
+            ) or 1
+        else:
+            long_slots = [slot for slot in slots if slot["length"] > max_word_len]
+            long_slot_count_before = len(long_slots)
+            long_slot_count_after = len(long_slots)
+            overflow_letters = sum(max(0, slot["length"] - max_word_len) for slot in long_slots)
+            total_letters = sum(slot["length"] for slot in slots) or 1
+        long_slot_penalty = overflow_letters / total_letters
+
+    auto_block_density = 0.0
+    if auto_block["added_blocks"]:
+        auto_block_density = len(auto_block["added_blocks"]) / max(1, template.size * template.size)
+
     score = (
         w["length_fit"] * length_fit
         + w["anchor"] * anchor_score
@@ -256,6 +369,14 @@ def score_template_from_length_hist(
         "crossing_score": crossing_score,
         "slot_count": len(slots),
         "fill_conflict": fill_conflict,
+        "long_slot_penalty": long_slot_penalty,
+        "long_slot_count_before": long_slot_count_before,
+        "long_slot_count_after": long_slot_count_after,
+        "max_word_len": max_word_len,
+        "auto_block_added_count": len(auto_block["added_blocks"]),
+        "auto_block_density": auto_block_density,
+        "auto_block_iterations": auto_block["iterations"],
+        "auto_block_added_blocks": auto_block["added_blocks"],
         "weights": w,
     }
 
@@ -267,18 +388,37 @@ def select_best_template(
     *,
     weights: dict[str, float] | None = None,
     fill_conflict_weight: float = 0.5,
+    long_slot_penalty_weight: float = 2.0,
+    auto_block_penalty_weight: float = 0.2,
+    max_word_len: int | None = None,
+    auto_block_long_slots_enabled: bool = True,
 ) -> dict:
     templates = get_templates(size)
     length_hist: dict[int, int] = {}
     for word in words:
         length = len(word)
         length_hist[length] = length_hist.get(length, 0) + 1
+    inferred_max_word_len = max(length_hist.keys(), default=None)
+    if max_word_len is None:
+        max_word_len = inferred_max_word_len
 
     scored = [
-        score_template_from_length_hist(length_hist, template, min_len=min_len, weights=weights)
+        score_template_from_length_hist(
+            length_hist,
+            template,
+            min_len=min_len,
+            weights=weights,
+            max_word_len=max_word_len,
+            auto_block_long_slots_enabled=auto_block_long_slots_enabled,
+        )
         for template in templates
     ]
     for row in scored:
-        row["selection_score"] = row["score"] - (fill_conflict_weight * row["fill_conflict"])
+        row["selection_score"] = (
+            row["score"]
+            - (fill_conflict_weight * row["fill_conflict"])
+            - (long_slot_penalty_weight * row["long_slot_penalty"])
+            - (auto_block_penalty_weight * row["auto_block_density"])
+        )
     scored.sort(key=lambda row: (row["selection_score"], row["score"]), reverse=True)
     return {"selected": scored[0]["template"], "scored": scored}

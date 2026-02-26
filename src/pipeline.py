@@ -28,7 +28,14 @@ from .clue_builder import (
 from .provenance import build_oldid_url, validate_clue_provenance
 from .wikidata_client import WikidataClient
 from .crossword_csp import build_slots, render_grid, solve_crossword
-from .topology import build_grid, get_templates, score_template_from_length_hist, select_best_template
+from .lexicon import load_lexicon_scores, lexicon_score_for_token, lexicon_score_for_tokens
+from .topology import (
+    auto_block_long_slots,
+    build_grid,
+    get_templates,
+    score_template_from_length_hist,
+    select_best_template,
+)
 from .wiki_client import WikiClient
 
 
@@ -121,6 +128,15 @@ def _term_length_histogram(
             continue
         hist[length] = hist.get(length, 0) + 1
     return hist
+
+
+def _safe_float(value, *, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def run_seed_ingestion_stage(
@@ -289,6 +305,8 @@ def run_candidate_scoring_stage(
     keep_threshold: float = 0.2,
     borderline_threshold: float = 0.1,
     weights: dict[str, float] | None = None,
+    lexicon_path: str | Path | None = "data/lexicon/scowl_wordfreq.txt",
+    lexicon_weight: float = 0.08,
 ) -> ScoringStageResult:
     weights = weights or {"a": 1.5, "b": 0.3, "c": 0.3, "d": 0.2}
     errors: list[str] = []
@@ -358,6 +376,7 @@ def run_candidate_scoring_stage(
     ]
     term_counts = [sum(hist.values()) for hist in term_length_hists]
     max_term_count = max(term_counts) if term_counts else 1
+    max_term_count = max(1, max_term_count)
     term_scores = [count / max_term_count for count in term_counts]
 
     vectors = build_tfidf_vectors(texts, lang=lang)
@@ -368,8 +387,20 @@ def run_candidate_scoring_stage(
     depth_penalties = [1.0 if c.get("depth", 1) == 2 else 0.0 for c in candidates]
     backlink_bonus = [1.0 if c.get("links_back_to_seed") else 0.0 for c in candidates]
 
+    lexicon_weight = max(0.0, min(1.0, lexicon_weight))
+    lexicon = load_lexicon_scores(lexicon_path)
+    title_lexicon_scores: list[float] = []
+    for title in titles[1:]:
+        title_tokens = tokenize(title, lang=lang)
+        title_lexicon_scores.append(lexicon_score_for_tokens(title_tokens, lexicon))
+
+    ranking_rel_scores = [
+        rel + (lexicon_weight * lex_score)
+        for rel, lex_score in zip(rel_scores, title_lexicon_scores)
+    ]
+
     ranked = mmr_rank(
-        rel_scores=rel_scores,
+        rel_scores=ranking_rel_scores,
         pairwise=pairwise,
         depth_penalties=depth_penalties,
         backlink_bonus=backlink_bonus,
@@ -407,6 +438,7 @@ def run_candidate_scoring_stage(
                 "depth": depth,
                 "links_back_to_seed": links_back,
                 "rel_score": round(rel, 6),
+                "lexicon_score": round(title_lexicon_scores[idx], 6),
                 "red_score": round(row["red_score"], 6),
                 "selection_score": round(row["selection_score"], 6),
                 "status": status,
@@ -416,13 +448,17 @@ def run_candidate_scoring_stage(
 
     Path(scores_path).parent.mkdir(parents=True, exist_ok=True)
     with Path(scores_path).open("w", encoding="utf-8") as handle:
-        handle.write("rank,title,depth,links_back_to_seed,rel_score,red_score,selection_score,status,reason\n")
+        handle.write(
+            "rank,title,depth,links_back_to_seed,rel_score,lexicon_score,red_score,selection_score,status,reason\n"
+        )
         for row in scored_rows:
             handle.write(
                 f"{row['rank']},\"{row['title']}\",{row['depth']},{row['links_back_to_seed']},"
-                f"{row['rel_score']},{row['red_score']},{row['selection_score']},{row['status']},{row['reason']}\n"
+                f"{row['rel_score']},{row['lexicon_score']},{row['red_score']},{row['selection_score']},"
+                f"{row['status']},{row['reason']}\n"
             )
 
+    lexicon_hits = sum(1 for score in title_lexicon_scores if score > 0.0)
     diagnostics = {
         "stage": "candidate_scoring",
         "lang": lang,
@@ -430,6 +466,13 @@ def run_candidate_scoring_stage(
         "candidate_count": len(candidates),
         "scores_written": True,
         "weights": weights,
+        "lexicon": {
+            "path": str(lexicon_path) if lexicon_path is not None else None,
+            "loaded": bool(lexicon),
+            "entry_count": len(lexicon),
+            "weight": lexicon_weight,
+            "hits": lexicon_hits,
+        },
         "thresholds": {"keep": keep_threshold, "borderline": borderline_threshold},
         "errors": seed_result.diagnostics.get("errors", []) + errors,
     }
@@ -472,6 +515,8 @@ def run_k_selection_stage(
     weights: dict[str, float] | None = None,
     size: int = 15,
     min_slot_len: int = 3,
+    lexicon_path: str | Path | None = "data/lexicon/scowl_wordfreq.txt",
+    lexicon_weight: float = 0.08,
 ) -> KSelectionStageResult:
     weights = weights or {"w1": 1.0, "w2": 1.0, "w3": 1.0, "w4": 0.5, "w5": 0.5}
     scoring = run_candidate_scoring_stage(
@@ -489,6 +534,8 @@ def run_k_selection_stage(
         max_candidates=max_candidates,
         keep_threshold=keep_threshold,
         borderline_threshold=borderline_threshold,
+        lexicon_path=lexicon_path,
+        lexicon_weight=lexicon_weight,
     )
 
     if not scoring.scores:
@@ -533,8 +580,15 @@ def run_k_selection_stage(
                 template_fit_by_k.append(0.0)
                 fill_conflict_by_k.append(1.0)
                 continue
+            max_word_len = max(length_hist.keys(), default=None)
             scored_templates = [
-                score_template_from_length_hist(length_hist, template, min_len=min_slot_len)
+                score_template_from_length_hist(
+                    length_hist,
+                    template,
+                    min_len=min_slot_len,
+                    max_word_len=max_word_len,
+                    auto_block_long_slots_enabled=True,
+                )
                 for template in templates
             ]
             # Choose template using the same fit/conflict trade-off as J(K).
@@ -631,6 +685,8 @@ def run_term_extraction_stage(
     nlp_backend: str = "auto",
     entity_type_scoring: bool = False,
     wikidata_cache_dir: str | Path = "data/cache/wikidata",
+    lexicon_path: str | Path | None = "data/lexicon/scowl_wordfreq.txt",
+    lexicon_weight: float = 0.15,
 ) -> TermExtractionStageResult:
     errors: list[str] = []
     cache = DiskCache(cache_dir)
@@ -754,12 +810,17 @@ def run_term_extraction_stage(
     wikidata_client = None
     if entity_type_scoring:
         wikidata_client = WikidataClient(DiskCache(wikidata_cache_dir))
+    lexicon = load_lexicon_scores(lexicon_path)
+    lexicon_hits = 0
 
     filtered_terms = []
     for term, freq in eligible_terms:
         theme_score = 0.0 if max_df == 0 else freq / max_df
         shape = shape_penalty(term.normalized_answer)
         crossword_score = crosswordability_score(term.normalized_answer)
+        lexicon_score = lexicon_score_for_token(term.normalized_answer, lexicon)
+        if lexicon_score > 0.0:
+            lexicon_hits += 1
         entity_score = 0.0
         if wikidata_client is not None:
             cache_key = term.normalized_answer
@@ -778,9 +839,14 @@ def run_term_extraction_stage(
                 entity_scores[cache_key] = entity_score
 
         lead_bold_bonus = 1.0 if term.lead_bold_signal else 0.0
-        answer_score = (0.4 * theme_score) + (0.3 * entity_score) + (
-            0.2 * lead_bold_bonus
-        ) + (0.1 * crossword_score)
+        residual_weight = max(0.0, 1.0 - lexicon_weight)
+        answer_score = (
+            (0.4 * residual_weight * theme_score)
+            + (0.3 * residual_weight * entity_score)
+            + (0.2 * residual_weight * lead_bold_bonus)
+            + (0.1 * residual_weight * crossword_score)
+            + (lexicon_weight * lexicon_score)
+        )
 
         filtered_terms.append(
             {
@@ -795,10 +861,21 @@ def run_term_extraction_stage(
                 "theme_score": round(theme_score, 4),
                 "entity_type_score": round(entity_score, 4),
                 "crosswordability_score": round(crossword_score, 4),
+                "lexicon_score": round(lexicon_score, 4),
                 "shape_penalty": round(shape, 4),
                 "answer_score": round(answer_score, 4),
             }
         )
+
+    filtered_terms.sort(
+        key=lambda row: (
+            row["answer_score"],
+            row["doc_frequency"],
+            row["crosswordability_score"],
+            row["length"],
+        ),
+        reverse=True,
+    )
 
     Path(terms_path).parent.mkdir(parents=True, exist_ok=True)
     import csv
@@ -817,6 +894,7 @@ def run_term_extraction_stage(
                 "theme_score",
                 "entity_type_score",
                 "crosswordability_score",
+                "lexicon_score",
                 "shape_penalty",
                 "answer_score",
             ]
@@ -834,6 +912,7 @@ def run_term_extraction_stage(
                     row["theme_score"],
                     row["entity_type_score"],
                     row["crosswordability_score"],
+                    row["lexicon_score"],
                     row["shape_penalty"],
                     row["answer_score"],
                 ]
@@ -849,6 +928,13 @@ def run_term_extraction_stage(
         "nlp_backend": backend_used,
         "entity_type_scoring": entity_type_scoring,
         "entity_type_hits": entity_hits if entity_type_scoring else 0,
+        "lexicon": {
+            "path": str(lexicon_path) if lexicon_path is not None else None,
+            "loaded": bool(lexicon),
+            "entry_count": len(lexicon),
+            "weight": lexicon_weight,
+            "hits": lexicon_hits,
+        },
         "errors": errors,
     }
     final_diagnostics = write_json(diagnostics_path, diagnostics)
@@ -1339,11 +1425,22 @@ def run_topology_selection_stage(
 
     import csv
 
-    words = []
+    words: list[str] = []
+    word_scores: dict[str, float] = {}
     with Path(terms_path).open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
-            words.append(row["normalized_answer"])
+            normalized = (row.get("normalized_answer") or "").strip().upper()
+            if not normalized:
+                continue
+            answer_score = _safe_float(row.get("answer_score"), default=0.0)
+            lexicon_score = _safe_float(row.get("lexicon_score"), default=0.0)
+            crossword_score = _safe_float(row.get("crosswordability_score"), default=0.0)
+            composite = (0.6 * answer_score) + (0.25 * lexicon_score) + (0.15 * crossword_score)
+            previous = word_scores.get(normalized)
+            if previous is None or composite > previous:
+                word_scores[normalized] = composite
+    words = sorted(word_scores, key=lambda word: (word_scores[word], word), reverse=True)
 
     gate_result = evaluate_vocab_gate(len(words), min_required=gate_min, max_allowed=gate_max)
     if require_gate and not gate_result.passed:
@@ -1365,7 +1462,13 @@ def run_topology_selection_stage(
     if min_word_len is not None:
         effective_min_slot_len = max(min_slot_len, min_word_len)
 
-    selection = select_best_template(words, size=size, min_len=effective_min_slot_len)
+    selection = select_best_template(
+        words,
+        size=size,
+        min_len=effective_min_slot_len,
+        max_word_len=max_word_len,
+        auto_block_long_slots_enabled=True,
+    )
     diagnostics = {
         "stage": "topology_selection",
         "lang": lang,
@@ -1398,6 +1501,9 @@ def run_csp_solve_stage(
     max_restarts: int = 2,
     random_seed: int = 13,
     use_ac3: bool = True,
+    beam_width: int = 32,
+    enable_local_repair: bool = True,
+    repair_steps: int = 300,
     require_gate: bool = True,
     gate_min: int = 40,
     gate_max: int = 80,
@@ -1421,11 +1527,22 @@ def run_csp_solve_stage(
 
     import csv
 
-    words = []
+    words: list[str] = []
+    word_scores: dict[str, float] = {}
     with Path(terms_path).open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
-            words.append(row["normalized_answer"])
+            normalized = (row.get("normalized_answer") or "").strip().upper()
+            if not normalized:
+                continue
+            answer_score = _safe_float(row.get("answer_score"), default=0.0)
+            lexicon_score = _safe_float(row.get("lexicon_score"), default=0.0)
+            crossword_score = _safe_float(row.get("crosswordability_score"), default=0.0)
+            composite = (0.6 * answer_score) + (0.25 * lexicon_score) + (0.15 * crossword_score)
+            previous = word_scores.get(normalized)
+            if previous is None or composite > previous:
+                word_scores[normalized] = composite
+    words = sorted(word_scores, key=lambda word: (word_scores[word], word), reverse=True)
 
     gate_result = evaluate_vocab_gate(len(words), min_required=gate_min, max_allowed=gate_max)
     if require_gate and not gate_result.passed:
@@ -1455,17 +1572,25 @@ def run_csp_solve_stage(
     if template_name:
         template = next((t for t in templates if t.name == template_name), templates[0])
     else:
-        selection = select_best_template(words, size=size, min_len=effective_min_slot_len)
+        selection = select_best_template(
+            words,
+            size=size,
+            min_len=effective_min_slot_len,
+            max_word_len=max_word_len,
+            auto_block_long_slots_enabled=True,
+        )
         template = next(t for t in templates if t.name == selection["selected"])
 
     grid = build_grid(template)
+    auto_block = auto_block_long_slots(grid, max_slot_len=max_word_len, symmetric=True)
+    grid = auto_block["grid"]
     slots = build_slots(grid, min_len=effective_min_slot_len)
     domains = {slot.id: [word for word in words if len(word) == slot.length] for slot in slots}
     active_slots = [slot for slot in slots if len(domains[slot.id]) >= min_domain]
 
     if not active_slots:
         errors.append("no_active_slots")
-        result = {"solved": False, "assignments": {}, "steps": 0}
+        result = {"solved": False, "assignments": {}, "steps": 0, "restarts": 0}
     else:
         result = solve_crossword(
             grid,
@@ -1476,6 +1601,10 @@ def run_csp_solve_stage(
             max_restarts=max_restarts,
             random_seed=random_seed,
             use_ac3=use_ac3,
+            word_scores=word_scores,
+            beam_width=beam_width,
+            enable_local_repair=enable_local_repair,
+            repair_steps=repair_steps,
         )
 
     rendered = render_grid(grid, active_slots, result["assignments"])
@@ -1489,6 +1618,23 @@ def run_csp_solve_stage(
         "effective_min_slot_len": effective_min_slot_len,
         "grid": rendered,
         "assignments": result["assignments"],
+        "slots": [
+            {
+                "id": slot.id,
+                "direction": slot.direction,
+                "length": slot.length,
+                "cells": slot.cells,
+            }
+            for slot in slots
+        ],
+        "auto_block": {
+            "max_word_len": max_word_len,
+            "added_block_count": len(auto_block["added_blocks"]),
+            "added_blocks": auto_block["added_blocks"],
+            "long_slot_count_before": len(auto_block["long_slots_before"]),
+            "long_slot_count_after": len(auto_block["long_slots_after"]),
+            "iterations": auto_block["iterations"],
+        },
         "fill_status": None,
         "fill_percent": 0.0,
         "unfilled_slots": [],
@@ -1543,6 +1689,12 @@ def run_csp_solve_stage(
         "max_restarts": max_restarts,
         "random_seed": random_seed,
         "use_ac3": use_ac3,
+        "beam_width": beam_width,
+        "local_repair_enabled": enable_local_repair,
+        "repair_steps": repair_steps,
+        "local_repair_applied": result.get("local_repair_applied", False),
+        "word_score_count": len(word_scores),
+        "auto_block": payload["auto_block"],
         "unfilled_slots": unfilled_slots,
         "errors": errors,
     }
@@ -1615,7 +1767,26 @@ def run_packaging_stage(
 
     across_entries: list[dict] = []
     down_entries: list[dict] = []
-    if template_name:
+    assignments = grid_payload.get("assignments", {})
+    normalized_assignments = {int(k): v for k, v in assignments.items()}
+    slot_records: list[dict] = []
+
+    raw_slots = grid_payload.get("slots")
+    if isinstance(raw_slots, list):
+        for row in raw_slots:
+            try:
+                slot_records.append(
+                    {
+                        "id": int(row["id"]),
+                        "direction": str(row["direction"]),
+                        "length": int(row["length"]),
+                        "cells": [tuple(cell) for cell in row["cells"]],
+                    }
+                )
+            except Exception:
+                continue
+
+    if not slot_records and template_name:
         templates = get_templates(size)
         template = next((t for t in templates if t.name == template_name), None)
         if template is None:
@@ -1623,25 +1794,33 @@ def run_packaging_stage(
         else:
             grid = build_grid(template)
             slots = build_slots(grid, min_len=min_slot_len)
-            assignments = grid_payload.get("assignments", {})
-            normalized_assignments = {int(k): v for k, v in assignments.items()}
-            for slot in slots:
-                answer = normalized_assignments.get(slot.id)
-                if not answer:
-                    continue
-                clue = clue_by_normalized.get(answer, {})
-                entry = {
-                    "slot_id": slot.id,
-                    "answer": answer,
-                    "clue": clue.get("clue", ""),
-                    "row": slot.cells[0][0],
-                    "col": slot.cells[0][1],
+            slot_records = [
+                {
+                    "id": slot.id,
+                    "direction": slot.direction,
                     "length": slot.length,
+                    "cells": slot.cells,
                 }
-                if slot.direction == "across":
-                    across_entries.append(entry)
-                else:
-                    down_entries.append(entry)
+                for slot in slots
+            ]
+
+    for slot in slot_records:
+        answer = normalized_assignments.get(slot["id"])
+        if not answer:
+            continue
+        clue = clue_by_normalized.get(answer, {})
+        entry = {
+            "slot_id": slot["id"],
+            "answer": answer,
+            "clue": clue.get("clue", ""),
+            "row": slot["cells"][0][0],
+            "col": slot["cells"][0][1],
+            "length": slot["length"],
+        }
+        if slot["direction"] == "across":
+            across_entries.append(entry)
+        else:
+            down_entries.append(entry)
 
     fill_status = grid_payload.get("fill_status", "failed")
     fill_percent = grid_payload.get("fill_percent", 0.0)

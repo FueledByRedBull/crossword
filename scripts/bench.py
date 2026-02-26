@@ -93,6 +93,8 @@ def run_benchmark(seed: str, args: argparse.Namespace) -> dict:
         max_candidates=args.max_candidates,
         keep_threshold=args.keep_threshold,
         borderline_threshold=args.borderline_threshold,
+        lexicon_path=args.lexicon_path,
+        lexicon_weight=args.candidate_lexicon_weight,
     )
 
     selection = run_k_selection_stage(
@@ -118,6 +120,8 @@ def run_benchmark(seed: str, args: argparse.Namespace) -> dict:
         m=args.m,
         size=args.grid_size,
         min_slot_len=args.min_slot_len,
+        lexicon_path=args.lexicon_path,
+        lexicon_weight=args.candidate_lexicon_weight,
     )
 
     terms = run_term_extraction_stage(
@@ -134,6 +138,8 @@ def run_benchmark(seed: str, args: argparse.Namespace) -> dict:
         nlp_backend=args.nlp_backend,
         entity_type_scoring=args.entity_type_scoring,
         wikidata_cache_dir=args.wikidata_cache_dir,
+        lexicon_path=args.lexicon_path,
+        lexicon_weight=args.term_lexicon_weight,
     )
 
     gate = run_vocab_gate_stage(
@@ -171,6 +177,9 @@ def run_benchmark(seed: str, args: argparse.Namespace) -> dict:
         max_restarts=args.max_restarts,
         random_seed=args.random_seed,
         use_ac3=not args.no_ac3,
+        beam_width=args.beam_width,
+        enable_local_repair=not args.no_local_repair,
+        repair_steps=args.repair_steps,
         require_gate=not args.skip_gate,
         gate_min=args.gate_min,
         gate_max=args.gate_max,
@@ -244,6 +253,13 @@ def main() -> None:
     parser.add_argument("--max-candidates", type=int, default=None)
     parser.add_argument("--keep-threshold", type=float, default=0.2)
     parser.add_argument("--borderline-threshold", type=float, default=0.1)
+    parser.add_argument(
+        "--lexicon-path",
+        default="data/lexicon/scowl_wordfreq.txt",
+        help="Optional external lexicon file (word[,score])",
+    )
+    parser.add_argument("--candidate-lexicon-weight", type=float, default=0.08)
+    parser.add_argument("--term-lexicon-weight", type=float, default=0.15)
     parser.add_argument("--min-k", type=int, default=5)
     parser.add_argument("--max-k", type=int, default=None)
     parser.add_argument("--epsilon", type=float, default=0.01)
@@ -267,6 +283,9 @@ def main() -> None:
     parser.add_argument("--max-restarts", type=int, default=2)
     parser.add_argument("--random-seed", type=int, default=13)
     parser.add_argument("--no-ac3", action="store_true")
+    parser.add_argument("--beam-width", type=int, default=32)
+    parser.add_argument("--no-local-repair", action="store_true")
+    parser.add_argument("--repair-steps", type=int, default=300)
     parser.add_argument("--skip-gate", action="store_true")
     args = parser.parse_args()
 

@@ -47,6 +47,28 @@ class CspTests(unittest.TestCase):
             len(assigned), len(set(assigned)), "Repeated answers found in grid"
         )
 
+    def test_word_scores_drive_value_ordering(self) -> None:
+        grid = [
+            [".", ".", "."],
+            ["#", "#", "#"],
+            ["#", "#", "#"],
+        ]
+        slots = build_slots(grid, min_len=3)
+        words = ["CAT", "DOG"]
+        result = solve_crossword(
+            grid,
+            slots,
+            words,
+            min_len=3,
+            max_steps=100,
+            use_ac3=False,
+            beam_width=2,
+            word_scores={"CAT": 0.1, "DOG": 0.9},
+        )
+        assigned_words = list(result["assignments"].values())
+        self.assertTrue(assigned_words)
+        self.assertEqual(assigned_words[0], "DOG")
+
 
 if __name__ == "__main__":
     unittest.main()
