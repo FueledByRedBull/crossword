@@ -1,0 +1,2 @@
+"""Crossword generation pipeline package."""
+
