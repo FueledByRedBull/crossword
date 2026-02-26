@@ -746,6 +746,14 @@ def run_term_extraction_stage(
             except Exception as exc:  # pragma: no cover
                 errors.append(f"spacy_model_load_failed:{model_name}:{exc}")
 
+        spacy_version = getattr(spacy, "__version__", None) if spacy is not None else None
+        spacy_model_version = None
+        if nlp is not None:
+            try:
+                spacy_model_version = nlp.meta.get("version")
+            except Exception:  # pragma: no cover
+                pass
+
     if backend_used is None and nlp_backend in {"auto", "nltk"}:
         try:
             import nltk  # noqa: F401
@@ -926,6 +934,8 @@ def run_term_extraction_stage(
         "term_count": len(filtered_terms),
         "min_df": min_df,
         "nlp_backend": backend_used,
+        "spacy_version": spacy_version if backend_used == "spacy" else None,
+        "spacy_model_version": spacy_model_version if backend_used == "spacy" else None,
         "entity_type_scoring": entity_type_scoring,
         "entity_type_hits": entity_hits if entity_type_scoring else 0,
         "lexicon": {
@@ -1268,11 +1278,18 @@ def run_clue_extraction_stage(
     api_base = f"https://{lang}.wikipedia.org/w/api.php"
     client = WikiClient(cache, api_base=api_base)
     nlp = None
+    clue_spacy_version = None
+    clue_spacy_model_version = None
     try:
         import spacy
 
         model_name = "en_core_web_sm" if lang == "en" else "el_core_news_sm"
         nlp = spacy.load(model_name)
+        clue_spacy_version = getattr(spacy, "__version__", None)
+        try:
+            clue_spacy_model_version = nlp.meta.get("version")
+        except Exception:  # pragma: no cover
+            pass
     except Exception as exc:  # pragma: no cover
         errors.append(f"clue_spacy_unavailable:{exc}")
 
@@ -1345,7 +1362,67 @@ def run_clue_extraction_stage(
             }
         )
 
-    clues = enforce_diversity(clues, max_per_bucket=diversity_cap, definitional_cap=3)
+    clues, rejected_answers = enforce_diversity(clues, max_per_bucket=diversity_cap, definitional_cap=3)
+
+    # Re-extraction pass for diversity-rejected answers (PLAN §5.5 Pass 4).
+    # Try alternate sentences from source articles, preserving provenance.
+    if rejected_answers:
+        rejected_set = set(rejected_answers)
+        existing_answers = {c.get("normalized_answer", c["answer"]).upper() for c in clues}
+        for term in terms:
+            answer = term["answer"]
+            normalized_answer = term.get("normalized_answer", "")
+            if answer not in rejected_set:
+                continue
+            if normalized_answer.upper() in existing_answers:
+                continue
+            source_titles_list = [t for t in term["source_titles"].split("|") if t]
+            retry_sentence = None
+            retry_offset = None
+            retry_title = None
+            retry_revid = None
+            for title in source_titles_list:
+                if title not in source_cache:
+                    continue
+                payload = source_cache[title]
+                extract = payload.get("extract", "")
+                # Try extracting all sentences, skip the one already used
+                from .clue_builder import split_sentences as _split_sentences
+                all_sentences = _split_sentences(extract)
+                for s_offset, candidate_sentence in enumerate(all_sentences):
+                    if answer.lower() not in candidate_sentence.lower():
+                        continue
+                    trial_clue = clue_pass_mask_trim(candidate_sentence, answer, max_words=max_words)
+                    if clue_pass_validate(
+                        trial_clue, answer, min_words=min_words, nlp=nlp, original_sentence=candidate_sentence
+                    ):
+                        retry_sentence = candidate_sentence
+                        retry_offset = s_offset
+                        retry_title = payload.get("title", title)
+                        retry_revid = payload.get("revid")
+                        break
+                if retry_sentence:
+                    break
+            if retry_sentence and retry_title is not None:
+                retry_clue = clue_pass_mask_trim(retry_sentence, answer, max_words=max_words)
+                clue_word_count = len(retry_clue.split())
+                clue_score = round(
+                    1.0 - abs(clue_word_count - 9) / max(9, clue_word_count), 4
+                )
+                clues.append(
+                    {
+                        "answer": answer,
+                        "normalized_answer": normalized_answer,
+                        "clue": retry_clue,
+                        "clue_score": clue_score,
+                        "source_method": term["source_method"],
+                        "source_page": retry_title,
+                        "revid": retry_revid,
+                        "sentence_offset": retry_offset,
+                        "oldid_url": build_oldid_url(retry_title, retry_revid, lang=lang),
+                    }
+                )
+                existing_answers.add(normalized_answer.upper())
 
     Path(clues_path).parent.mkdir(parents=True, exist_ok=True)
     with Path(clues_path).open("w", encoding="utf-8", newline="") as handle:
@@ -1385,6 +1462,13 @@ def run_clue_extraction_stage(
         "seed_title": seed_title,
         "clues_written": True,
         "clue_count": len(clues),
+        "spacy_version": clue_spacy_version,
+        "spacy_model_version": clue_spacy_model_version,
+        "diversity_rejected_count": len(rejected_answers),
+        "diversity_retried_count": len(clues) - (len(clues) - len([
+            a for a in rejected_answers
+            if any(c.get("answer") == a for c in clues)
+        ])),
         "provenance_missing_count": len(provenance_missing),
         "provenance_missing": provenance_missing[:10],
         "errors": errors,

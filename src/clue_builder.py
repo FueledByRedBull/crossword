@@ -138,20 +138,24 @@ def enforce_diversity(
     clues: list[dict],
     max_per_bucket: int = 2,
     definitional_cap: int = 3,
-) -> list[dict]:
+) -> tuple[list[dict], list[str]]:
+    """Return (kept_clues, rejected_answers) after diversity filtering."""
     bucket_counts: dict[str, int] = {}
     definitional_count = 0
     output = []
+    rejected_answers: list[str] = []
     for clue in clues:
         tokens = clue["clue"].split()
         bucket = " ".join(tokens[:3]).lower()
         bucket_counts.setdefault(bucket, 0)
         if bucket_counts[bucket] >= max_per_bucket:
+            rejected_answers.append(clue.get("answer", ""))
             continue
         if _is_definitional(clue["clue"]):
             if definitional_count >= definitional_cap:
+                rejected_answers.append(clue.get("answer", ""))
                 continue
             definitional_count += 1
         bucket_counts[bucket] += 1
         output.append(clue)
-    return output
+    return output, rejected_answers

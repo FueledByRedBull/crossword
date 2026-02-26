@@ -33,14 +33,37 @@ class ClueBuilderTests(unittest.TestCase):
         self.assertEqual(sentence, "Entropy is a measure.")
         self.assertEqual(offset, 1)
 
-    def test_diversity_enforcement(self) -> None:
+    def test_diversity_enforcement_returns_tuple(self) -> None:
         clues = [
             {"answer": "A", "clue": "A measure of X"},
             {"answer": "B", "clue": "A measure of Y"},
             {"answer": "C", "clue": "A measure of Z"},
         ]
-        filtered = enforce_diversity(clues, max_per_bucket=2)
-        self.assertEqual(len(filtered), 2)
+        kept, rejected = enforce_diversity(clues, max_per_bucket=2)
+        self.assertEqual(len(kept), 2)
+        self.assertIsInstance(rejected, list)
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0], "C")
+
+    def test_diversity_rejection_preserves_answers(self) -> None:
+        """Rejected answers should contain the answer field of dropped clues."""
+        clues = [
+            {"answer": "ALPHA", "clue": "First letter of the Greek alphabet"},
+            {"answer": "BETA", "clue": "First letter in the second row"},
+            {"answer": "GAMMA", "clue": "First letter that represents radiation"},
+        ]
+        kept, rejected = enforce_diversity(clues, max_per_bucket=2)
+        # All three share the bucket "first letter of/in/that" but 3-word bucket is exact.
+        # With different 3-word prefixes, they may all survive.  Force collision:
+        clues2 = [
+            {"answer": "ALPHA", "clue": "The standard measure of quality"},
+            {"answer": "BETA", "clue": "The standard measure of price"},
+            {"answer": "GAMMA", "clue": "The standard measure of value"},
+        ]
+        kept2, rejected2 = enforce_diversity(clues2, max_per_bucket=2)
+        self.assertEqual(len(kept2), 2)
+        self.assertEqual(len(rejected2), 1)
+        self.assertIn(rejected2[0], ["ALPHA", "BETA", "GAMMA"])
 
     def test_morphological_leakage_detection(self) -> None:
         try:

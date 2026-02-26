@@ -51,9 +51,35 @@ def get_templates(size: int) -> list[GridTemplate]:
             (4, 10),
             (5, 7),
         }
+
+        # NYT Classic — ~38 blocks, dense but every slot 3-12 letters.
+        # Standard American 15×15 pattern with heavy crossing.
+        nyt_base = {
+            (0, 4), (0, 10),
+            (1, 4), (1, 10),
+            (2, 4), (2, 10),
+            (3, 0), (3, 1), (3, 7),
+            (4, 5), (4, 6),
+            (5, 3), (5, 9),
+            (6, 2), (6, 8),
+        }
+
+        # Medium Open — ~28 blocks, more open with longer slots (still ≤ 12).
+        medium_base = {
+            (0, 5), (0, 9),
+            (1, 5), (1, 9),
+            (2, 3), (2, 11),
+            (3, 7),
+            (4, 4), (4, 10),
+            (5, 2),
+            (6, 6), (6, 8),
+        }
+
         return [
             GridTemplate(name="open", size=size, blocks=set()),
             GridTemplate(name="symmetric_sparse", size=size, blocks=make_symmetric_blocks(size, base_blocks)),
+            GridTemplate(name="nyt_classic", size=size, blocks=make_symmetric_blocks(size, nyt_base)),
+            GridTemplate(name="medium_open", size=size, blocks=make_symmetric_blocks(size, medium_base)),
             GridTemplate(name="dense", size=size, blocks=_grid_blocks(size, gap=5)),
         ]
     if size == 13:
@@ -68,9 +94,21 @@ def get_templates(size: int) -> list[GridTemplate]:
             (4, 4),
             (4, 8),
         }
+
+        # NYT Classic 13 — standard 13×13 pattern.
+        nyt_13_base = {
+            (0, 4), (0, 8),
+            (1, 4), (1, 8),
+            (2, 0), (2, 6),
+            (3, 3), (3, 9),
+            (4, 5),
+            (5, 2), (5, 10),
+        }
+
         return [
             GridTemplate(name="open", size=size, blocks=set()),
             GridTemplate(name="symmetric_sparse", size=size, blocks=make_symmetric_blocks(size, base_blocks)),
+            GridTemplate(name="nyt_classic_13", size=size, blocks=make_symmetric_blocks(size, nyt_13_base)),
             GridTemplate(name="dense", size=size, blocks=_grid_blocks(size, gap=8)),
         ]
     return [GridTemplate(name="open", size=size, blocks=set())]
