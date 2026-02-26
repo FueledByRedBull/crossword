@@ -399,6 +399,57 @@ class PipelineTests(unittest.TestCase):
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def test_csp_includes_filler_words(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "csp_filler"
+        diagnostics_path = tmp_dir / "diagnostics_csp.json"
+        grid_path = tmp_dir / "grid.json"
+        terms_path = tmp_dir / "terms.csv"
+        filler_path = tmp_dir / "filler_words.txt"
+
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        terms_path.write_text(
+            "\n".join(
+                [
+                    "answer,normalized_answer,length,source_method,lead_bold_signal,source_titles,doc_frequency,theme_score,entity_type_score,crosswordability_score,lexicon_score,shape_penalty,answer_score",
+                    "Theme,THEME,5,spacy,False,Test,1,0.2,0.0,0.4,0.2,0.0,0.6",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        filler_path.write_text("FILLER\n", encoding="utf-8")
+
+        with patch("src.pipeline.solve_crossword") as mocked_solver:
+            mocked_solver.return_value = {
+                "solved": False,
+                "assignments": {},
+                "steps": 0,
+                "restarts": 0,
+                "local_repair_applied": False,
+            }
+            run_csp_solve_stage(
+                seed_title="Test",
+                lang="en",
+                terms_path=terms_path,
+                diagnostics_path=diagnostics_path,
+                grid_path=grid_path,
+                size=5,
+                min_slot_len=3,
+                template_name="open",
+                max_steps=100,
+                require_gate=False,
+                filler_path=filler_path,
+                filler_max_per_length=100,
+            )
+
+        words_arg = mocked_solver.call_args.args[2]
+        self.assertIn("THEME", words_arg)
+        self.assertIn("FILLER", words_arg)
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -25,6 +26,7 @@ class WikiClient:
         max_retries: int = 2,
         backoff_seconds: float = 0.5,
         backoff_factor: float = 2.0,
+        offline: bool | None = None,
     ):
         self.cache = cache
         self.api_base = api_base
@@ -33,11 +35,21 @@ class WikiClient:
         self.max_retries = max_retries
         self.backoff_seconds = backoff_seconds
         self.backoff_factor = backoff_factor
+        if offline is None:
+            offline = os.getenv("CROSSWORD_OFFLINE", "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        self.offline = offline
 
     def _query(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
         cached = self.cache.get(endpoint, params)
         if cached is not None:
             return cached
+        if self.offline:
+            return {}
 
         query = urlencode({k: v for k, v in params.items() if v is not None}, doseq=True)
         request = Request(

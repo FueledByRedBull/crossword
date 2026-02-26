@@ -157,14 +157,23 @@ class TopologyTests(unittest.TestCase):
         grid = build_grid(nyt)
         slots = extract_slots(grid, min_len=3)
         self.assertGreaterEqual(len(slots), 20)
-        self.assertLessEqual(len(slots), 70)
+        self.assertLessEqual(len(slots), 80)
 
     def test_medium_open_slot_count_reasonable(self) -> None:
         medium = next(t for t in get_templates(15) if t.name == "medium_open")
         grid = build_grid(medium)
         slots = extract_slots(grid, min_len=3)
         self.assertGreaterEqual(len(slots), 20)
-        self.assertLessEqual(len(slots), 70)
+        self.assertLessEqual(len(slots), 80)
+
+    def test_new_templates_have_no_overlong_slots(self) -> None:
+        for name in ["nyt_classic", "medium_open"]:
+            template = next(t for t in get_templates(15) if t.name == name)
+            slots = extract_slots(build_grid(template), min_len=1)
+            self.assertTrue(all(slot["length"] <= 12 for slot in slots))
+        template_13 = next(t for t in get_templates(13) if t.name == "nyt_classic_13")
+        slots_13 = extract_slots(build_grid(template_13), min_len=1)
+        self.assertTrue(all(slot["length"] <= 12 for slot in slots_13))
 
 
 if __name__ == "__main__":

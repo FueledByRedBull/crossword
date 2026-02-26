@@ -75,11 +75,30 @@ def get_templates(size: int) -> list[GridTemplate]:
             (6, 6), (6, 8),
         }
 
+        nyt_blocks = make_symmetric_blocks(size, nyt_base)
+        medium_blocks = make_symmetric_blocks(size, medium_base)
+        # Ensure no slot exceeds 12 letters in the base template.
+        nyt_grid = [["." for _ in range(size)] for _ in range(size)]
+        for r, c in nyt_blocks:
+            nyt_grid[r][c] = "#"
+        nyt_grid = auto_block_long_slots(nyt_grid, max_slot_len=12, symmetric=True)["grid"]
+        nyt_blocks = _blocks_from_grid(nyt_grid)
+
+        medium_grid = [["." for _ in range(size)] for _ in range(size)]
+        for r, c in medium_blocks:
+            medium_grid[r][c] = "#"
+        medium_grid = auto_block_long_slots(medium_grid, max_slot_len=12, symmetric=True)["grid"]
+        medium_blocks = _blocks_from_grid(medium_grid)
+
         return [
             GridTemplate(name="open", size=size, blocks=set()),
-            GridTemplate(name="symmetric_sparse", size=size, blocks=make_symmetric_blocks(size, base_blocks)),
-            GridTemplate(name="nyt_classic", size=size, blocks=make_symmetric_blocks(size, nyt_base)),
-            GridTemplate(name="medium_open", size=size, blocks=make_symmetric_blocks(size, medium_base)),
+            GridTemplate(
+                name="symmetric_sparse",
+                size=size,
+                blocks=make_symmetric_blocks(size, base_blocks),
+            ),
+            GridTemplate(name="nyt_classic", size=size, blocks=nyt_blocks),
+            GridTemplate(name="medium_open", size=size, blocks=medium_blocks),
             GridTemplate(name="dense", size=size, blocks=_grid_blocks(size, gap=5)),
         ]
     if size == 13:
@@ -105,10 +124,21 @@ def get_templates(size: int) -> list[GridTemplate]:
             (5, 2), (5, 10),
         }
 
+        nyt_13_blocks = make_symmetric_blocks(size, nyt_13_base)
+        nyt_13_grid = [["." for _ in range(size)] for _ in range(size)]
+        for r, c in nyt_13_blocks:
+            nyt_13_grid[r][c] = "#"
+        nyt_13_grid = auto_block_long_slots(nyt_13_grid, max_slot_len=12, symmetric=True)["grid"]
+        nyt_13_blocks = _blocks_from_grid(nyt_13_grid)
+
         return [
             GridTemplate(name="open", size=size, blocks=set()),
-            GridTemplate(name="symmetric_sparse", size=size, blocks=make_symmetric_blocks(size, base_blocks)),
-            GridTemplate(name="nyt_classic_13", size=size, blocks=make_symmetric_blocks(size, nyt_13_base)),
+            GridTemplate(
+                name="symmetric_sparse",
+                size=size,
+                blocks=make_symmetric_blocks(size, base_blocks),
+            ),
+            GridTemplate(name="nyt_classic_13", size=size, blocks=nyt_13_blocks),
             GridTemplate(name="dense", size=size, blocks=_grid_blocks(size, gap=8)),
         ]
     return [GridTemplate(name="open", size=size, blocks=set())]
@@ -119,6 +149,44 @@ def build_grid(template: GridTemplate) -> list[list[str]]:
     for r, c in template.blocks:
         grid[r][c] = "#"
     return grid
+
+
+def _blocks_from_grid(grid: list[list[str]]) -> set[tuple[int, int]]:
+    blocks: set[tuple[int, int]] = set()
+    for r, row in enumerate(grid):
+        for c, cell in enumerate(row):
+            if cell == "#":
+                blocks.add((r, c))
+    return blocks
+
+
+def _largest_white_component_ratio(grid: list[list[str]]) -> float:
+    size = len(grid)
+    whites = {(r, c) for r in range(size) for c in range(size) if grid[r][c] != "#"}
+    if not whites:
+        return 1.0
+    visited: set[tuple[int, int]] = set()
+    largest = 0
+    for start in whites:
+        if start in visited:
+            continue
+        stack = [start]
+        count = 0
+        while stack:
+            cell = stack.pop()
+            if cell in visited:
+                continue
+            visited.add(cell)
+            count += 1
+            r, c = cell
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nr, nc = r + dr, c + dc
+                neighbor = (nr, nc)
+                if neighbor in whites and neighbor not in visited:
+                    stack.append(neighbor)
+        if count > largest:
+            largest = count
+    return largest / len(whites)
 
 
 def extract_slots(grid: list[list[str]], min_len: int = 3) -> list[dict]:
@@ -293,6 +361,9 @@ def score_template(
     intersections = sum(1 for count in cell_map.values() if count > 1)
     crossing_score = min(1.0, intersections / max(1, len(slots)))
 
+    connected_ratio = _largest_white_component_ratio(grid)
+    disconnected_penalty = 1.0 - connected_ratio
+
     score = (
         w["length_fit"] * length_fit
         + w["anchor"] * anchor_score
@@ -307,6 +378,8 @@ def score_template(
         "anchor_score": anchor_score,
         "short_score": short_score,
         "crossing_score": crossing_score,
+        "connected_ratio": connected_ratio,
+        "disconnected_penalty": disconnected_penalty,
         "slot_count": len(slots),
         "weights": w,
     }
@@ -359,6 +432,9 @@ def score_template_from_length_hist(
     intersections = sum(1 for count in cell_map.values() if count > 1)
     crossing_score = min(1.0, intersections / max(1, len(slots)))
 
+    connected_ratio = _largest_white_component_ratio(grid)
+    disconnected_penalty = 1.0 - connected_ratio
+
     # Conflict is the fraction of slots that cannot be uniquely supplied by
     # current length inventory (shortage, not just complete absence).
     shortage_slots = sum(
@@ -405,6 +481,8 @@ def score_template_from_length_hist(
         "anchor_score": anchor_score,
         "short_score": short_score,
         "crossing_score": crossing_score,
+        "connected_ratio": connected_ratio,
+        "disconnected_penalty": disconnected_penalty,
         "slot_count": len(slots),
         "fill_conflict": fill_conflict,
         "long_slot_penalty": long_slot_penalty,
@@ -428,6 +506,7 @@ def select_best_template(
     fill_conflict_weight: float = 0.5,
     long_slot_penalty_weight: float = 2.0,
     auto_block_penalty_weight: float = 0.2,
+    disconnected_penalty_weight: float = 2.0,
     max_word_len: int | None = None,
     auto_block_long_slots_enabled: bool = True,
 ) -> dict:
@@ -457,6 +536,7 @@ def select_best_template(
             - (fill_conflict_weight * row["fill_conflict"])
             - (long_slot_penalty_weight * row["long_slot_penalty"])
             - (auto_block_penalty_weight * row["auto_block_density"])
+            - (disconnected_penalty_weight * row.get("disconnected_penalty", 0.0))
         )
     scored.sort(key=lambda row: (row["selection_score"], row["score"]), reverse=True)
     return {"selected": scored[0]["template"], "scored": scored}

@@ -76,3 +76,43 @@ def lexicon_score_for_tokens(tokens: list[str], lexicon: dict[str, float]) -> fl
     if not scored:
         return 0.0
     return sum(scored) / len(scored)
+
+
+def load_word_list(
+    path: str | Path | None,
+    *,
+    min_len: int = 3,
+    max_len: int = 12,
+    max_per_length: int | None = None,
+) -> list[str]:
+    if path is None:
+        return []
+    word_path = Path(path)
+    if not word_path.exists() or not word_path.is_file():
+        return []
+
+    buckets: dict[int, set[str]] = {}
+    with word_path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            text = line.strip()
+            if not text or text.startswith("#"):
+                continue
+            token = text.split()[0]
+            if not token:
+                continue
+            normalized = normalize_lexicon_token(token)
+            if not normalized:
+                continue
+            length = len(normalized)
+            if length < min_len or length > max_len:
+                continue
+            bucket = buckets.setdefault(length, set())
+            bucket.add(normalized)
+
+    words: list[str] = []
+    for length in sorted(buckets.keys()):
+        candidates = sorted(buckets[length])
+        if max_per_length is not None:
+            candidates = candidates[:max_per_length]
+        words.extend(candidates)
+    return words

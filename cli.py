@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 from src.pipeline import (
     run_candidate_scoring_stage,
@@ -13,6 +14,7 @@ from src.pipeline import (
     run_topology_selection_stage,
     run_csp_solve_stage,
     run_packaging_stage,
+    run_generate_pipeline,
 )
 
 
@@ -138,7 +140,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     score_parser.add_argument(
         "--lexicon-path",
-        default="data/lexicon/scowl_wordfreq.txt",
+        default="data/lexicon/combined_wordfreq.txt",
         help="Optional external lexicon file (word[,score])",
     )
     score_parser.add_argument(
@@ -238,7 +240,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     k_parser.add_argument(
         "--lexicon-path",
-        default="data/lexicon/scowl_wordfreq.txt",
+        default="data/lexicon/combined_wordfreq.txt",
         help="Optional external lexicon file (word[,score])",
     )
     k_parser.add_argument(
@@ -340,7 +342,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     term_parser.add_argument(
         "--lexicon-path",
-        default="data/lexicon/scowl_wordfreq.txt",
+        default="data/lexicon/combined_wordfreq.txt",
         help="Optional external lexicon file (word[,score])",
     )
     term_parser.add_argument(
@@ -371,7 +373,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to vocab gate diagnostics JSON output",
     )
     gate_parser.add_argument("--min-required", type=int, default=40, help="Minimum terms required")
-    gate_parser.add_argument("--max-allowed", type=int, default=80, help="Maximum terms allowed")
+    gate_parser.add_argument("--max-allowed", type=int, default=250, help="Maximum terms allowed")
 
     clue_parser = subparsers.add_parser(
         "clues",
@@ -443,7 +445,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to rescue diagnostics JSON output",
     )
     rescue_parser.add_argument("--gate-min", type=int, default=40, help="Minimum terms required")
-    rescue_parser.add_argument("--gate-max", type=int, default=80, help="Maximum terms allowed")
+    rescue_parser.add_argument("--gate-max", type=int, default=250, help="Maximum terms allowed")
     rescue_parser.add_argument("--min-len", type=int, default=4, help="Minimum answer length")
     rescue_parser.add_argument("--max-len", type=int, default=12, help="Maximum answer length")
     rescue_parser.add_argument(
@@ -481,7 +483,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip vocabulary readiness gate",
     )
     topo_parser.add_argument("--gate-min", type=int, default=40, help="Minimum terms required")
-    topo_parser.add_argument("--gate-max", type=int, default=80, help="Maximum terms allowed")
+    topo_parser.add_argument("--gate-max", type=int, default=250, help="Maximum terms allowed")
 
     csp_parser = subparsers.add_parser(
         "solve",
@@ -528,6 +530,46 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Maximum solver restarts",
     )
     csp_parser.add_argument(
+        "--template-trials",
+        type=int,
+        default=3,
+        help="Number of top templates to try before selecting best fill",
+    )
+    csp_parser.add_argument(
+        "--filler-path",
+        default="data/lexicon/filler_words.txt",
+        help="Optional filler word list for CSP (one word per line)",
+    )
+    csp_parser.add_argument(
+        "--no-filler",
+        action="store_true",
+        help="Disable filler word list for CSP",
+    )
+    csp_parser.add_argument(
+        "--filler-min-len",
+        type=int,
+        default=3,
+        help="Minimum filler word length",
+    )
+    csp_parser.add_argument(
+        "--filler-max-len",
+        type=int,
+        default=12,
+        help="Maximum filler word length",
+    )
+    csp_parser.add_argument(
+        "--filler-max-per-length",
+        type=int,
+        default=4000,
+        help="Max filler words to keep per length bucket",
+    )
+    csp_parser.add_argument(
+        "--filler-weight",
+        type=float,
+        default=0.05,
+        help="Score weight for filler words (lower favors thematic words)",
+    )
+    csp_parser.add_argument(
         "--random-seed",
         type=int,
         default=13,
@@ -567,7 +609,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip vocabulary readiness gate",
     )
     csp_parser.add_argument("--gate-min", type=int, default=40, help="Minimum terms required")
-    csp_parser.add_argument("--gate-max", type=int, default=80, help="Maximum terms allowed")
+    csp_parser.add_argument("--gate-max", type=int, default=250, help="Maximum terms allowed")
 
     package_parser = subparsers.add_parser(
         "package",
@@ -609,6 +651,93 @@ def _build_parser() -> argparse.ArgumentParser:
         default="outputs/diagnostics_package.json",
         help="Path to packaging diagnostics JSON output",
     )
+
+    generate_parser = subparsers.add_parser(
+        "generate",
+        help="Run full pipeline end-to-end",
+    )
+    generate_parser.add_argument("--seed", required=True, help="Seed Wikipedia article title")
+    generate_parser.add_argument(
+        "--lang",
+        default="en",
+        help="Language code for Wikipedia API (default: en, also supports el)",
+    )
+    generate_parser.add_argument(
+        "--output-dir",
+        default="outputs",
+        help="Output directory for all stage artifacts",
+    )
+    generate_parser.add_argument(
+        "--cache-dir",
+        default="data/cache/wiki",
+        help="Disk cache directory",
+    )
+    generate_parser.add_argument(
+        "--wikidata-cache-dir",
+        default="data/cache/wikidata",
+        help="Wikidata cache directory",
+    )
+    generate_parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Use cache only (skip network requests)",
+    )
+    generate_parser.add_argument("--max-links", type=int, default=None)
+    generate_parser.add_argument("--max-backlinks", type=int, default=None)
+    generate_parser.add_argument("--no-backlinks", action="store_true")
+    generate_parser.add_argument(
+        "--expansion",
+        default="one_hop_only",
+        choices=["one_hop_only", "one_hop_plus_bounded_two_hop"],
+    )
+    generate_parser.add_argument("--max-two-hop-parents", type=int, default=None)
+    generate_parser.add_argument("--max-two-hop-links", type=int, default=None)
+    generate_parser.add_argument("--max-candidates", type=int, default=None)
+    generate_parser.add_argument("--keep-threshold", type=float, default=0.2)
+    generate_parser.add_argument("--borderline-threshold", type=float, default=0.1)
+    generate_parser.add_argument(
+        "--lexicon-path",
+        default="data/lexicon/combined_wordfreq.txt",
+        help="Optional external lexicon file (word[,score])",
+    )
+    generate_parser.add_argument("--candidate-lexicon-weight", type=float, default=0.08)
+    generate_parser.add_argument("--term-lexicon-weight", type=float, default=0.15)
+    generate_parser.add_argument("--min-k", type=int, default=5)
+    generate_parser.add_argument("--max-k", type=int, default=None)
+    generate_parser.add_argument("--epsilon", type=float, default=0.01)
+    generate_parser.add_argument("--m", type=int, default=2)
+    generate_parser.add_argument("--grid-size", type=int, default=15)
+    generate_parser.add_argument("--min-slot-len", type=int, default=3)
+    generate_parser.add_argument("--min-len", type=int, default=4)
+    generate_parser.add_argument("--max-len", type=int, default=12)
+    generate_parser.add_argument("--min-alpha-ratio", type=float, default=0.8)
+    generate_parser.add_argument("--min-df", type=int, default=2)
+    generate_parser.add_argument("--nlp-backend", choices=["auto", "spacy", "nltk"], default="auto")
+    generate_parser.add_argument("--entity-type-scoring", action="store_true")
+    generate_parser.add_argument("--gate-min", type=int, default=40)
+    generate_parser.add_argument("--gate-max", type=int, default=250)
+    generate_parser.add_argument("--clue-min-words", type=int, default=6)
+    generate_parser.add_argument("--clue-max-words", type=int, default=12)
+    generate_parser.add_argument("--diversity-cap", type=int, default=2)
+    generate_parser.add_argument("--template", default=None)
+    generate_parser.add_argument("--use-topology", action="store_true")
+    generate_parser.add_argument("--max-steps", type=int, default=20000)
+    generate_parser.add_argument("--min-domain", type=int, default=1)
+    generate_parser.add_argument("--max-restarts", type=int, default=2)
+    generate_parser.add_argument("--template-trials", type=int, default=3)
+    generate_parser.add_argument("--random-seed", type=int, default=13)
+    generate_parser.add_argument("--no-ac3", action="store_true")
+    generate_parser.add_argument("--beam-width", type=int, default=32)
+    generate_parser.add_argument("--no-local-repair", action="store_true")
+    generate_parser.add_argument("--repair-steps", type=int, default=300)
+    generate_parser.add_argument("--filler-path", default="data/lexicon/filler_words.txt")
+    generate_parser.add_argument("--no-filler", action="store_true")
+    generate_parser.add_argument("--filler-min-len", type=int, default=3)
+    generate_parser.add_argument("--filler-max-len", type=int, default=12)
+    generate_parser.add_argument("--filler-max-per-length", type=int, default=4000)
+    generate_parser.add_argument("--filler-weight", type=float, default=0.05)
+    generate_parser.add_argument("--skip-gate", action="store_true")
+    generate_parser.add_argument("--no-rescue", action="store_true")
 
     return parser
 
@@ -776,6 +905,12 @@ def main() -> None:
             beam_width=args.beam_width,
             enable_local_repair=not args.no_local_repair,
             repair_steps=args.repair_steps,
+            template_trials=args.template_trials,
+            filler_path=None if args.no_filler else args.filler_path,
+            filler_min_len=args.filler_min_len,
+            filler_max_len=args.filler_max_len,
+            filler_max_per_length=args.filler_max_per_length,
+            filler_weight=args.filler_weight,
             require_gate=not args.skip_gate,
             gate_min=args.gate_min,
             gate_max=args.gate_max,
@@ -796,6 +931,65 @@ def main() -> None:
         print(f"Puzzle: {result.puzzle_path}")
         print(f"Attribution: {result.attribution_path}")
         print(f"Diagnostics: {result.diagnostics_path}")
+    elif args.command == "generate":
+        if args.offline:
+            os.environ["CROSSWORD_OFFLINE"] = "1"
+        result = run_generate_pipeline(
+            seed_title=args.seed,
+            lang=args.lang,
+            output_dir=args.output_dir,
+            cache_dir=args.cache_dir,
+            wikidata_cache_dir=args.wikidata_cache_dir,
+            include_backlinks=not args.no_backlinks,
+            max_links=args.max_links,
+            max_backlinks=args.max_backlinks,
+            expansion=args.expansion,
+            max_two_hop_parents=args.max_two_hop_parents,
+            max_two_hop_links=args.max_two_hop_links,
+            max_candidates=args.max_candidates,
+            keep_threshold=args.keep_threshold,
+            borderline_threshold=args.borderline_threshold,
+            lexicon_path=args.lexicon_path,
+            candidate_lexicon_weight=args.candidate_lexicon_weight,
+            term_lexicon_weight=args.term_lexicon_weight,
+            min_k=args.min_k,
+            max_k=args.max_k,
+            epsilon=args.epsilon,
+            m=args.m,
+            min_len=args.min_len,
+            max_len=args.max_len,
+            min_alpha_ratio=args.min_alpha_ratio,
+            min_df=args.min_df,
+            nlp_backend=args.nlp_backend,
+            entity_type_scoring=args.entity_type_scoring,
+            gate_min=args.gate_min,
+            gate_max=args.gate_max,
+            rescue=not args.no_rescue,
+            clue_min_words=args.clue_min_words,
+            clue_max_words=args.clue_max_words,
+            diversity_cap=args.diversity_cap,
+            size=args.grid_size,
+            min_slot_len=args.min_slot_len,
+            template_name=args.template,
+            max_steps=args.max_steps,
+            min_domain=args.min_domain,
+            max_restarts=args.max_restarts,
+            random_seed=args.random_seed,
+            use_ac3=not args.no_ac3,
+            beam_width=args.beam_width,
+            enable_local_repair=not args.no_local_repair,
+            repair_steps=args.repair_steps,
+            template_trials=args.template_trials,
+            filler_path=None if args.no_filler else args.filler_path,
+            filler_min_len=args.filler_min_len,
+            filler_max_len=args.filler_max_len,
+            filler_max_per_length=args.filler_max_per_length,
+            filler_weight=args.filler_weight,
+            skip_gate=args.skip_gate,
+            use_topology=args.use_topology,
+        )
+        print(f"Output dir: {result['output_dir']}")
+        print(f"Puzzle: {result['package'].puzzle_path}")
 
 
 if __name__ == "__main__":
