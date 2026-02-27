@@ -4,6 +4,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .cache import DiskCache
+from .artifact_models import (
+    GridArtifact,
+    GridSlotRecord,
+    PuzzleArtifact,
+    SelectedCandidatesArtifact,
+)
 from .diagnostics import build_seed_stage_diagnostics, write_json
 from .k_selector import select_k
 from .semantic import build_pairwise_matrix, build_tfidf_vectors, cosine_similarity, mmr_rank
@@ -28,6 +34,11 @@ from .clue_builder import (
 from .provenance import build_oldid_url, validate_clue_provenance
 from .wikidata_client import WikidataClient
 from .crossword_csp import build_slots, render_grid, solve_crossword
+from .csp_heuristics import (
+    build_solver_vocabulary,
+    evaluate_quality_gate,
+    run_template_trial,
+)
 from .lexicon import (
     load_lexicon_scores,
     load_word_list,
@@ -226,13 +237,16 @@ def run_seed_ingestion_stage(
         parent_titles = [candidate["title"] for candidate in links]
         parent_extracts: list[str] = []
         if seed_extract:
+            extract_payloads, extract_errors = client.fetch_page_extracts_concurrent(
+                parent_titles,
+                intro_only=True,
+                max_concurrency=8,
+            )
             for title in parent_titles:
-                try:
-                    extract = client.fetch_page_extract(title, intro_only=True).get("extract", "")
-                except Exception as exc:  # pragma: no cover - runtime/network path
-                    extract = ""
-                    errors.append(f"two_hop_parent_extract_failed:{title}:{exc}")
-                parent_extracts.append(extract)
+                payload = extract_payloads.get(title, {})
+                parent_extracts.append(payload.get("extract", ""))
+            for title, exc_text in extract_errors.items():
+                errors.append(f"two_hop_parent_extract_failed:{title}:{exc_text}")
 
             vectors = build_tfidf_vectors([seed_extract] + parent_extracts, lang=lang)
             seed_vec = vectors[0]
@@ -243,12 +257,19 @@ def run_seed_ingestion_stage(
             limit = max_two_hop_parents or len(ranked)
             two_hop_parents = [title for title, _ in ranked[:limit]]
 
+        parent_link_payloads: dict[str, dict] = {}
+        parent_link_errors: dict[str, str] = {}
+        if two_hop_parents:
+            parent_link_payloads, parent_link_errors = client.fetch_links_concurrent(
+                two_hop_parents,
+                max_links=max_two_hop_links,
+                max_concurrency=8,
+            )
+            for title, exc_text in parent_link_errors.items():
+                errors.append(f"two_hop_links_failed:{title}:{exc_text}")
+
         for parent_title in two_hop_parents:
-            try:
-                payload = client.fetch_links(parent_title, max_links=max_two_hop_links)
-            except Exception as exc:  # pragma: no cover - runtime/network path
-                errors.append(f"two_hop_links_failed:{parent_title}:{exc}")
-                continue
+            payload = parent_link_payloads.get(parent_title, {"links": []})
             for link in payload.get("links", []):
                 title = link.get("title")
                 if not title or title in candidate_map:
@@ -640,12 +661,13 @@ def run_k_selection_stage(
         mapping_errors.append(
             f"selected_title_mapping_missing_indices:{','.join(str(idx) for idx in missing_indices)}"
         )
-    selected_payload = {
-        "seed_title": seed_title,
-        "lang": lang,
-        "selected_k": selection.selected_k,
-        "selected_titles": selected_titles,
-    }
+    selected_payload_model = SelectedCandidatesArtifact(
+        seed_title=seed_title,
+        lang=lang,
+        selected_k=selection.selected_k,
+        selected_titles=selected_titles,
+    )
+    selected_payload = selected_payload_model.to_dict()
     final_selected = write_json(selected_path, selected_payload)
 
     diagnostics = {
@@ -704,7 +726,8 @@ def run_term_extraction_stage(
             import json
 
             selected = json.loads(selected_payload)
-            selected_titles = selected.get("selected_titles", [])
+            selected_artifact = SelectedCandidatesArtifact.from_dict(selected)
+            selected_titles = selected_artifact.selected_titles
         except Exception as exc:  # pragma: no cover
             errors.append(f"selected_parse_failed:{exc}")
             selected_titles = []
@@ -1643,33 +1666,29 @@ def run_csp_solve_stage(
             diagnostics=diagnostics,
         )
 
-    import csv
-
-    words: list[str] = []
-    word_scores: dict[str, float] = {}
-    def _normalize_solver_token(token: str) -> str:
-        text = (token or "").strip().upper()
-        if not text:
-            return ""
-        if lang == "en":
-            # Keep solver vocabulary strictly ASCII A-Z in English mode.
-            return "".join(ch for ch in text if "A" <= ch <= "Z")
-        return "".join(ch for ch in text if ch.isalpha())
-
-    with Path(terms_path).open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            normalized = _normalize_solver_token(row.get("normalized_answer") or "")
-            if not normalized:
-                continue
-            answer_score = _safe_float(row.get("answer_score"), default=0.0)
-            lexicon_score = _safe_float(row.get("lexicon_score"), default=0.0)
-            crossword_score = _safe_float(row.get("crosswordability_score"), default=0.0)
-            composite = (0.6 * answer_score) + (0.25 * lexicon_score) + (0.15 * crossword_score)
-            previous = word_scores.get(normalized)
-            if previous is None or composite > previous:
-                word_scores[normalized] = composite
-    themed_words = sorted(word_scores, key=lambda word: (word_scores[word], word), reverse=True)
+    vocabulary = build_solver_vocabulary(
+        terms_path=terms_path,
+        lang=lang,
+        filler_path=filler_path,
+        filler_min_len=filler_min_len,
+        filler_max_len=filler_max_len,
+        filler_max_per_length=filler_max_per_length,
+        filler_weight=filler_weight,
+    )
+    word_scores = vocabulary.word_scores
+    words = vocabulary.words
+    themed_words = vocabulary.themed_words
+    themed_set = vocabulary.themed_set
+    clue_answers = vocabulary.clue_answers
+    clue_answers_available = vocabulary.clue_answers_available
+    filler_words = vocabulary.filler_words
+    filler_raw_count = vocabulary.filler_raw_count
+    filler_added = vocabulary.filler_added
+    filler_limit_per_length = vocabulary.filler_limit_per_length
+    filler_weight = vocabulary.filler_weight
+    long_filler_weight = vocabulary.long_filler_weight
+    min_word_len = vocabulary.min_word_len
+    max_word_len = vocabulary.max_word_len
 
     gate_result = evaluate_vocab_gate(len(themed_words), min_required=gate_min, max_allowed=gate_max)
     if require_gate and not gate_result.passed:
@@ -1689,76 +1708,6 @@ def run_csp_solve_stage(
             diagnostics=diagnostics,
         )
 
-    themed_set = set(word_scores.keys())
-    clue_answers_path = Path(terms_path).with_name("clues.csv")
-    clue_answers: set[str] = set()
-    if clue_answers_path.exists():
-        with clue_answers_path.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle)
-            for row in reader:
-                answer = _normalize_solver_token(row.get("normalized_answer") or "")
-                if answer:
-                    clue_answers.add(answer)
-    clue_answers_available = bool(clue_answers)
-
-    common_lexicon = load_lexicon_scores("data/lexicon/combined_wordfreq.txt")
-
-    def _is_strict_filler_candidate(word: str) -> bool:
-        if not word:
-            return False
-        if lang == "en":
-            if not word.isascii():
-                return False
-            if any(ch < "A" or ch > "Z" for ch in word):
-                return False
-            if len(set(word)) <= 1:
-                return False
-            vowel_count = sum(ch in "AEIOUY" for ch in word)
-            if vowel_count == 0:
-                return False
-            if len(word) <= 4 and vowel_count <= 1:
-                # Filters most acronym-like short tokens.
-                return False
-        if common_lexicon:
-            if common_lexicon.get(word, 0.0) < 0.12:
-                return False
-        return True
-
-    filler_raw_words = load_word_list(
-        filler_path,
-        min_len=filler_min_len,
-        max_len=filler_max_len,
-        max_per_length=filler_max_per_length,
-    )
-    filler_raw_count = len(filler_raw_words)
-    filler_limit_per_length = min(filler_max_per_length, 1200)
-    filler_buckets: dict[int, list[str]] = {}
-    for word in filler_raw_words:
-        if word in word_scores or not _is_strict_filler_candidate(word):
-            continue
-        filler_buckets.setdefault(len(word), []).append(word)
-    filler_words: list[str] = []
-    for length in sorted(filler_buckets):
-        unique = sorted(
-            set(filler_buckets[length]),
-            key=lambda token: (common_lexicon.get(token, 0.0), token),
-            reverse=True,
-        )
-        filler_words.extend(unique[:filler_limit_per_length])
-
-    filler_added = 0
-    filler_weight = min(float(filler_weight), 0.015)
-    long_filler_weight = min(filler_weight * 0.25, 0.004)
-    for word in filler_words:
-        if word in word_scores:
-            continue
-        word_scores[word] = long_filler_weight if len(word) >= 6 else filler_weight
-        filler_added += 1
-
-    words = sorted(word_scores, key=lambda word: (word_scores[word], word), reverse=True)
-
-    min_word_len = min((len(word) for word in words), default=None)
-    max_word_len = max((len(word) for word in words), default=None)
     effective_min_slot_len = min_slot_len
     if min_word_len is not None:
         effective_min_slot_len = max(min_slot_len, min_word_len)
@@ -1811,214 +1760,37 @@ def run_csp_solve_stage(
         except Exception as exc:
             errors.append(f"rust_solver_unavailable:{exc}")
 
-    def _imply_assignments(
-        rendered_grid: list[list[str]],
-        slots_to_check: list,
-        assignments_in: dict[int, str],
-    ) -> tuple[dict[int, str], list[dict]]:
-        implied = dict(assignments_in)
-        used_words = set(implied.values())
-        invalid_slots: list[dict] = []
-        for slot in slots_to_check:
-            if slot.id in implied:
-                continue
-            letters: list[str] = []
-            for r, c in slot.cells:
-                cell = rendered_grid[r][c]
-                if cell in (".", "#"):
-                    letters = []
-                    break
-                letters.append(cell)
-            if not letters:
-                continue
-            word = "".join(letters)
-            if word in word_scores and word not in used_words:
-                implied[slot.id] = word
-                used_words.add(word)
-            else:
-                invalid_slots.append(
-                    {
-                        "slot_id": slot.id,
-                        "direction": slot.direction,
-                        "length": slot.length,
-                        "position": slot.cells[0],
-                        "word": word,
-                        "reason": "not_in_pool" if word not in word_scores else "duplicate",
-                    }
-                )
-        return implied, invalid_slots
-
-    def _run_template(template, trial_seed: int) -> dict:
-        grid = build_grid(template)
-        auto_block = auto_block_long_slots(grid, max_slot_len=max_word_len, symmetric=True)
-        grid = auto_block["grid"]
-        slots = build_slots(grid, min_len=effective_min_slot_len)
-        domains = {slot.id: [word for word in words if len(word) == slot.length] for slot in slots}
-        active_slots = [slot for slot in slots if len(domains[slot.id]) >= min_domain]
-        slot_by_id = {slot.id: slot for slot in slots}
-        long_slot_ids = {slot.id for slot in slots if slot.length >= 6}
-        trial_errors: list[str] = []
-        phase_a_result = {"solved": False, "assignments": {}, "steps": 0, "restarts": 0}
-        preferred_long_words: set[str] = set()
-        if not active_slots:
-            trial_errors.append("no_active_slots")
-            result = {"solved": False, "assignments": {}, "steps": 0, "restarts": 0}
-        else:
-            phase_a_steps = max(2000, max_steps // 4)
-            phase_a_restarts = max(1, max_restarts // 3)
-            phase_a_result = solver(
-                grid,
-                active_slots,
-                themed_words,
-                min_len=effective_min_slot_len,
-                max_steps=phase_a_steps,
-                max_restarts=phase_a_restarts,
-                random_seed=trial_seed + 37,
-                use_ac3=use_ac3,
-                word_scores=word_scores,
-                beam_width=max(16, beam_width // 2),
-                enable_local_repair=False,
-                repair_steps=0,
-            )
-            for slot_id, word in phase_a_result.get("assignments", {}).items():
-                slot = slot_by_id.get(slot_id)
-                if slot is not None and slot.length >= 6 and word in themed_set:
-                    preferred_long_words.add(word)
-
-            phase_b_scores = dict(word_scores)
-            for word in words:
-                if word not in themed_set and len(word) >= 6:
-                    phase_b_scores[word] = min(phase_b_scores[word], long_filler_weight)
-            for word in preferred_long_words:
-                phase_b_scores[word] = phase_b_scores.get(word, 0.0) + 0.35
-            result = solver(
-                grid,
-                active_slots,
-                words,
-                min_len=effective_min_slot_len,
-                max_steps=max_steps,
-                max_restarts=max_restarts,
-                random_seed=trial_seed,
-                use_ac3=use_ac3,
-                word_scores=phase_b_scores,
-                beam_width=beam_width,
-                enable_local_repair=enable_local_repair,
-                repair_steps=repair_steps,
-            )
-
-        rendered = render_grid(grid, active_slots, result["assignments"])
-        final_assignments, invalid_slots = _imply_assignments(
-            rendered, slots, result["assignments"]
-        )
-        unclued_removed_count = 0
-        if clue_answers_available:
-            clued_assignments = {
-                slot_id: word for slot_id, word in final_assignments.items() if word in clue_answers
-            }
-            unclued_removed_count = len(final_assignments) - len(clued_assignments)
-            final_assignments = clued_assignments
-            rendered = render_grid(grid, slots, final_assignments)
-        fill_count = sum(1 for row in rendered for cell in row if cell not in (".", "#"))
-        total_cells = sum(1 for row in rendered for cell in row if cell != "#")
-        fill_percent = 0.0 if total_cells == 0 else fill_count / total_cells
-        unfilled_slots = []
-        assigned_ids = set(final_assignments.keys())
-        for slot in slots:
-            if slot.id in assigned_ids:
-                continue
-            unfilled_slots.append(
-                {
-                    "slot_id": slot.id,
-                    "direction": slot.direction,
-                    "length": slot.length,
-                    "position": slot.cells[0],
-                }
-            )
-
-        assigned_count = len(final_assignments)
-        themed_assigned_count = sum(1 for word in final_assignments.values() if word in themed_set)
-        clued_assigned_count = (
-            sum(1 for word in final_assignments.values() if word in clue_answers)
-            if clue_answers_available
-            else assigned_count
-        )
-        filler_used_count = max(0, assigned_count - themed_assigned_count)
-        filler_used_ratio = 0.0 if assigned_count == 0 else filler_used_count / assigned_count
-        clued_entry_ratio = 0.0 if assigned_count == 0 else clued_assigned_count / assigned_count
-        long_slot_assigned_count = sum(1 for slot_id in final_assignments if slot_id in long_slot_ids)
-        long_slot_non_theme_count = sum(
-            1
-            for slot_id, word in final_assignments.items()
-            if slot_id in long_slot_ids and word not in themed_set
-        )
-        long_slot_theme_ratio = (
-            1.0
-            if long_slot_assigned_count == 0
-            else (long_slot_assigned_count - long_slot_non_theme_count) / long_slot_assigned_count
-        )
-
-        # Optimize for good crossword quality, not just raw fill.
-        quality_objective = (
-            (1.20 * fill_percent)
-            + (0.90 * (0.0 if assigned_count == 0 else themed_assigned_count / assigned_count))
-            + (0.70 * clued_entry_ratio)
-            - (1.10 * filler_used_ratio)
-            - (0.25 * len(invalid_slots))
-            - (0.50 * long_slot_non_theme_count)
-        )
-
-        solved_final = result["solved"] or (
-            len(final_assignments) == len(slots) and not invalid_slots
-        )
-        if solved_final and active_slots and len(final_assignments) == len(slots):
-            fill_status = "complete"
-        elif final_assignments:
-            fill_status = "partial"
-        else:
-            fill_status = "failed"
-
-        return {
-            "template": template,
-            "rendered": rendered,
-            "result": {**result, "assignments": final_assignments},
-            "slots": slots,
-            "active_slots": active_slots,
-            "auto_block": auto_block,
-            "fill_percent": fill_percent,
-            "fill_status": fill_status,
-            "fill_count": fill_count,
-            "total_cells": total_cells,
-            "unfilled_slots": unfilled_slots,
-            "trial_errors": trial_errors,
-            "invalid_slots": invalid_slots,
-            "implicit_added_count": len(final_assignments) - len(result["assignments"]),
-            "solved_final": solved_final,
-            "quality_objective": quality_objective,
-            "themed_assigned_count": themed_assigned_count,
-            "clued_assigned_count": clued_assigned_count,
-            "assigned_count": assigned_count,
-            "filler_used_count": filler_used_count,
-            "filler_used_ratio": filler_used_ratio,
-            "clued_entry_ratio": clued_entry_ratio,
-            "long_slot_assigned_count": long_slot_assigned_count,
-            "long_slot_non_theme_count": long_slot_non_theme_count,
-            "long_slot_theme_ratio": long_slot_theme_ratio,
-            "unclued_removed_count": unclued_removed_count,
-            "phase_a": {
-                "steps": phase_a_result.get("steps", 0),
-                "restarts": phase_a_result.get("restarts", 0),
-                "assigned_count": len(phase_a_result.get("assignments", {})),
-                "preferred_long_words_count": len(preferred_long_words),
-            },
-        }
-
     template_trials_log: list[dict] = []
     best_trial: dict | None = None
     best_rank: tuple[int, float, float, int, int] | None = None
 
     for idx, template in enumerate(templates_to_try):
         trial_seed = random_seed + (idx * 101)
-        trial = _run_template(template, trial_seed)
+        trial = run_template_trial(
+            template=template,
+            trial_seed=trial_seed,
+            solver=solver,
+            build_grid_fn=build_grid,
+            auto_block_long_slots_fn=auto_block_long_slots,
+            build_slots_fn=build_slots,
+            render_grid_fn=render_grid,
+            words=words,
+            themed_words=themed_words,
+            themed_set=themed_set,
+            clue_answers=clue_answers,
+            clue_answers_available=clue_answers_available,
+            word_scores=word_scores,
+            long_filler_weight=long_filler_weight,
+            max_word_len=max_word_len,
+            effective_min_slot_len=effective_min_slot_len,
+            min_domain=min_domain,
+            max_steps=max_steps,
+            max_restarts=max_restarts,
+            use_ac3=use_ac3,
+            beam_width=beam_width,
+            enable_local_repair=enable_local_repair,
+            repair_steps=repair_steps,
+        )
         template_trials_log.append(
             {
                 "template": template.name,
@@ -2094,18 +1866,14 @@ def run_csp_solve_stage(
     long_slot_theme_ratio = best_trial["long_slot_theme_ratio"]
     quality_objective = best_trial["quality_objective"]
     unclued_removed_count = best_trial["unclued_removed_count"]
-    quality_gate_reasons: list[str] = []
-    if fill_percent < 0.98:
-        quality_gate_reasons.append("fill_percent_below_min:0.98")
-    if invalid_slots:
-        quality_gate_reasons.append("invalid_slots_present")
-    if filler_used_ratio > 0.25:
-        quality_gate_reasons.append("filler_ratio_above_max:0.25")
-    if clue_answers_available and clued_entry_ratio < 0.90:
-        quality_gate_reasons.append("clued_ratio_below_min:0.90")
-    if long_slot_non_theme_count > 0:
-        quality_gate_reasons.append("long_slots_using_filler")
-    quality_gate_passed = len(quality_gate_reasons) == 0
+    quality_gate_passed, quality_gate_reasons = evaluate_quality_gate(
+        fill_percent=fill_percent,
+        invalid_slots=invalid_slots,
+        filler_used_ratio=filler_used_ratio,
+        clued_entry_ratio=clued_entry_ratio,
+        clue_answers_available=clue_answers_available,
+        long_slot_non_theme_count=long_slot_non_theme_count,
+    )
     if not quality_gate_passed:
         fill_status = "failed"
         solved_final = False
@@ -2113,25 +1881,25 @@ def run_csp_solve_stage(
     if unclued_removed_count > 0:
         errors.append(f"unclued_assignments_removed:{unclued_removed_count}")
 
-    payload = {
-        "seed_title": seed_title,
-        "lang": lang,
-        "template": template.name,
-        "size": size,
-        "min_slot_len": min_slot_len,
-        "effective_min_slot_len": effective_min_slot_len,
-        "grid": rendered,
-        "assignments": result["assignments"],
-        "slots": [
-            {
-                "id": slot.id,
-                "direction": slot.direction,
-                "length": slot.length,
-                "cells": slot.cells,
-            }
+    grid_artifact = GridArtifact(
+        seed_title=seed_title,
+        lang=lang,
+        template=template.name,
+        size=size,
+        min_slot_len=min_slot_len,
+        effective_min_slot_len=effective_min_slot_len,
+        grid=rendered,
+        assignments=result["assignments"],
+        slots=[
+            GridSlotRecord(
+                id=slot.id,
+                direction=slot.direction,
+                length=slot.length,
+                cells=slot.cells,
+            )
             for slot in slots
         ],
-        "auto_block": {
+        auto_block={
             "max_word_len": max_word_len,
             "added_block_count": len(auto_block["added_blocks"]),
             "added_blocks": auto_block["added_blocks"],
@@ -2139,7 +1907,7 @@ def run_csp_solve_stage(
             "long_slot_count_after": len(auto_block["long_slots_after"]),
             "iterations": auto_block["iterations"],
         },
-        "filler": {
+        filler={
             "path": str(filler_path) if filler_path is not None else None,
             "loaded": bool(filler_words),
             "min_len": filler_min_len,
@@ -2153,28 +1921,31 @@ def run_csp_solve_stage(
             "used_ratio": filler_used_ratio,
             "strict_filter_enabled": True,
         },
-        "implicit_assignments_added": implicit_added_count,
-        "invalid_slots": invalid_slots,
-        "quality_gate": {
-            "passed": quality_gate_passed,
-            "reasons": quality_gate_reasons,
-            "objective": quality_objective,
-            "min_fill_percent": 0.98,
-            "max_filler_ratio": 0.25,
-            "min_clued_ratio": 0.90 if clue_answers_available else None,
+        invalid_slots=invalid_slots,
+        fill_status=fill_status,
+        fill_percent=fill_percent,
+        unfilled_slots=unfilled_slots,
+        extras={
+            "implicit_assignments_added": implicit_added_count,
+            "quality_gate": {
+                "passed": quality_gate_passed,
+                "reasons": quality_gate_reasons,
+                "objective": quality_objective,
+                "min_fill_percent": 0.98,
+                "max_filler_ratio": 0.25,
+                "min_clued_ratio": 0.90 if clue_answers_available else None,
+            },
+            "assigned_count": assigned_count,
+            "themed_assigned_count": themed_assigned_count,
+            "clued_assigned_count": clued_assigned_count,
+            "clue_answers_available": clue_answers_available,
+            "clued_entry_ratio": clued_entry_ratio,
+            "long_slot_assigned_count": long_slot_assigned_count,
+            "long_slot_non_theme_count": long_slot_non_theme_count,
+            "long_slot_theme_ratio": long_slot_theme_ratio,
         },
-        "assigned_count": assigned_count,
-        "themed_assigned_count": themed_assigned_count,
-        "clued_assigned_count": clued_assigned_count,
-        "clue_answers_available": clue_answers_available,
-        "clued_entry_ratio": clued_entry_ratio,
-        "long_slot_assigned_count": long_slot_assigned_count,
-        "long_slot_non_theme_count": long_slot_non_theme_count,
-        "long_slot_theme_ratio": long_slot_theme_ratio,
-        "fill_status": fill_status,
-        "fill_percent": fill_percent,
-        "unfilled_slots": unfilled_slots,
-    }
+    )
+    payload = grid_artifact.to_dict()
 
     if best_trial["trial_errors"]:
         errors.extend(best_trial["trial_errors"])
@@ -2252,24 +2023,28 @@ def run_packaging_stage(
 
     selected_titles: list[str] = []
     selected_k = 0
+    selected_artifact: SelectedCandidatesArtifact | None = None
     if Path(selected_path).exists():
         try:
             import json
 
             payload = json.loads(Path(selected_path).read_text(encoding="utf-8"))
-            selected_titles = payload.get("selected_titles", [])
-            selected_k = payload.get("selected_k", len(selected_titles))
+            selected_artifact = SelectedCandidatesArtifact.from_dict(payload)
+            selected_titles = selected_artifact.selected_titles
+            selected_k = selected_artifact.selected_k
         except Exception as exc:  # pragma: no cover
             errors.append(f"selected_parse_failed:{exc}")
     else:
         errors.append("selected_missing")
 
     grid_payload: dict = {}
+    grid_artifact: GridArtifact | None = None
     if Path(grid_path).exists():
         try:
             import json
 
             grid_payload = json.loads(Path(grid_path).read_text(encoding="utf-8"))
+            grid_artifact = GridArtifact.from_dict(grid_payload)
         except Exception as exc:  # pragma: no cover
             errors.append(f"grid_parse_failed:{exc}")
     else:
@@ -2296,31 +2071,40 @@ def run_packaging_stage(
         text = (clue_row.get("clue") or "").strip()
         return bool(text)
 
-    template_name = grid_payload.get("template")
-    size = grid_payload.get("size", 15)
-    min_slot_len = grid_payload.get("effective_min_slot_len") or grid_payload.get("min_slot_len") or 3
+    template_name = grid_artifact.template if grid_artifact is not None else grid_payload.get("template")
+    size = grid_artifact.size if grid_artifact is not None else grid_payload.get("size", 15)
+    if grid_artifact is not None:
+        min_slot_len = grid_artifact.effective_min_slot_len or grid_artifact.min_slot_len
+    else:
+        min_slot_len = grid_payload.get("effective_min_slot_len") or grid_payload.get("min_slot_len") or 3
 
     across_entries: list[dict] = []
     down_entries: list[dict] = []
     unclued_assigned_slots: list[dict] = []
-    assignments = grid_payload.get("assignments", {})
-    normalized_assignments = {int(k): v for k, v in assignments.items()}
+    if grid_artifact is not None:
+        normalized_assignments = dict(grid_artifact.assignments)
+    else:
+        assignments = grid_payload.get("assignments", {})
+        normalized_assignments = {int(k): v for k, v in assignments.items()}
     slot_records: list[dict] = []
 
-    raw_slots = grid_payload.get("slots")
-    if isinstance(raw_slots, list):
-        for row in raw_slots:
-            try:
-                slot_records.append(
-                    {
-                        "id": int(row["id"]),
-                        "direction": str(row["direction"]),
-                        "length": int(row["length"]),
-                        "cells": [tuple(cell) for cell in row["cells"]],
-                    }
-                )
-            except Exception:
-                continue
+    if grid_artifact is not None:
+        slot_records = [slot.to_dict() for slot in grid_artifact.slots]
+    else:
+        raw_slots = grid_payload.get("slots")
+        if isinstance(raw_slots, list):
+            for row in raw_slots:
+                try:
+                    slot_records.append(
+                        {
+                            "id": int(row["id"]),
+                            "direction": str(row["direction"]),
+                            "length": int(row["length"]),
+                            "cells": [tuple(cell) for cell in row["cells"]],
+                        }
+                    )
+                except Exception:
+                    continue
 
     if not slot_records and template_name:
         templates = get_templates(size)
@@ -2369,9 +2153,9 @@ def run_packaging_stage(
         else:
             down_entries.append(entry)
 
-    fill_status = grid_payload.get("fill_status", "failed")
-    fill_percent = grid_payload.get("fill_percent", 0.0)
-    unfilled_slots = grid_payload.get("unfilled_slots", [])
+    fill_status = grid_artifact.fill_status if grid_artifact is not None else grid_payload.get("fill_status", "failed")
+    fill_percent = grid_artifact.fill_percent if grid_artifact is not None else grid_payload.get("fill_percent", 0.0)
+    unfilled_slots = grid_artifact.unfilled_slots if grid_artifact is not None else grid_payload.get("unfilled_slots", [])
     assigned_slot_count = len(normalized_assignments)
     clued_entry_count = len(across_entries) + len(down_entries)
     clued_entry_ratio = 0.0 if assigned_slot_count == 0 else clued_entry_count / assigned_slot_count
@@ -2388,20 +2172,20 @@ def run_packaging_stage(
     if provenance_missing:
         errors.append("provenance_incomplete")
 
-    puzzle_payload = {
-        "seed_title": seed_title,
-        "lang": lang,
-        "selected_articles": selected_titles,
-        "selected_k": selected_k,
-        "grid_template_id": template_name,
-        "grid_cells": grid_payload.get("grid", []),
-        "across_entries": across_entries,
-        "down_entries": down_entries,
-        "fill_status": fill_status,
-        "fill_percent": fill_percent,
-        "unfilled_slots": unfilled_slots,
-        "puzzle_status": puzzle_status,
-        "diagnostics": {
+    puzzle_model = PuzzleArtifact(
+        seed_title=seed_title,
+        lang=lang,
+        selected_articles=selected_titles,
+        selected_k=selected_k,
+        grid_template_id=template_name,
+        grid_cells=grid_artifact.grid if grid_artifact is not None else grid_payload.get("grid", []),
+        across_entries=across_entries,
+        down_entries=down_entries,
+        fill_status=fill_status,
+        fill_percent=fill_percent,
+        unfilled_slots=unfilled_slots,
+        puzzle_status=puzzle_status,
+        diagnostics={
             "errors": errors,
             "provenance_missing_count": len(provenance_missing),
             "assigned_slot_count": assigned_slot_count,
@@ -2410,8 +2194,9 @@ def run_packaging_stage(
             "unclued_assigned_slots_count": len(unclued_assigned_slots),
             "unclued_assigned_slots": unclued_assigned_slots,
         },
-        "attribution": clues,
-    }
+        attribution=clues,
+    )
+    puzzle_payload = puzzle_model.to_dict()
 
     final_puzzle = write_json(puzzle_path, puzzle_payload)
     final_attribution = write_json(attribution_path, {"clues": clues})

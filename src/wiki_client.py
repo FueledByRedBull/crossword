@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -244,6 +245,124 @@ class WikiClient:
             "extract": page.get("extract", ""),
             "revid": revid,
         }
+
+    async def _fetch_page_extract_async(
+        self,
+        title: str,
+        *,
+        intro_only: bool,
+        semaphore: asyncio.Semaphore,
+    ) -> tuple[str, dict[str, Any], str | None]:
+        async with semaphore:
+            try:
+                payload = await asyncio.to_thread(self.fetch_page_extract, title, intro_only=intro_only)
+                return title, payload, None
+            except Exception as exc:  # pragma: no cover - runtime/network path
+                return title, {"title": title, "page_id": None, "extract": ""}, str(exc)
+
+    async def _fetch_links_async(
+        self,
+        title: str,
+        *,
+        max_links: int | None,
+        semaphore: asyncio.Semaphore,
+    ) -> tuple[str, dict[str, Any], str | None]:
+        async with semaphore:
+            try:
+                payload = await asyncio.to_thread(self.fetch_links, title, max_links=max_links)
+                return title, payload, None
+            except Exception as exc:  # pragma: no cover - runtime/network path
+                return title, {"seed_title": title, "seed_page_id": None, "links": []}, str(exc)
+
+    def fetch_page_extracts_concurrent(
+        self,
+        titles: list[str],
+        *,
+        intro_only: bool = True,
+        max_concurrency: int = 8,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+        unique_titles = list(dict.fromkeys(title for title in titles if title))
+        if not unique_titles:
+            return {}, {}
+        if len(unique_titles) == 1:
+            title = unique_titles[0]
+            try:
+                return {title: self.fetch_page_extract(title, intro_only=intro_only)}, {}
+            except Exception as exc:  # pragma: no cover - runtime/network path
+                return {title: {"title": title, "page_id": None, "extract": ""}}, {title: str(exc)}
+
+        async def _run() -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+            semaphore = asyncio.Semaphore(max(1, max_concurrency))
+            tasks = [
+                self._fetch_page_extract_async(title, intro_only=intro_only, semaphore=semaphore)
+                for title in unique_titles
+            ]
+            results = await asyncio.gather(*tasks)
+            payloads: dict[str, dict[str, Any]] = {}
+            errors: dict[str, str] = {}
+            for title, payload, error in results:
+                payloads[title] = payload
+                if error:
+                    errors[title] = error
+            return payloads, errors
+
+        try:
+            return asyncio.run(_run())
+        except RuntimeError:
+            payloads: dict[str, dict[str, Any]] = {}
+            errors: dict[str, str] = {}
+            for title in unique_titles:
+                try:
+                    payloads[title] = self.fetch_page_extract(title, intro_only=intro_only)
+                except Exception as exc:  # pragma: no cover - runtime/network path
+                    payloads[title] = {"title": title, "page_id": None, "extract": ""}
+                    errors[title] = str(exc)
+            return payloads, errors
+
+    def fetch_links_concurrent(
+        self,
+        titles: list[str],
+        *,
+        max_links: int | None = None,
+        max_concurrency: int = 8,
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+        unique_titles = list(dict.fromkeys(title for title in titles if title))
+        if not unique_titles:
+            return {}, {}
+        if len(unique_titles) == 1:
+            title = unique_titles[0]
+            try:
+                return {title: self.fetch_links(title, max_links=max_links)}, {}
+            except Exception as exc:  # pragma: no cover - runtime/network path
+                return {title: {"seed_title": title, "seed_page_id": None, "links": []}}, {title: str(exc)}
+
+        async def _run() -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+            semaphore = asyncio.Semaphore(max(1, max_concurrency))
+            tasks = [
+                self._fetch_links_async(title, max_links=max_links, semaphore=semaphore)
+                for title in unique_titles
+            ]
+            results = await asyncio.gather(*tasks)
+            payloads: dict[str, dict[str, Any]] = {}
+            errors: dict[str, str] = {}
+            for title, payload, error in results:
+                payloads[title] = payload
+                if error:
+                    errors[title] = error
+            return payloads, errors
+
+        try:
+            return asyncio.run(_run())
+        except RuntimeError:
+            payloads: dict[str, dict[str, Any]] = {}
+            errors: dict[str, str] = {}
+            for title in unique_titles:
+                try:
+                    payloads[title] = self.fetch_links(title, max_links=max_links)
+                except Exception as exc:  # pragma: no cover - runtime/network path
+                    payloads[title] = {"seed_title": title, "seed_page_id": None, "links": []}
+                    errors[title] = str(exc)
+            return payloads, errors
 
     def extract_lead_bold_terms(self, wikitext: str) -> list[str]:
         if not wikitext or mwparserfromhell is None:
