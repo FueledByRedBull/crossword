@@ -1,101 +1,112 @@
-# 🧩 Wikipedia-Seeded Thematic Crossword Generator
+# Wikipedia-Seeded Crossword Generator
 
-Generate coherent, educational crossword puzzles from any Wikipedia article. Give it a seed topic like *Thermodynamics* or *Jazz*, and it builds a complete puzzle — grid, clues, and all.
+Generate thematic crosswords from a Wikipedia seed article with provenance-backed clues and diagnostics.
 
-## How It Works
+## Requirements
 
-The system runs a multi-stage pipeline:
+- Python 3.10+
+- Rust toolchain (optional, only for Rust CSP backend)
 
-1. **Seed Graph Expansion** — Fetches outgoing links from the seed Wikipedia article (optional 2-hop expansion)
-2. **Semantic Scoring** — Ranks candidates using TF-IDF cosine similarity, redundancy penalty, depth penalty, and backlink bonus (MMR-style)
-3. **K Optimization** — Selects the optimal number of articles using a crossword-aware objective with diminishing-returns stopping
-4. **Term Extraction** — Extracts crossword answer candidates via spaCy NLP (with nltk fallback), lead-section boldface signals, and quality filters
-5. **Clue Generation** — Four-pass pipeline: extract → mask/trim → validate (leakage check) → diversity deduplication
-6. **Grid Topology Selection** — Scores candidate grid templates against the word-length distribution
-7. **CSP Fill** — Fills the grid using arc consistency (AC-3), MRV/degree variable ordering, and forward checking with restarts
-8. **Provenance & Packaging** — Bundles the puzzle with full CC BY-SA attribution metadata
+## Install
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+## Optional: Build Rust CSP Backend
+
+```powershell
+cd rust_csp
+python -m pip install maturin
+python -m maturin develop
+cd ..
+```
+
+After this, `--use-rust` is available in `generate`, `solve`, and tuning/benchmark scripts.
 
 ## Quick Start
 
-### Prerequisites
-
-- Python 3.10+
-
-### Installation
-
-```bash
-pip install -r requirements.txt
+```powershell
+python cli.py generate `
+  --seed "Thermodynamics" `
+  --lang en `
+  --output-dir outputs\run_thermo `
+  --use-topology `
+  --use-rust
 ```
 
-### Usage
+Offline (cache-only):
 
-```bash
-# Generate an English crossword from "Thermodynamics"
-python cli.py generate \
-  --seed "Thermodynamics" \
-  --lang en \
-  --grid-size 15 \
-  --output outputs/thermo_15.json
-
-# Generate a Greek crossword
-python cli.py generate \
-  --seed "Θερμοδυναμική" \
-  --lang el \
-  --grid-size 13 \
-  --output outputs/thermo_el_13.json
+```powershell
+python cli.py generate `
+  --seed "Thermodynamics" `
+  --output-dir outputs\run_thermo_offline `
+  --offline `
+  --use-rust
 ```
 
-**Key flags:**
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--seed` | Wikipedia article title | *(required)* |
-| `--lang` | Language (`en` or `el`) | `en` |
-| `--grid-size` | Grid dimension | `15` |
-| `--expansion` | `one_hop_only` or `one_hop_plus_bounded_two_hop` | `one_hop_only` |
-| `--output` | Output path | `outputs/puzzle.json` |
+## Current Quality Controls
 
-## Project Structure
+The CSP stage now enforces quality gates before accepting a puzzle:
 
+- `fill_percent >= 0.98`
+- `invalid_slots == 0`
+- `filler_used_ratio <= 0.25`
+- `clued_entry_ratio >= 0.90` (when clue set is available)
+- no non-themed filler in long slots
+
+If any gate fails, solve status is marked as failed and packaging reports `insufficient_quality` or `insufficient_clues`.
+
+## Solver Behavior
+
+- Two-phase solve:
+- Phase A: thematic prepass focused on long slots.
+- Phase B: full solve with strict filler penalties, then quality-gated selection.
+- Strict filler filtering:
+- English solver vocabulary is ASCII A-Z only.
+- Acronym-like and low-quality filler is filtered out.
+- Defaults are conservative: `filler_max_per_length=1200`, `filler_weight=0.01`.
+
+## Tuning Weights
+
+Run grid-search tuning across benchmark seeds:
+
+```powershell
+python scripts/tune_weights.py `
+  --offline `
+  --use-rust `
+  --seeds "Thermodynamics,Jazz,Ancient Rome,Quantum mechanics" `
+  --output-dir outputs/weight_tuning_v2 `
+  --candidate-weights "1.5,0.3,0.3,0.2;1.8,0.25,0.35,0.15;1.3,0.35,0.25,0.25;1.6,0.4,0.2,0.1" `
+  --k-weights "1.0,1.0,1.0,0.5,0.5;1.2,1.1,1.0,0.4,0.3;0.9,1.2,1.1,0.6,0.4;1.1,0.9,1.2,0.3,0.6" `
+  --max-steps 80000 `
+  --max-restarts 12 `
+  --template-trials 5 `
+  --beam-width 64 `
+  --filler-max-per-length 1200 `
+  --filler-weight 0.01
 ```
-src/
-├── pipeline.py          # Stage orchestration
-├── wiki_client.py       # MediaWiki API client with caching
-├── wikidata_client.py   # Wikidata entity lookups
-├── semantic.py          # TF-IDF vectorization & MMR scoring
-├── k_selector.py        # Crossword-aware K optimization
-├── term_extractor.py    # NLP-based answer extraction
-├── clue_builder.py      # Four-pass clue pipeline
-├── topology.py          # Grid template generation & scoring
-├── crossword_csp.py     # Constraint solver (AC-3 + backtracking)
-├── provenance.py        # Attribution capture
-├── text_normalize.py    # Text cleaning & normalization
-├── cache.py             # Disk cache layer
-├── diagnostics.py       # Diagnostics emission
-└── __init__.py
 
-tests/                   # Unit & integration tests
-scripts/
-└── bench.py             # Benchmarking utility
-cli.py                   # CLI entry point
-PLAN.md                  # Detailed design document
-requirements.txt         # Pinned dependencies
-```
+Expected runtime for that full matrix is typically 6-14 hours.
 
-## Output
+## Key Outputs
 
-Each run produces:
-- **`puzzle.json`** — Grid, clues, and fill status
-- **`diagnostics.json`** — Scores, selection decisions, and solver trace
-- **`candidate_scores.csv`** — Ranked article candidates
-- **`k_selection_trace.csv`** — Marginal utility trace
-- **`attribution.json`** — Per-clue Wikipedia revision provenance
+For `generate --output-dir <dir>`:
 
-## Dependencies
+- `<dir>\puzzle.json`
+- `<dir>\grid.json`
+- `<dir>\clues.csv`
+- `<dir>\diagnostics_terms.json`
+- `<dir>\diagnostics_vocab_gate.json`
+- `<dir>\diagnostics_csp.json`
+- `<dir>\diagnostics_package.json`
+- `<dir>\attribution.json`
 
-- [spaCy](https://spacy.io/) — NLP backbone for term extraction
-- [mwparserfromhell](https://github.com/earwig/mwparserfromhell) — Wikipedia markup parsing
-- MediaWiki API — Content and metadata (no scraping)
+## Main Commands
 
-## License
-
-Content derived from Wikipedia is used under [CC BY-SA 3.0](https://creativecommons.org/licenses/by-sa/3.0/). Attribution metadata is bundled with every generated puzzle.
+- `python cli.py generate ...` full end-to-end pipeline
+- `python cli.py solve ...` CSP stage only
+- `python scripts/bench.py ...` multi-seed benchmark runner
+- `python scripts/tune_weights.py ...` weight grid search

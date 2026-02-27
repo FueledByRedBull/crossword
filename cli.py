@@ -560,13 +560,13 @@ def _build_parser() -> argparse.ArgumentParser:
     csp_parser.add_argument(
         "--filler-max-per-length",
         type=int,
-        default=4000,
+        default=1200,
         help="Max filler words to keep per length bucket",
     )
     csp_parser.add_argument(
         "--filler-weight",
         type=float,
-        default=0.05,
+        default=0.01,
         help="Score weight for filler words (lower favors thematic words)",
     )
     csp_parser.add_argument(
@@ -739,8 +739,8 @@ def _build_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("--no-filler", action="store_true")
     generate_parser.add_argument("--filler-min-len", type=int, default=3)
     generate_parser.add_argument("--filler-max-len", type=int, default=12)
-    generate_parser.add_argument("--filler-max-per-length", type=int, default=4000)
-    generate_parser.add_argument("--filler-weight", type=float, default=0.05)
+    generate_parser.add_argument("--filler-max-per-length", type=int, default=1200)
+    generate_parser.add_argument("--filler-weight", type=float, default=0.01)
     generate_parser.add_argument("--skip-gate", action="store_true")
     generate_parser.add_argument("--no-rescue", action="store_true")
     generate_parser.add_argument("--use-rust", action="store_true")

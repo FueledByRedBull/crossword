@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from src.pipeline import run_generate_pipeline
 
@@ -29,6 +34,7 @@ def main() -> None:
     parser.add_argument("--cache-dir", default="data/cache/wiki")
     parser.add_argument("--wikidata-cache-dir", default="data/cache/wikidata")
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--use-rust", action="store_true")
     parser.add_argument(
         "--candidate-weights",
         default="1.5,0.3,0.3,0.2",
@@ -43,8 +49,8 @@ def main() -> None:
     parser.add_argument("--max-restarts", type=int, default=2)
     parser.add_argument("--template-trials", type=int, default=2)
     parser.add_argument("--beam-width", type=int, default=24)
-    parser.add_argument("--filler-max-per-length", type=int, default=2000)
-    parser.add_argument("--filler-weight", type=float, default=0.05)
+    parser.add_argument("--filler-max-per-length", type=int, default=1200)
+    parser.add_argument("--filler-weight", type=float, default=0.01)
     args = parser.parse_args()
 
     if args.offline:
@@ -86,6 +92,7 @@ def main() -> None:
                     beam_width=args.beam_width,
                     filler_max_per_length=args.filler_max_per_length,
                     filler_weight=args.filler_weight,
+                    use_rust=args.use_rust,
                 )
                 fill_status = result["solve"].diagnostics.get("fill_status", "unknown")
                 fill_percent = result["solve"].diagnostics.get("fill_percent", 0.0)
