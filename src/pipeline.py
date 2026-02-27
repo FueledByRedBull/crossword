@@ -1621,6 +1621,7 @@ def run_csp_solve_stage(
     filler_max_len: int = 12,
     filler_max_per_length: int = 4000,
     filler_weight: float = 0.05,
+    use_rust: bool | None = None,
     require_gate: bool = True,
     gate_min: int = 40,
     gate_max: int = 250,
@@ -1729,6 +1730,27 @@ def run_csp_solve_stage(
             return 1
         return 0
 
+    import os
+
+    solver_backend = "python"
+    solver = solve_crossword
+    use_rust_solver = use_rust
+    if use_rust_solver is None:
+        use_rust_solver = os.getenv("CROSSWORD_USE_RUST", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    if use_rust_solver:
+        try:
+            import rust_csp
+
+            solver = rust_csp.solve_crossword
+            solver_backend = "rust"
+        except Exception as exc:
+            errors.append(f"rust_solver_unavailable:{exc}")
+
     def _imply_assignments(
         rendered_grid: list[list[str]],
         slots_to_check: list,
@@ -1778,7 +1800,7 @@ def run_csp_solve_stage(
             trial_errors.append("no_active_slots")
             result = {"solved": False, "assignments": {}, "steps": 0, "restarts": 0}
         else:
-            result = solve_crossword(
+            result = solver(
                 grid,
                 active_slots,
                 words,
@@ -1986,6 +2008,7 @@ def run_csp_solve_stage(
         "invalid_slots_count": len(invalid_slots),
         "invalid_slots": invalid_slots,
         "unfilled_slots": unfilled_slots,
+        "solver_backend": solver_backend,
         "errors": errors,
     }
     final_diagnostics = write_json(diagnostics_path, diagnostics)
@@ -2220,6 +2243,7 @@ def run_generate_pipeline(
     filler_max_len: int = 12,
     filler_max_per_length: int = 4000,
     filler_weight: float = 0.05,
+    use_rust: bool | None = None,
     skip_gate: bool = False,
     use_topology: bool = False,
 ) -> dict:
@@ -2402,6 +2426,7 @@ def run_generate_pipeline(
         filler_max_len=filler_max_len,
         filler_max_per_length=filler_max_per_length,
         filler_weight=filler_weight,
+        use_rust=use_rust,
         require_gate=not skip_gate,
         gate_min=gate_min,
         gate_max=gate_max,

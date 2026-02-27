@@ -570,6 +570,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Score weight for filler words (lower favors thematic words)",
     )
     csp_parser.add_argument(
+        "--use-rust",
+        action="store_true",
+        help="Use Rust CSP solver if available",
+    )
+    csp_parser.add_argument(
         "--random-seed",
         type=int,
         default=13,
@@ -738,6 +743,7 @@ def _build_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("--filler-weight", type=float, default=0.05)
     generate_parser.add_argument("--skip-gate", action="store_true")
     generate_parser.add_argument("--no-rescue", action="store_true")
+    generate_parser.add_argument("--use-rust", action="store_true")
 
     return parser
 
@@ -911,6 +917,7 @@ def main() -> None:
             filler_max_len=args.filler_max_len,
             filler_max_per_length=args.filler_max_per_length,
             filler_weight=args.filler_weight,
+            use_rust=args.use_rust,
             require_gate=not args.skip_gate,
             gate_min=args.gate_min,
             gate_max=args.gate_max,
@@ -985,6 +992,7 @@ def main() -> None:
             filler_max_len=args.filler_max_len,
             filler_max_per_length=args.filler_max_per_length,
             filler_weight=args.filler_weight,
+            use_rust=args.use_rust,
             skip_gate=args.skip_gate,
             use_topology=args.use_topology,
         )

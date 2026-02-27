@@ -72,3 +72,4 @@ outputs/
 data/cache/
 tests/tmp_outputs/
 .ignore
+rust_csp/target/

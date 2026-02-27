@@ -189,6 +189,7 @@ def run_benchmark(seed: str, args: argparse.Namespace) -> dict:
         require_gate=not args.skip_gate,
         gate_min=args.gate_min,
         gate_max=args.gate_max,
+        use_rust=args.use_rust,
     )
 
     package = run_packaging_stage(
@@ -300,6 +301,7 @@ def main() -> None:
     parser.add_argument("--filler-max-per-length", type=int, default=4000)
     parser.add_argument("--filler-weight", type=float, default=0.05)
     parser.add_argument("--skip-gate", action="store_true")
+    parser.add_argument("--use-rust", action="store_true")
     args = parser.parse_args()
 
     seeds = [seed.strip() for seed in args.seeds.split(",") if seed.strip()]
