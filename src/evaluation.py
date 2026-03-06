@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass
 
 
 @dataclass
 class BenchmarkResult:
     seed: str
+    solver_backend: str
+    puzzle_status: str
     pipeline_errors: list[str]
     candidate_count: int
     selected_k: int
@@ -15,12 +18,40 @@ class BenchmarkResult:
     leakage_rate: float
     fill_status: str
     fill_percent: float
+    filler_used_ratio: float
+    clued_entry_ratio: float
+    long_slot_theme_ratio: float
+    quality_objective: float
     provenance_missing_count: int
+    synthetic_filler_clue_count: int
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass
+class BenchmarkAggregate:
+    seed_count: int
+    backend_counts: dict[str, int]
+    fill_status_counts: dict[str, int]
+    puzzle_status_counts: dict[str, int]
+    average_fill_percent: float
+    average_filler_used_ratio: float
+    average_long_slot_theme_ratio: float
+    average_clued_entry_ratio: float
+    average_leakage_rate: float
+    fill_pass_rate: float
+    puzzle_ok_rate: float
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
 
 
 def summarize_benchmark(payload: dict) -> BenchmarkResult:
     return BenchmarkResult(
         seed=payload.get("seed", ""),
+        solver_backend=payload.get("solver_backend", "python"),
+        puzzle_status=payload.get("puzzle_status", "unknown"),
         pipeline_errors=payload.get("pipeline_errors", []),
         candidate_count=payload.get("candidate_count", 0),
         selected_k=payload.get("selected_k", 0),
@@ -30,6 +61,52 @@ def summarize_benchmark(payload: dict) -> BenchmarkResult:
         leakage_rate=payload.get("leakage_rate", 0.0),
         fill_status=payload.get("fill_status", "failed"),
         fill_percent=payload.get("fill_percent", 0.0),
+        filler_used_ratio=payload.get("filler_used_ratio", 0.0),
+        clued_entry_ratio=payload.get("clued_entry_ratio", 0.0),
+        long_slot_theme_ratio=payload.get("long_slot_theme_ratio", 0.0),
+        quality_objective=payload.get("quality_objective", 0.0),
         provenance_missing_count=payload.get("provenance_missing_count", 0),
+        synthetic_filler_clue_count=payload.get("synthetic_filler_clue_count", 0),
     )
 
+
+def summarize_benchmark_collection(results: list[dict] | list[BenchmarkResult]) -> BenchmarkAggregate:
+    normalized = [
+        result if isinstance(result, BenchmarkResult) else summarize_benchmark(result)
+        for result in results
+    ]
+    if not normalized:
+        return BenchmarkAggregate(
+            seed_count=0,
+            backend_counts={},
+            fill_status_counts={},
+            puzzle_status_counts={},
+            average_fill_percent=0.0,
+            average_filler_used_ratio=0.0,
+            average_long_slot_theme_ratio=0.0,
+            average_clued_entry_ratio=0.0,
+            average_leakage_rate=0.0,
+            fill_pass_rate=0.0,
+            puzzle_ok_rate=0.0,
+        )
+
+    count = len(normalized)
+    backend_counts = Counter(result.solver_backend for result in normalized)
+    fill_status_counts = Counter(result.fill_status for result in normalized)
+    puzzle_status_counts = Counter(result.puzzle_status for result in normalized)
+    fill_pass_count = sum(1 for result in normalized if result.fill_status in {"partial", "complete"})
+    puzzle_ok_count = sum(1 for result in normalized if result.puzzle_status == "ok")
+
+    return BenchmarkAggregate(
+        seed_count=count,
+        backend_counts=dict(backend_counts),
+        fill_status_counts=dict(fill_status_counts),
+        puzzle_status_counts=dict(puzzle_status_counts),
+        average_fill_percent=sum(result.fill_percent for result in normalized) / count,
+        average_filler_used_ratio=sum(result.filler_used_ratio for result in normalized) / count,
+        average_long_slot_theme_ratio=sum(result.long_slot_theme_ratio for result in normalized) / count,
+        average_clued_entry_ratio=sum(result.clued_entry_ratio for result in normalized) / count,
+        average_leakage_rate=sum(result.leakage_rate for result in normalized) / count,
+        fill_pass_rate=fill_pass_count / count,
+        puzzle_ok_rate=puzzle_ok_count / count,
+    )

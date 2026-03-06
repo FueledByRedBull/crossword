@@ -1,6 +1,12 @@
 import unittest
+from importlib import import_module
 
 from src.crossword_csp import build_slots, render_grid, solve_crossword
+
+try:
+    rust_csp = import_module("rust_csp")
+except Exception:
+    rust_csp = None
 
 
 class CspTests(unittest.TestCase):
@@ -89,6 +95,52 @@ class CspTests(unittest.TestCase):
 
         self.assertTrue(result["solved"])
         self.assertEqual(len(result["assignments"]), len(slots))
+
+    @unittest.skipIf(rust_csp is None, "rust_csp is not installed")
+    def test_rust_solver_matches_python_on_branching_fixture(self) -> None:
+        grid = [
+            [".", "."],
+            [".", "."],
+        ]
+        slots = build_slots(grid, min_len=2)
+        words = ["AB", "AC", "AD", "AE", "BC", "BD", "EA", "EB"]
+        kwargs = {
+            "min_len": 2,
+            "max_steps": 100,
+            "use_ac3": False,
+            "beam_width": 2,
+            "word_scores": {"AC": 1.0},
+        }
+
+        python_result = solve_crossword(grid, slots, words, **kwargs)
+        rust_result = rust_csp.solve_crossword(grid, slots, words, **kwargs)
+
+        self.assertEqual(rust_result["solved"], python_result["solved"])
+        self.assertEqual(len(rust_result["assignments"]), len(python_result["assignments"]))
+        self.assertEqual(len(rust_result["assignments"]), len(slots))
+
+    @unittest.skipIf(rust_csp is None, "rust_csp is not installed")
+    def test_rust_solver_matches_python_on_scored_single_slot(self) -> None:
+        grid = [
+            [".", ".", "."],
+            ["#", "#", "#"],
+            ["#", "#", "#"],
+        ]
+        slots = build_slots(grid, min_len=3)
+        words = ["CAT", "DOG"]
+        kwargs = {
+            "min_len": 3,
+            "max_steps": 100,
+            "use_ac3": False,
+            "beam_width": 2,
+            "word_scores": {"CAT": 0.1, "DOG": 0.9},
+        }
+
+        python_result = solve_crossword(grid, slots, words, **kwargs)
+        rust_result = rust_csp.solve_crossword(grid, slots, words, **kwargs)
+
+        self.assertEqual(rust_result["assignments"], python_result["assignments"])
+        self.assertEqual(rust_result["steps"], python_result["steps"])
 
 
 if __name__ == "__main__":

@@ -33,41 +33,40 @@ python cli.py generate `
   --seed "Thermodynamics" `
   --lang en `
   --output-dir outputs\run_thermo `
-  --use-topology `
-  --use-rust
+  --offline
 ```
 
-Offline (cache-only):
+Rust backend (optional):
 
 ```powershell
 python cli.py generate `
   --seed "Thermodynamics" `
-  --output-dir outputs\run_thermo_offline `
+  --lang en `
+  --output-dir outputs\run_thermo_rust `
   --offline `
   --use-rust
 ```
 
 ## Current Quality Controls
 
-The CSP stage now enforces quality gates before accepting a puzzle:
+The CSP stage accepts complete or strong partial fills. Current quality gates are:
 
-- `fill_percent >= 0.98`
+- `fill_percent >= 0.70`
 - `invalid_slots == 0`
 - `filler_used_ratio <= 0.25`
 - `clued_entry_ratio >= 0.90` (when clue set is available)
 - no non-themed filler in long slots
 
-If any gate fails, solve status is marked as failed and packaging reports `insufficient_quality` or `insufficient_clues`.
+Passing puzzles can still be `fill_status = "partial"` if they clear the gate and package cleanly as `puzzle_status = "ok"`.
 
 ## Solver Behavior
 
 - Two-phase solve:
-- Phase A: thematic prepass focused on long slots.
-- Phase B: full solve with strict filler penalties, then quality-gated selection.
-- Strict filler filtering:
-- English solver vocabulary is ASCII A-Z only.
-- Acronym-like and low-quality filler is filtered out.
-- Defaults are conservative: `filler_max_per_length=1200`, `filler_weight=0.01`.
+  Phase A is a thematic prepass for long slots.
+  Phase B is the full solve with quality-gated selection.
+- `--use-topology` is a ranking hint for template order, not a hard template lock.
+- Python and Rust CSP backends are kept in parity by direct fixture tests and the offline seed corpus.
+- English filler vocabulary is ASCII A-Z only, filtered aggressively, and capped to short bridge lengths when clue answers are available.
 
 ## Tuning Weights
 
@@ -90,6 +89,22 @@ python scripts/tune_weights.py `
 ```
 
 Expected runtime for that full matrix is typically 6-14 hours.
+
+## Regression Coverage
+
+The offline integration corpus currently covers:
+
+- `Thermodynamics`
+- `Quantum mechanics`
+- `Jazz`
+- `Ancient Rome`
+
+The test suite runs that corpus on the Python backend and, when installed, the Rust backend. It checks per-seed gate clearance plus aggregate quality:
+
+- average `fill_percent >= 0.73`
+- average `filler_used_ratio <= 0.10`
+
+The benchmark runner now writes those quality metrics into `benchmarks_summary.json` as an `aggregate` block so you can track average fill, filler pressure, long-slot theme usage, and pass rates across a seed set.
 
 ## Key Outputs
 

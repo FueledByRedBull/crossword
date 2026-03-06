@@ -11,7 +11,7 @@ import argparse
 import json
 
 from src.clue_builder import clue_pass_validate
-from src.evaluation import summarize_benchmark
+from src.evaluation import summarize_benchmark, summarize_benchmark_collection
 from src.pipeline import (
     run_candidate_scoring_stage,
     run_clue_extraction_stage,
@@ -214,6 +214,8 @@ def run_benchmark(seed: str, args: argparse.Namespace) -> dict:
 
     payload = {
         "seed": seed,
+        "solver_backend": diagnostics_csp_payload.get("solver_backend", "python"),
+        "puzzle_status": diagnostics_package_payload.get("puzzle_status", "unknown"),
         "pipeline_errors": (
             diagnostics_scores_payload.get("errors", [])
             + diagnostics_terms_payload.get("errors", [])
@@ -228,12 +230,17 @@ def run_benchmark(seed: str, args: argparse.Namespace) -> dict:
         "leakage_rate": leakage_rate,
         "fill_status": diagnostics_csp_payload.get("fill_status", "failed"),
         "fill_percent": diagnostics_csp_payload.get("fill_percent", 0.0),
+        "filler_used_ratio": diagnostics_csp_payload.get("filler_used_ratio", 0.0),
+        "clued_entry_ratio": diagnostics_csp_payload.get("clued_entry_ratio", 0.0),
+        "long_slot_theme_ratio": diagnostics_csp_payload.get("long_slot_theme_ratio", 0.0),
+        "quality_objective": diagnostics_csp_payload.get("quality_objective", 0.0),
         "provenance_missing_count": diagnostics_package_payload.get("provenance_missing_count", 0),
+        "synthetic_filler_clue_count": diagnostics_package_payload.get("synthetic_filler_clue_count", 0),
     }
     summary = summarize_benchmark(payload)
     summary_path = output_dir / "benchmark_summary.json"
-    summary_path.write_text(json.dumps(summary.__dict__, indent=2), encoding="utf-8")
-    return summary.__dict__
+    summary_path.write_text(json.dumps(summary.to_dict(), indent=2), encoding="utf-8")
+    return summary.to_dict()
 
 
 def main() -> None:
@@ -306,8 +313,12 @@ def main() -> None:
 
     seeds = [seed.strip() for seed in args.seeds.split(",") if seed.strip()]
     results = [run_benchmark(seed, args) for seed in seeds]
+    aggregate = summarize_benchmark_collection(results)
     summary_path = Path(args.output_dir) / "benchmarks_summary.json"
-    summary_path.write_text(json.dumps({"results": results}, indent=2), encoding="utf-8")
+    summary_path.write_text(
+        json.dumps({"results": results, "aggregate": aggregate.to_dict()}, indent=2),
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":
