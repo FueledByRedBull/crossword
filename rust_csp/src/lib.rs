@@ -212,17 +212,24 @@ fn value_score(
     score_lookup: &[f64],
 ) -> f64 {
     let mut support = 0usize;
+    let mut unresolved_neighbors = 0usize;
     for (neighbor_id, a_idx, b_idx) in neighbors[slot_id].iter() {
         if assignments[*neighbor_id].is_some() {
             continue;
         }
+        unresolved_neighbors += 1;
         for &candidate in domains[*neighbor_id].iter() {
             if word_bytes[candidate][*b_idx] == word_bytes[word_idx][*a_idx] {
                 support += 1;
             }
         }
     }
-    support as f64 + (2.0 * score_lookup[word_idx])
+    let support_bonus = if unresolved_neighbors == 0 {
+        0.0
+    } else {
+        (support as f64 / unresolved_neighbors as f64).min(3.0)
+    };
+    support_bonus + (8.0 * score_lookup[word_idx])
 }
 
 fn state_rank(
@@ -356,122 +363,127 @@ fn solve_crossword(
         }];
 
         while !states.is_empty() && total_steps < max_steps {
-            let mut next_states: Vec<State> = Vec::new();
-            for state in states.into_iter() {
-                if state.assigned_count == slot_count {
-                    solved = true;
-                    if better_candidate(
-                        state.assigned_count,
-                        state.quality,
-                        best_overall_count,
-                        best_overall_quality,
-                    ) {
-                        best_overall = state.assignments.clone();
-                        best_overall_quality = state.quality;
-                        best_overall_count = state.assigned_count;
-                    }
-                    break;
+            states.sort_by(|a, b| {
+                let ar = state_rank(&a.assignments, &a.domains, a.quality);
+                let br = state_rank(&b.assignments, &b.domains, b.quality);
+                br.0
+                    .cmp(&ar.0)
+                    .then_with(|| br.1.partial_cmp(&ar.1).unwrap_or(Ordering::Equal))
+                    .then_with(|| br.2.cmp(&ar.2))
+            });
+            let state = states.remove(0);
+            if state.assigned_count == slot_count {
+                solved = true;
+                if better_candidate(
+                    state.assigned_count,
+                    state.quality,
+                    best_overall_count,
+                    best_overall_quality,
+                ) {
+                    best_overall = state.assignments.clone();
+                    best_overall_quality = state.quality;
+                    best_overall_count = state.assigned_count;
                 }
+                break;
+            }
 
-                let slot_id = choose_slot(&state.assignments, &state.domains, &neighbors);
-                if slot_id.is_none() {
-                    solved = true;
-                    if better_candidate(
-                        state.assigned_count,
-                        state.quality,
-                        best_overall_count,
-                        best_overall_quality,
-                    ) {
-                        best_overall = state.assignments.clone();
-                        best_overall_quality = state.quality;
-                        best_overall_count = state.assigned_count;
-                    }
+            let slot_id = choose_slot(&state.assignments, &state.domains, &neighbors);
+            if slot_id.is_none() {
+                solved = true;
+                if better_candidate(
+                    state.assigned_count,
+                    state.quality,
+                    best_overall_count,
+                    best_overall_quality,
+                ) {
+                    best_overall = state.assignments.clone();
+                    best_overall_quality = state.quality;
+                    best_overall_count = state.assigned_count;
+                }
+                break;
+            }
+            let slot_id = slot_id.unwrap();
+            let mut candidates = state.domains[slot_id].clone();
+            if candidates.is_empty() {
+                continue;
+            }
+            candidates.shuffle(&mut rng);
+            candidates.sort_by(|a, b| {
+                value_score(slot_id, *b, &state.assignments, &state.domains, &neighbors, &word_bytes, &score_lookup)
+                    .partial_cmp(
+                        &value_score(
+                            slot_id,
+                            *a,
+                            &state.assignments,
+                            &state.domains,
+                            &neighbors,
+                            &word_bytes,
+                            &score_lookup,
+                        ),
+                    )
+                    .unwrap_or(Ordering::Equal)
+            });
+            let branch_limit = std::cmp::max(8, std::cmp::min(candidates.len(), beam_width * 2));
+            let mut child_states: Vec<State> = Vec::new();
+
+            for &word_idx in candidates.iter().take(branch_limit) {
+                total_steps += 1;
+                if total_steps > max_steps {
                     break;
                 }
-                let slot_id = slot_id.unwrap();
-                let mut candidates = state.domains[slot_id].clone();
-                if candidates.is_empty() {
+                if !is_consistent(
+                    &state.assignments,
+                    &state.used_words,
+                    slot_id,
+                    word_idx,
+                    &neighbors,
+                    &word_bytes,
+                ) {
                     continue;
                 }
-                candidates.shuffle(&mut rng);
-                candidates.sort_by(|a, b| {
-                    value_score(slot_id, *b, &state.assignments, &state.domains, &neighbors, &word_bytes, &score_lookup)
-                        .partial_cmp(
-                            &value_score(
-                                slot_id,
-                                *a,
-                                &state.assignments,
-                                &state.domains,
-                                &neighbors,
-                                &word_bytes,
-                                &score_lookup,
-                            ),
-                        )
-                        .unwrap_or(Ordering::Equal)
-                });
-                let branch_limit = std::cmp::max(8, std::cmp::min(candidates.len(), beam_width * 2));
-
-                for &word_idx in candidates.iter().take(branch_limit) {
-                    total_steps += 1;
-                    if total_steps > max_steps {
-                        break;
-                    }
-                    if !is_consistent(
-                        &state.assignments,
-                        &state.used_words,
-                        slot_id,
-                        word_idx,
-                        &neighbors,
-                        &word_bytes,
-                    ) {
-                        continue;
-                    }
-                    let mut next_assignments = state.assignments.clone();
-                    next_assignments[slot_id] = Some(word_idx);
-                    let mut next_used_words = state.used_words.clone();
-                    next_used_words.insert(word_idx);
-                    let mut next_domains = state.domains.clone();
-                    if !forward_check(
-                        &next_assignments,
-                        &next_used_words,
-                        slot_id,
-                        word_idx,
-                        &mut next_domains,
-                        &neighbors,
-                        &word_bytes,
-                    ) {
-                        continue;
-                    }
-                    let quality = state.quality + score_lookup[word_idx];
-                    let assigned_count = state.assigned_count + 1;
-                    if better_candidate(
-                        assigned_count,
-                        quality,
-                        best_overall_count,
-                        best_overall_quality,
-                    ) {
-                        best_overall = next_assignments.clone();
-                        best_overall_quality = quality;
-                        best_overall_count = assigned_count;
-                    }
-                    next_states.push(State {
-                        assignments: next_assignments,
-                        used_words: next_used_words,
-                        domains: next_domains,
-                        quality,
-                        assigned_count,
-                    });
+                let mut next_assignments = state.assignments.clone();
+                next_assignments[slot_id] = Some(word_idx);
+                let mut next_used_words = state.used_words.clone();
+                next_used_words.insert(word_idx);
+                let mut next_domains = state.domains.clone();
+                if !forward_check(
+                    &next_assignments,
+                    &next_used_words,
+                    slot_id,
+                    word_idx,
+                    &mut next_domains,
+                    &neighbors,
+                    &word_bytes,
+                ) {
+                    continue;
                 }
+                let quality = state.quality + score_lookup[word_idx];
+                let assigned_count = state.assigned_count + 1;
+                if better_candidate(
+                    assigned_count,
+                    quality,
+                    best_overall_count,
+                    best_overall_quality,
+                ) {
+                    best_overall = next_assignments.clone();
+                    best_overall_quality = quality;
+                    best_overall_count = assigned_count;
+                }
+                child_states.push(State {
+                    assignments: next_assignments,
+                    used_words: next_used_words,
+                    domains: next_domains,
+                    quality,
+                    assigned_count,
+                });
             }
 
-            if solved {
-                break;
-            }
-            if next_states.is_empty() {
-                break;
+            if child_states.is_empty() {
+                continue;
             }
 
-            next_states.sort_by(|a, b| {
+            states.extend(child_states);
+            states.sort_by(|a, b| {
                 let ar = state_rank(&a.assignments, &a.domains, a.quality);
                 let br = state_rank(&b.assignments, &b.domains, b.quality);
                 br.0
@@ -482,8 +494,8 @@ fn solve_crossword(
 
             let mut deduped: Vec<State> = Vec::new();
             let mut seen: HashSet<Vec<(usize, usize)>> = HashSet::new();
-            for state in next_states.into_iter() {
-                let signature: Vec<(usize, usize)> = state
+            for candidate_state in states.drain(..) {
+                let signature: Vec<(usize, usize)> = candidate_state
                     .assignments
                     .iter()
                     .enumerate()
@@ -493,7 +505,7 @@ fn solve_crossword(
                     continue;
                 }
                 seen.insert(signature);
-                deduped.push(state);
+                deduped.push(candidate_state);
                 if deduped.len() >= beam_width {
                     break;
                 }
@@ -608,4 +620,36 @@ fn solve_crossword(
 fn rust_csp(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solve_crossword, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::value_score;
+
+    #[test]
+    fn value_score_matches_python_weighting() {
+        let assignments = vec![None, None, None];
+        let domains = vec![vec![0], vec![1, 2], vec![3, 4]];
+        let neighbors = vec![vec![(1, 0, 0), (2, 1, 1)], vec![], vec![]];
+        let word_bytes = vec![
+            b"AB".to_vec(),
+            b"AX".to_vec(),
+            b"AY".to_vec(),
+            b"XB".to_vec(),
+            b"YB".to_vec(),
+        ];
+        let score_lookup = vec![0.5, 0.0, 0.0, 0.0, 0.0];
+
+        let score = value_score(
+            0,
+            0,
+            &assignments,
+            &domains,
+            &neighbors,
+            &word_bytes,
+            &score_lookup,
+        );
+
+        assert!((score - 6.0).abs() < 1e-9);
+    }
 }

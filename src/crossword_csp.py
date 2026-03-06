@@ -228,82 +228,81 @@ def solve_crossword(
         ]
 
         while states and total_steps < max_steps:
-            next_states: list[dict] = []
-            for state in states:
-                assignments = state["assignments"]
-                used_words = state["used_words"]
-                domains = state["domains"]
+            states.sort(key=state_rank, reverse=True)
+            state = states.pop(0)
+            assignments = state["assignments"]
+            used_words = state["used_words"]
+            domains = state["domains"]
 
-                if len(assignments) == len(slots):
-                    solved = True
-                    if better_candidate(assignments, state["quality"], best_overall, best_overall_quality):
-                        best_overall = dict(assignments)
-                        best_overall_quality = state["quality"]
+            if len(assignments) == len(slots):
+                solved = True
+                if better_candidate(assignments, state["quality"], best_overall, best_overall_quality):
+                    best_overall = dict(assignments)
+                    best_overall_quality = state["quality"]
+                break
+
+            slot_id = choose_slot(assignments, domains)
+            if slot_id is None:
+                solved = True
+                if better_candidate(assignments, state["quality"], best_overall, best_overall_quality):
+                    best_overall = dict(assignments)
+                    best_overall_quality = state["quality"]
+                break
+
+            candidates = list(domains[slot_id])
+            if not candidates:
+                continue
+            rng.shuffle(candidates)
+            candidates.sort(
+                key=lambda word: value_score(slot_id, word, assignments, domains),
+                reverse=True,
+            )
+            child_states: list[dict] = []
+            branch_limit = max(8, min(len(candidates), beam_width * 2))
+            for word in candidates[:branch_limit]:
+                total_steps += 1
+                if total_steps > max_steps:
                     break
-
-                slot_id = choose_slot(assignments, domains)
-                if slot_id is None:
-                    solved = True
-                    if better_candidate(assignments, state["quality"], best_overall, best_overall_quality):
-                        best_overall = dict(assignments)
-                        best_overall_quality = state["quality"]
-                    break
-
-                candidates = list(domains[slot_id])
-                if not candidates:
+                if not is_consistent(assignments, used_words, slot_id, word):
                     continue
-                rng.shuffle(candidates)
-                candidates.sort(
-                    key=lambda word: value_score(slot_id, word, assignments, domains),
-                    reverse=True,
+                next_assignments = dict(assignments)
+                next_assignments[slot_id] = word
+                next_used_words = set(used_words)
+                next_used_words.add(word)
+                next_domains = {k: list(v) for k, v in domains.items()}
+                if not forward_check(
+                    next_assignments,
+                    next_used_words,
+                    slot_id,
+                    word,
+                    next_domains,
+                ):
+                    continue
+                quality = state["quality"] + score_lookup.get(word, 0.0)
+                if better_candidate(next_assignments, quality, best_overall, best_overall_quality):
+                    best_overall = dict(next_assignments)
+                    best_overall_quality = quality
+                child_states.append(
+                    {
+                        "assignments": next_assignments,
+                        "used_words": next_used_words,
+                        "domains": next_domains,
+                        "quality": quality,
+                    }
                 )
-                branch_limit = max(8, min(len(candidates), beam_width * 2))
-                for word in candidates[:branch_limit]:
-                    total_steps += 1
-                    if total_steps > max_steps:
-                        break
-                    if not is_consistent(assignments, used_words, slot_id, word):
-                        continue
-                    next_assignments = dict(assignments)
-                    next_assignments[slot_id] = word
-                    next_used_words = set(used_words)
-                    next_used_words.add(word)
-                    next_domains = {k: list(v) for k, v in domains.items()}
-                    if not forward_check(
-                        next_assignments,
-                        next_used_words,
-                        slot_id,
-                        word,
-                        next_domains,
-                    ):
-                        continue
-                    quality = state["quality"] + score_lookup.get(word, 0.0)
-                    if better_candidate(next_assignments, quality, best_overall, best_overall_quality):
-                        best_overall = dict(next_assignments)
-                        best_overall_quality = quality
-                    next_states.append(
-                        {
-                            "assignments": next_assignments,
-                            "used_words": next_used_words,
-                            "domains": next_domains,
-                            "quality": quality,
-                        }
-                    )
 
-            if solved:
-                break
-            if not next_states:
-                break
+            if not child_states:
+                continue
 
-            ranked = sorted(next_states, key=state_rank, reverse=True)
+            ranked = sorted(states + child_states, key=state_rank, reverse=True)
             deduped: list[dict] = []
             seen_signatures: set[tuple[tuple[int, str], ...]] = set()
-            for state in ranked:
-                signature = tuple(sorted(state["assignments"].items()))
+            for candidate_state in ranked:
+                signature = tuple(sorted(candidate_state["assignments"].items()))
                 if signature in seen_signatures:
                     continue
                 seen_signatures.add(signature)
-                deduped.append(state)
+                deduped.append(candidate_state)
                 if len(deduped) >= beam_width:
                     break
             states = deduped

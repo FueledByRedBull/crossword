@@ -69,6 +69,27 @@ class CspTests(unittest.TestCase):
         self.assertTrue(assigned_words)
         self.assertEqual(assigned_words[0], "DOG")
 
+    def test_search_frontier_can_backtrack_to_earlier_branch(self) -> None:
+        grid = [
+            [".", "."],
+            [".", "."],
+        ]
+        slots = build_slots(grid, min_len=2)
+        words = ["AB", "AC", "AD", "AE", "BC", "BD", "EA", "EB"]
+        result = solve_crossword(
+            grid,
+            slots,
+            words,
+            min_len=2,
+            max_steps=100,
+            use_ac3=False,
+            beam_width=2,
+            word_scores={"AC": 1.0},
+        )
+
+        self.assertTrue(result["solved"])
+        self.assertEqual(len(result["assignments"]), len(slots))
+
 
 if __name__ == "__main__":
     unittest.main()
