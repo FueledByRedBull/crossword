@@ -177,11 +177,17 @@ def solve_crossword(
         domains: dict[int, list[str]],
     ) -> float:
         support = 0
+        unresolved_neighbors = 0
         for neighbor_id, (a_idx, b_idx) in intersections.get(slot_id, {}).items():
             if neighbor_id in assignments:
                 continue
+            unresolved_neighbors += 1
             support += sum(1 for candidate in domains[neighbor_id] if candidate[b_idx] == word[a_idx])
-        return float(support) + (2.0 * score_lookup.get(word, 0.0))
+        if unresolved_neighbors == 0:
+            support_bonus = 0.0
+        else:
+            support_bonus = min(3.0, support / unresolved_neighbors)
+        return support_bonus + (8.0 * score_lookup.get(word, 0.0))
 
     def state_rank(state: dict) -> tuple[int, float, int]:
         assignments = state["assignments"]

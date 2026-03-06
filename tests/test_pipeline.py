@@ -5,10 +5,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from src.crossword_csp import build_slots, render_grid
+from src.csp_heuristics import (
+    build_solver_vocabulary,
+    evaluate_quality_gate,
+    prune_conflicting_assignments,
+)
 from src.pipeline import (
     run_candidate_scoring_stage,
     run_clue_extraction_stage,
     run_k_selection_stage,
+    run_packaging_stage,
     run_rescue_ladder,
     run_csp_solve_stage,
     run_seed_ingestion_stage,
@@ -269,6 +276,96 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('"unfilled_slots"', grid_payload)
         shutil.rmtree(terms_path.parent, ignore_errors=True)
 
+    def test_quality_gate_accepts_strong_partial_fill(self) -> None:
+        passed, reasons = evaluate_quality_gate(
+            fill_percent=0.85,
+            invalid_slots=[],
+            filler_used_ratio=0.1,
+            clued_entry_ratio=1.0,
+            clue_answers_available=True,
+            long_slot_non_theme_count=0,
+        )
+
+        self.assertTrue(passed)
+        self.assertEqual(reasons, [])
+
+    def test_solver_vocabulary_prefers_clued_answers_for_clued_lengths(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "solver_vocab_clues"
+        terms_path = tmp_dir / "terms.csv"
+        clues_path = tmp_dir / "clues.csv"
+        filler_path = tmp_dir / "filler_words.txt"
+
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        terms_path.write_text(
+            "\n".join(
+                [
+                    "answer,normalized_answer,length,source_method,lead_bold_signal,source_titles,doc_frequency,theme_score,entity_type_score,crosswordability_score,lexicon_score,shape_penalty,answer_score",
+                    "Alpha,ALPHA,5,spacy,False,Test,1,0.2,0.0,0.4,0.2,0.0,0.8",
+                    "Bravo,BRAVO,5,spacy,False,Test,1,0.2,0.0,0.4,0.2,0.0,0.7",
+                    "Cat,CAT,3,spacy,False,Test,1,0.2,0.0,0.4,0.2,0.0,0.6",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        clues_path.write_text(
+            "\n".join(
+                [
+                    "answer,normalized_answer,clue,clue_score,source_method,source_page,revid,sentence_offset,oldid_url",
+                    "Alpha,ALPHA,First clue,0.9,spacy,Test,1,0,https://example.com",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        filler_path.write_text("", encoding="utf-8")
+
+        vocabulary = build_solver_vocabulary(
+            terms_path=terms_path,
+            lang="en",
+            filler_path=filler_path,
+            filler_min_len=3,
+            filler_max_len=12,
+            filler_max_per_length=100,
+            filler_weight=0.01,
+        )
+
+        self.assertIn("ALPHA", vocabulary.themed_set)
+        self.assertIn("CAT", vocabulary.themed_set)
+        self.assertNotIn("BRAVO", vocabulary.themed_set)
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_prune_conflicting_assignments_clears_invalid_crossings(self) -> None:
+        grid = [
+            [".", ".", "."],
+            [".", ".", "."],
+            [".", ".", "."],
+        ]
+        slots = build_slots(grid, min_len=3)
+        down_slots = [slot for slot in slots if slot.direction == "down"]
+        assignments = {
+            down_slots[0].id: "ABC",
+            down_slots[1].id: "DEF",
+            down_slots[2].id: "GHI",
+        }
+
+        final_assignments, invalid_slots, rendered, removed = prune_conflicting_assignments(
+            grid=grid,
+            slots=slots,
+            assignments_in=assignments,
+            word_scores={"ABC": 1.0, "DEF": 0.9, "GHI": 0.8},
+            themed_set={"ABC", "DEF", "GHI"},
+            clue_answers=set(),
+            clue_answers_available=False,
+            render_grid_fn=render_grid,
+        )
+
+        self.assertEqual(invalid_slots, [])
+        self.assertTrue(removed)
+        self.assertLess(len(final_assignments), len(assignments))
+        self.assertEqual(len(rendered), 3)
+
     def test_rescue_ladder_runs(self) -> None:
         diagnostics_path = Path("tests") / "tmp_outputs" / "diagnostics_rescue.json"
         result = run_rescue_ladder(
@@ -280,6 +377,113 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertIn("passed", result)
         self.assertFalse(result["passed"])
+
+    def test_clue_stage_adds_fallback_without_revid(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "clue_fallback_missing_revid"
+        terms_path = tmp_dir / "terms.csv"
+        clues_path = tmp_dir / "clues.csv"
+        diagnostics_path = tmp_dir / "diagnostics_clues.json"
+
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        terms_path.write_text(
+            "\n".join(
+                [
+                    "answer,normalized_answer,source_titles,source_method",
+                    "Entropy,ENTROPY,Entropy,spacy",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        with patch(
+            "src.pipeline.WikiClient.fetch_page_extract_with_revid",
+            return_value={"title": "Entropy", "extract": "", "revid": None},
+        ):
+            result = run_clue_extraction_stage(
+                seed_title="Thermodynamics",
+                lang="en",
+                diagnostics_path=diagnostics_path,
+                terms_path=terms_path,
+                clues_path=clues_path,
+            )
+
+        self.assertEqual(result.diagnostics["clue_count"], 1)
+        self.assertEqual(result.diagnostics["fallback_template_added"], 1)
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_packaging_adds_short_filler_fallback_clue(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "package_short_filler"
+        selected_path = tmp_dir / "selected_candidates.json"
+        grid_path = tmp_dir / "grid.json"
+        clues_path = tmp_dir / "clues.csv"
+        puzzle_path = tmp_dir / "puzzle.json"
+        attribution_path = tmp_dir / "attribution.json"
+        diagnostics_path = tmp_dir / "diagnostics_package.json"
+
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        selected_path.write_text(
+            json.dumps(
+                {
+                    "seed_title": "Test",
+                    "lang": "en",
+                    "selected_k": 1,
+                    "selected_titles": ["Seed"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        grid_path.write_text(
+            json.dumps(
+                {
+                    "seed_title": "Test",
+                    "lang": "en",
+                    "template": "open",
+                    "size": 5,
+                    "min_slot_len": 3,
+                    "effective_min_slot_len": 4,
+                    "grid": [["A", "B", "C", "D"]],
+                    "assignments": {"0": "ABCD"},
+                    "slots": [
+                        {
+                            "id": 0,
+                            "direction": "across",
+                            "length": 4,
+                            "cells": [[0, 0], [0, 1], [0, 2], [0, 3]],
+                        }
+                    ],
+                    "fill_status": "partial",
+                    "fill_percent": 1.0,
+                    "unfilled_slots": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        clues_path.write_text(
+            "answer,normalized_answer,clue,clue_score,source_method,source_page,revid,sentence_offset,oldid_url\n",
+            encoding="utf-8",
+        )
+
+        result = run_packaging_stage(
+            seed_title="Test",
+            lang="en",
+            selected_path=selected_path,
+            grid_path=grid_path,
+            clues_path=clues_path,
+            puzzle_path=puzzle_path,
+            attribution_path=attribution_path,
+            diagnostics_path=diagnostics_path,
+        )
+
+        self.assertEqual(result.diagnostics["synthetic_filler_clue_count"], 1)
+        self.assertEqual(result.diagnostics["clued_entry_count"], 1)
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def test_csp_stage_passes_composite_word_scores_to_solver(self) -> None:
         tmp_dir = Path("tests") / "tmp_outputs" / "csp_word_scores"
@@ -447,6 +651,263 @@ class PipelineTests(unittest.TestCase):
         words_arg = mocked_solver.call_args.args[2]
         self.assertIn("THEME", words_arg)
         self.assertIn("FILLER", words_arg)
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_csp_stage_prefers_fuller_passing_template(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "csp_template_rank"
+        diagnostics_path = tmp_dir / "diagnostics_csp.json"
+        grid_path = tmp_dir / "grid.json"
+        terms_path = tmp_dir / "terms.csv"
+
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        terms_path.write_text(
+            "\n".join(
+                [
+                    "answer,normalized_answer,length,source_method,lead_bold_signal,source_titles,doc_frequency,theme_score,entity_type_score,crosswordability_score,lexicon_score,shape_penalty,answer_score",
+                    "Alpha,ALPHA,5,spacy,False,Test,1,0.2,0.0,0.4,0.2,0.0,0.6",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        slot = SimpleNamespace(
+            id=0,
+            direction="across",
+            length=5,
+            cells=[(0, 0), (0, 1), (0, 2), (0, 3), (0, 4)],
+        )
+        base_trial = {
+            "rendered": [["A", "L", "P", "H", "A"]] + [["#"] * 5 for _ in range(4)],
+            "result": {
+                "solved": False,
+                "assignments": {0: "ALPHA"},
+                "steps": 10,
+                "restarts": 0,
+                "local_repair_applied": False,
+            },
+            "slots": [slot],
+            "active_slots": [slot],
+            "auto_block": {
+                "added_blocks": [],
+                "long_slots_before": [],
+                "long_slots_after": [],
+                "iterations": 0,
+            },
+            "unfilled_slots": [],
+            "trial_errors": [],
+            "invalid_slots": [],
+            "removed_assignments": [],
+            "implicit_added_count": 0,
+            "solved_final": False,
+            "themed_assigned_count": 1,
+            "clued_assigned_count": 1,
+            "assigned_count": 1,
+            "filler_used_count": 0,
+            "filler_used_ratio": 0.0,
+            "clued_entry_ratio": 1.0,
+            "long_slot_assigned_count": 0,
+            "long_slot_non_theme_count": 0,
+            "long_slot_theme_ratio": 1.0,
+            "unclued_removed_count": 0,
+            "phase_a": {
+                "steps": 1,
+                "restarts": 0,
+                "assigned_count": 1,
+                "preferred_long_words_count": 0,
+            },
+        }
+        lower_fill_trial = {
+            **base_trial,
+            "template": SimpleNamespace(name="sparse"),
+            "fill_percent": 0.72,
+            "fill_status": "partial",
+            "fill_count": 18,
+            "total_cells": 25,
+            "quality_objective": 9.0,
+        }
+        higher_fill_trial = {
+            **base_trial,
+            "template": SimpleNamespace(name="dense"),
+            "fill_percent": 0.86,
+            "fill_status": "partial",
+            "fill_count": 21,
+            "total_cells": 25,
+            "quality_objective": 3.0,
+        }
+
+        vocabulary = SimpleNamespace(
+            word_scores={"ALPHA": 1.0},
+            words=["ALPHA"],
+            themed_words=["ALPHA"],
+            themed_set={"ALPHA"},
+            clue_answers=set(),
+            clue_answers_available=False,
+            filler_words=[],
+            filler_raw_count=0,
+            filler_added=0,
+            filler_limit_per_length=0,
+            filler_weight=0.01,
+            long_filler_weight=0.0025,
+            min_word_len=5,
+            max_word_len=5,
+        )
+        passing_gate = SimpleNamespace(
+            passed=True,
+            reason="ok",
+            term_count=1,
+            min_required=40,
+            max_allowed=250,
+        )
+
+        with (
+            patch("src.pipeline.build_solver_vocabulary", return_value=vocabulary),
+            patch("src.pipeline.evaluate_vocab_gate", return_value=passing_gate),
+            patch(
+                "src.pipeline.get_templates",
+                return_value=[SimpleNamespace(name="sparse"), SimpleNamespace(name="dense")],
+            ),
+            patch(
+                "src.pipeline.select_best_template",
+                return_value={
+                    "selected": "sparse",
+                    "scored": [{"template": "sparse"}, {"template": "dense"}],
+                },
+            ),
+            patch(
+                "src.pipeline.run_template_trial",
+                side_effect=[lower_fill_trial, higher_fill_trial],
+            ) as mocked_trial,
+        ):
+            result = run_csp_solve_stage(
+                seed_title="Test",
+                lang="en",
+                terms_path=terms_path,
+                diagnostics_path=diagnostics_path,
+                grid_path=grid_path,
+                size=5,
+                min_slot_len=3,
+                max_steps=100,
+                require_gate=False,
+                template_trials=2,
+            )
+
+        self.assertEqual(mocked_trial.call_count, 2)
+        self.assertEqual(result.diagnostics["template"], "dense")
+        self.assertAlmostEqual(result.diagnostics["fill_percent"], 0.86, places=6)
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_csp_raises_effective_min_slot_len_to_clue_floor(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "csp_clue_floor"
+        diagnostics_path = tmp_dir / "diagnostics_csp.json"
+        grid_path = tmp_dir / "grid.json"
+        terms_path = tmp_dir / "terms.csv"
+
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        terms_path.write_text("answer,normalized_answer\n", encoding="utf-8")
+
+        vocabulary = SimpleNamespace(
+            word_scores={"ALPHA": 1.0, "ETA": 0.5},
+            words=["ALPHA", "ETA"],
+            themed_words=["ALPHA", "ETA"],
+            themed_set={"ALPHA", "ETA"},
+            clue_answers={"ALPHA"},
+            clue_answers_available=True,
+            filler_words=[],
+            filler_raw_count=0,
+            filler_added=0,
+            filler_limit_per_length=0,
+            filler_weight=0.01,
+            long_filler_weight=0.0025,
+            min_word_len=3,
+            max_word_len=5,
+        )
+        passing_gate = SimpleNamespace(
+            passed=True,
+            reason="ok",
+            term_count=1,
+            min_required=40,
+            max_allowed=250,
+        )
+
+        with (
+            patch("src.pipeline.build_solver_vocabulary", return_value=vocabulary),
+            patch("src.pipeline.evaluate_vocab_gate", return_value=passing_gate),
+            patch("src.pipeline.get_templates", return_value=[SimpleNamespace(name="open")]),
+            patch(
+                "src.pipeline.select_best_template",
+                return_value={"selected": "open", "scored": [{"template": "open"}]},
+            ),
+            patch(
+                "src.pipeline.run_template_trial",
+                return_value={
+                    "template": SimpleNamespace(name="open"),
+                    "rendered": [["#"]],
+                    "result": {
+                        "solved": False,
+                        "assignments": {},
+                        "steps": 0,
+                        "restarts": 0,
+                        "local_repair_applied": False,
+                    },
+                    "slots": [],
+                    "active_slots": [],
+                    "auto_block": {
+                        "added_blocks": [],
+                        "long_slots_before": [],
+                        "long_slots_after": [],
+                        "iterations": 0,
+                    },
+                    "fill_percent": 0.0,
+                    "fill_status": "failed",
+                    "fill_count": 0,
+                    "total_cells": 0,
+                    "unfilled_slots": [],
+                    "trial_errors": [],
+                    "invalid_slots": [],
+                    "removed_assignments": [],
+                    "implicit_added_count": 0,
+                    "solved_final": False,
+                    "quality_objective": 0.0,
+                    "themed_assigned_count": 0,
+                    "clued_assigned_count": 0,
+                    "assigned_count": 0,
+                    "filler_used_count": 0,
+                    "filler_used_ratio": 0.0,
+                    "clued_entry_ratio": 0.0,
+                    "long_slot_assigned_count": 0,
+                    "long_slot_non_theme_count": 0,
+                    "long_slot_theme_ratio": 1.0,
+                    "unclued_removed_count": 0,
+                    "phase_a": {
+                        "steps": 0,
+                        "restarts": 0,
+                        "assigned_count": 0,
+                        "preferred_long_words_count": 0,
+                    },
+                },
+            ) as mocked_trial,
+        ):
+            result = run_csp_solve_stage(
+                seed_title="Test",
+                lang="en",
+                terms_path=terms_path,
+                diagnostics_path=diagnostics_path,
+                grid_path=grid_path,
+                size=5,
+                min_slot_len=3,
+                max_steps=100,
+                require_gate=False,
+                template_trials=1,
+            )
+
+        self.assertEqual(result.diagnostics["effective_min_slot_len"], 5)
+        self.assertEqual(mocked_trial.call_args.kwargs["effective_min_slot_len"], 5)
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

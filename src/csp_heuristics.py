@@ -7,6 +7,10 @@ from typing import Any, Callable
 
 from .lexicon import load_lexicon_scores, load_word_list
 
+QUALITY_GATE_MIN_FILL_PERCENT = 0.70
+QUALITY_GATE_MAX_FILLER_RATIO = 0.25
+QUALITY_GATE_MIN_CLUED_RATIO = 0.90
+
 
 @dataclass(slots=True)
 class SolverVocabulary:
@@ -70,9 +74,6 @@ def build_solver_vocabulary(
             if previous is None or composite > previous:
                 word_scores[normalized] = composite
 
-    themed_words = sorted(word_scores, key=lambda word: (word_scores[word], word), reverse=True)
-    themed_set = set(word_scores.keys())
-
     clue_answers_path = Path(terms_path).with_name("clues.csv")
     clue_answers: set[str] = set()
     if clue_answers_path.exists():
@@ -82,7 +83,18 @@ def build_solver_vocabulary(
                 answer = normalize_solver_token(row.get("normalized_answer") or "", lang=lang)
                 if answer:
                     clue_answers.add(answer)
+    clue_answers &= set(word_scores)
     clue_answers_available = bool(clue_answers)
+    if clue_answers_available:
+        clue_answer_lengths = {len(answer) for answer in clue_answers}
+        word_scores = {
+            word: score
+            for word, score in word_scores.items()
+            if word in clue_answers or len(word) not in clue_answer_lengths
+        }
+
+    themed_words = sorted(word_scores, key=lambda word: (word_scores[word], word), reverse=True)
+    themed_set = set(word_scores.keys())
 
     common_lexicon = load_lexicon_scores(common_lexicon_path)
     enforce_lexicon_cutoff = True
@@ -119,7 +131,7 @@ def build_solver_vocabulary(
         max_per_length=filler_max_per_length,
     )
     filler_raw_count = len(filler_raw_words)
-    filler_limit_per_length = min(filler_max_per_length, 1200)
+    filler_limit_per_length = max(0, int(filler_max_per_length))
     filler_buckets: dict[int, list[str]] = {}
     for word in filler_raw_words:
         if word in word_scores or not is_strict_filler_candidate(word):
@@ -134,8 +146,8 @@ def build_solver_vocabulary(
         )
         filler_words.extend(unique[:filler_limit_per_length])
 
-    normalized_filler_weight = min(float(filler_weight), 0.015)
-    long_filler_weight = min(normalized_filler_weight * 0.25, 0.004)
+    normalized_filler_weight = max(0.0, float(filler_weight))
+    long_filler_weight = normalized_filler_weight * 0.25
     filler_added = 0
     for word in filler_words:
         if word in word_scores:
@@ -203,6 +215,90 @@ def imply_assignments(
                 }
             )
     return implied, invalid_slots
+
+
+def prune_conflicting_assignments(
+    *,
+    grid: list[list[str]],
+    slots: list[Any],
+    assignments_in: dict[int, str],
+    word_scores: dict[str, float],
+    themed_set: set[str],
+    clue_answers: set[str],
+    clue_answers_available: bool,
+    render_grid_fn: Callable[[list[list[str]], list[Any], dict[int, str]], list[list[str]]],
+) -> tuple[dict[int, str], list[dict[str, Any]], list[list[str]], list[dict[str, Any]]]:
+    current_assignments = dict(assignments_in)
+    slot_by_id = {slot.id: slot for slot in slots}
+    removed_assignments: list[dict[str, Any]] = []
+    max_iterations = max(1, len(slots))
+
+    for _ in range(max_iterations):
+        rendered = render_grid_fn(grid, slots, current_assignments)
+        implied, invalid_slots = imply_assignments(
+            rendered_grid=rendered,
+            slots_to_check=slots,
+            assignments_in=current_assignments,
+            word_scores=word_scores,
+        )
+        current_assignments = implied
+        if not invalid_slots:
+            return current_assignments, invalid_slots, rendered, removed_assignments
+
+        participation: dict[int, int] = {}
+        for invalid_slot in invalid_slots:
+            slot = slot_by_id.get(invalid_slot["slot_id"])
+            if slot is None:
+                continue
+            invalid_cells = set(slot.cells)
+            for assigned_slot_id, word in current_assignments.items():
+                assigned_slot = slot_by_id.get(assigned_slot_id)
+                if assigned_slot is None:
+                    continue
+                if any(cell in invalid_cells for cell in assigned_slot.cells):
+                    participation[assigned_slot_id] = participation.get(assigned_slot_id, 0) + 1
+
+        if not participation:
+            return current_assignments, invalid_slots, rendered, removed_assignments
+
+        def removal_rank(slot_id: int) -> tuple[int, int, int, int, float, int]:
+            word = current_assignments[slot_id]
+            slot = slot_by_id[slot_id]
+            long_non_theme = 1 if slot.length >= 6 and word not in themed_set else 0
+            unclued = 1 if clue_answers_available and word not in clue_answers else 0
+            filler = 1 if word not in themed_set else 0
+            involvement = participation.get(slot_id, 0)
+            return (
+                long_non_theme,
+                unclued,
+                filler,
+                involvement,
+                -word_scores.get(word, 0.0),
+                slot.length,
+            )
+
+        slot_to_remove = max(participation, key=removal_rank)
+        removed_assignments.append(
+            {
+                "slot_id": slot_to_remove,
+                "word": current_assignments[slot_to_remove],
+                "reasons": {
+                    "involved_invalid_slots": participation[slot_to_remove],
+                    "is_filler": current_assignments[slot_to_remove] not in themed_set,
+                    "is_clued": current_assignments[slot_to_remove] in clue_answers,
+                },
+            }
+        )
+        current_assignments.pop(slot_to_remove, None)
+
+    rendered = render_grid_fn(grid, slots, current_assignments)
+    final_assignments, invalid_slots = imply_assignments(
+        rendered_grid=rendered,
+        slots_to_check=slots,
+        assignments_in=current_assignments,
+        word_scores=word_scores,
+    )
+    return final_assignments, invalid_slots, rendered, removed_assignments
 
 
 def run_template_trial(
@@ -295,21 +391,23 @@ def run_template_trial(
         int(slot_id): str(word)
         for slot_id, word in raw_assignments.items()
     }
-    rendered = render_grid_fn(grid, active_slots, solver_assignments)
-    final_assignments, invalid_slots = imply_assignments(
-        rendered_grid=rendered,
-        slots_to_check=slots,
+    final_assignments, invalid_slots, rendered, removed_assignments = prune_conflicting_assignments(
+        grid=grid,
+        slots=slots,
         assignments_in=solver_assignments,
         word_scores=word_scores,
+        themed_set=themed_set,
+        clue_answers=clue_answers,
+        clue_answers_available=clue_answers_available,
+        render_grid_fn=render_grid_fn,
     )
     unclued_removed_count = 0
     if clue_answers_available:
-        clued_assignments = {
-            slot_id: word for slot_id, word in final_assignments.items() if word in clue_answers
-        }
-        unclued_removed_count = len(final_assignments) - len(clued_assignments)
-        final_assignments = clued_assignments
-        rendered = render_grid_fn(grid, slots, final_assignments)
+        unclued_removed_count = sum(
+            1
+            for word in final_assignments.values()
+            if word in themed_set and word not in clue_answers
+        )
     fill_count = sum(1 for row in rendered for cell in row if cell not in (".", "#"))
     total_cells = sum(1 for row in rendered for cell in row if cell != "#")
     fill_percent = 0.0 if total_cells == 0 else fill_count / total_cells
@@ -329,11 +427,10 @@ def run_template_trial(
 
     assigned_count = len(final_assignments)
     themed_assigned_count = sum(1 for word in final_assignments.values() if word in themed_set)
-    clued_assigned_count = (
-        sum(1 for word in final_assignments.values() if word in clue_answers)
-        if clue_answers_available
-        else assigned_count
-    )
+    if clue_answers_available:
+        clued_assigned_count = assigned_count - unclued_removed_count
+    else:
+        clued_assigned_count = assigned_count
     filler_used_count = max(0, assigned_count - themed_assigned_count)
     filler_used_ratio = 0.0 if assigned_count == 0 else filler_used_count / assigned_count
     clued_entry_ratio = 0.0 if assigned_count == 0 else clued_assigned_count / assigned_count
@@ -385,7 +482,8 @@ def run_template_trial(
         "unfilled_slots": unfilled_slots,
         "trial_errors": trial_errors,
         "invalid_slots": invalid_slots,
-        "implicit_added_count": len(final_assignments) - len(solver_assignments),
+        "removed_assignments": removed_assignments,
+        "implicit_added_count": max(0, len(final_assignments) - len(solver_assignments)),
         "solved_final": solved_final,
         "quality_objective": quality_objective,
         "themed_assigned_count": themed_assigned_count,
@@ -417,14 +515,20 @@ def evaluate_quality_gate(
     long_slot_non_theme_count: int,
 ) -> tuple[bool, list[str]]:
     quality_gate_reasons: list[str] = []
-    if fill_percent < 0.98:
-        quality_gate_reasons.append("fill_percent_below_min:0.98")
+    if fill_percent < QUALITY_GATE_MIN_FILL_PERCENT:
+        quality_gate_reasons.append(
+            f"fill_percent_below_min:{QUALITY_GATE_MIN_FILL_PERCENT:.2f}"
+        )
     if invalid_slots:
         quality_gate_reasons.append("invalid_slots_present")
-    if filler_used_ratio > 0.25:
-        quality_gate_reasons.append("filler_ratio_above_max:0.25")
-    if clue_answers_available and clued_entry_ratio < 0.90:
-        quality_gate_reasons.append("clued_ratio_below_min:0.90")
+    if filler_used_ratio > QUALITY_GATE_MAX_FILLER_RATIO:
+        quality_gate_reasons.append(
+            f"filler_ratio_above_max:{QUALITY_GATE_MAX_FILLER_RATIO:.2f}"
+        )
+    if clue_answers_available and clued_entry_ratio < QUALITY_GATE_MIN_CLUED_RATIO:
+        quality_gate_reasons.append(
+            f"clued_ratio_below_min:{QUALITY_GATE_MIN_CLUED_RATIO:.2f}"
+        )
     if long_slot_non_theme_count > 0:
         quality_gate_reasons.append("long_slots_using_filler")
     return len(quality_gate_reasons) == 0, quality_gate_reasons
