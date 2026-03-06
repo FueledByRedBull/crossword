@@ -190,6 +190,7 @@ def run_benchmark(seed: str, args: argparse.Namespace) -> dict:
         gate_min=args.gate_min,
         gate_max=args.gate_max,
         use_rust=args.use_rust,
+        preferred_fill_target=args.preferred_fill_target,
     )
 
     package = run_packaging_stage(
@@ -233,12 +234,29 @@ def run_benchmark(seed: str, args: argparse.Namespace) -> dict:
         "filler_used_ratio": diagnostics_csp_payload.get("filler_used_ratio", 0.0),
         "clued_entry_ratio": diagnostics_csp_payload.get("clued_entry_ratio", 0.0),
         "source_backed_entry_ratio": diagnostics_package_payload.get("source_backed_entry_ratio", 0.0),
+        "used_source_backed_entry_ratio": diagnostics_package_payload.get(
+            "used_source_backed_entry_ratio",
+            diagnostics_package_payload.get("source_backed_entry_ratio", 0.0),
+        ),
         "fallback_only_entry_count": diagnostics_package_payload.get("fallback_only_entry_count", 0),
         "fallback_only_entry_ratio": diagnostics_package_payload.get("fallback_only_entry_ratio", 0.0),
+        "used_template_fallback_entry_ratio": diagnostics_package_payload.get(
+            "used_template_fallback_entry_ratio",
+            diagnostics_package_payload.get("fallback_only_entry_ratio", 0.0),
+        ),
         "long_slot_theme_ratio": diagnostics_csp_payload.get("long_slot_theme_ratio", 0.0),
         "quality_objective": diagnostics_csp_payload.get("quality_objective", 0.0),
         "provenance_missing_count": diagnostics_package_payload.get("provenance_missing_count", 0),
+        "used_clue_provenance_missing_count": diagnostics_package_payload.get(
+            "used_clue_provenance_missing_count",
+            diagnostics_package_payload.get("provenance_missing_count", 0),
+        ),
         "synthetic_filler_clue_count": diagnostics_package_payload.get("synthetic_filler_clue_count", 0),
+        "packaged_synthetic_filler_count": diagnostics_package_payload.get(
+            "packaged_synthetic_filler_count",
+            diagnostics_package_payload.get("synthetic_filler_clue_count", 0),
+        ),
+        "preferred_fill_target": diagnostics_csp_payload.get("preferred_fill_target", args.preferred_fill_target),
     }
     summary = summarize_benchmark(payload)
     summary_path = output_dir / "benchmark_summary.json"
@@ -312,6 +330,7 @@ def main() -> None:
     parser.add_argument("--filler-weight", type=float, default=0.01)
     parser.add_argument("--skip-gate", action="store_true")
     parser.add_argument("--use-rust", action="store_true")
+    parser.add_argument("--preferred-fill-target", type=float, default=0.85)
     args = parser.parse_args()
 
     seeds = [seed.strip() for seed in args.seeds.split(",") if seed.strip()]

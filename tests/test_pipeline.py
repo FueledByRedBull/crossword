@@ -18,6 +18,7 @@ from src.pipeline import (
     _inventory_min_k_target,
     _quality_rescue_target_count,
     _should_expand_selection_inventory,
+    _should_relax_min_df_for_quality_rescue,
     run_candidate_scoring_stage,
     run_clue_extraction_stage,
     run_k_selection_stage,
@@ -585,7 +586,7 @@ class PipelineTests(unittest.TestCase):
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    def test_packaging_adds_short_filler_fallback_clue(self) -> None:
+    def test_packaging_rejects_short_fill_without_real_clue(self) -> None:
         tmp_dir = Path("tests") / "tmp_outputs" / "package_short_filler"
         selected_path = tmp_dir / "selected_candidates.json"
         grid_path = tmp_dir / "grid.json"
@@ -651,11 +652,14 @@ class PipelineTests(unittest.TestCase):
             diagnostics_path=diagnostics_path,
         )
 
-        self.assertEqual(result.diagnostics["synthetic_filler_clue_count"], 1)
-        self.assertEqual(result.diagnostics["clued_entry_count"], 1)
-        self.assertEqual(result.diagnostics["clued_entry_ratio"], 1.0)
+        self.assertEqual(result.diagnostics["synthetic_filler_clue_count"], 0)
+        self.assertEqual(result.diagnostics["packaged_synthetic_filler_count"], 0)
+        self.assertEqual(result.diagnostics["clued_entry_count"], 0)
+        self.assertEqual(result.diagnostics["clued_entry_ratio"], 0.0)
         self.assertEqual(result.diagnostics["source_backed_entry_ratio"], 0.0)
         self.assertEqual(result.diagnostics["fallback_only_entry_ratio"], 0.0)
+        self.assertEqual(result.diagnostics["puzzle_status"], "insufficient_vocabulary")
+        self.assertEqual(result.diagnostics["unclued_assigned_slots_count"], 1)
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1735,6 +1739,21 @@ class PipelineTests(unittest.TestCase):
             14,
         )
 
+    def test_should_relax_min_df_for_quality_rescue_on_short_supported_inventory(self) -> None:
+        should_relax = _should_relax_min_df_for_quality_rescue(
+            size=15,
+            min_df=2,
+            terms=[
+                {"normalized_answer": "HEAT", "source_title_count": 1},
+                {"normalized_answer": "WORK", "source_title_count": 1},
+                {"normalized_answer": "STATE", "source_title_count": 1},
+            ],
+            solve_diagnostics={"fill_percent": 0.72, "unfilled_short_slot_count": 8},
+            preferred_fill_target=0.85,
+        )
+
+        self.assertTrue(should_relax)
+
     def test_generate_pipeline_expands_selection_after_failed_short_inventory(self) -> None:
         tmp_dir = Path("tests") / "tmp_outputs" / "generate_quality_rescue"
         if tmp_dir.exists():
@@ -1835,6 +1854,11 @@ class PipelineTests(unittest.TestCase):
             diagnostics_path=tmp_dir / "diagnostics_csp.json",
             diagnostics={"fill_status": "partial", "fill_percent": 0.74, "filler": {"used_ratio": 0.15}},
         )
+        retried_solve = SimpleNamespace(
+            grid_path=tmp_dir / "grid.json",
+            diagnostics_path=tmp_dir / "diagnostics_csp.json",
+            diagnostics={"fill_status": "partial", "fill_percent": 0.78, "filler": {"used_ratio": 0.12}},
+        )
         package_result = SimpleNamespace(
             puzzle_path=tmp_dir / "puzzle.json",
             attribution_path=tmp_dir / "attribution.json",
@@ -1849,7 +1873,7 @@ class PipelineTests(unittest.TestCase):
             patch("src.pipeline.run_vocab_gate_stage", return_value=gate_result),
             patch("src.pipeline.run_clue_extraction_stage", side_effect=[clue_result, clue_result]),
             patch("src.pipeline.run_topology_selection_stage", side_effect=[topology_result, topology_result]),
-            patch("src.pipeline.run_csp_solve_stage", side_effect=[failed_solve, improved_solve]),
+            patch("src.pipeline.run_csp_solve_stage", side_effect=[failed_solve, improved_solve, retried_solve]),
             patch("src.pipeline.run_packaging_stage", return_value=package_result) as mocked_package,
         ):
             run_generate_pipeline(
@@ -1866,6 +1890,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(mocked_terms.call_count, 2)
         second_terms_selected = Path(mocked_terms.call_args_list[1].kwargs["selected_path"])
         self.assertEqual(second_terms_selected.name, "selected_candidates_quality_rescue.json")
+        self.assertEqual(mocked_terms.call_args_list[1].kwargs["min_df"], 1)
         self.assertEqual(Path(mocked_package.call_args.kwargs["selected_path"]).name, "selected_candidates_quality_rescue.json")
         rescue_payload = json.loads((tmp_dir / "selected_candidates_quality_rescue.json").read_text(encoding="utf-8"))
         self.assertEqual(rescue_payload["selected_k"], 14)

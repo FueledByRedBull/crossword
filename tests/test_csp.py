@@ -1,7 +1,10 @@
 import unittest
 from importlib import import_module
+from pathlib import Path
+import shutil
 
 from src.crossword_csp import build_slots, render_grid, solve_crossword
+from src.csp_heuristics import build_solver_vocabulary
 
 try:
     rust_csp = import_module("rust_csp")
@@ -95,6 +98,50 @@ class CspTests(unittest.TestCase):
 
         self.assertTrue(result["solved"])
         self.assertEqual(len(result["assignments"]), len(slots))
+
+    def test_build_solver_vocabulary_excludes_unpackageable_template_fallback(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "csp_unpackageable_fallback"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        terms_path = tmp_dir / "answer_candidates.csv"
+        clues_path = tmp_dir / "clues.csv"
+        terms_path.write_text(
+            "\n".join(
+                [
+                    "answer,normalized_answer,length,source_method,lead_bold_signal,source_titles,doc_frequency,theme_score,entity_type_score,crosswordability_score,lexicon_score,shape_penalty,answer_score",
+                    "Alpha,ALPHA,5,spacy,False,Test,1,0.3,0.0,0.4,0.2,0.0,0.7",
+                    "Beta,BETA,4,spacy,False,Test,1,0.3,0.0,0.4,0.2,0.0,0.6",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        clues_path.write_text(
+            "\n".join(
+                [
+                    "answer,normalized_answer,clue,clue_score,clue_class,source_method,source_page,revid,sentence_offset,oldid_url",
+                    "Alpha,ALPHA,Good clue,0.9,source_backed,spacy,Test,1,0,https://example.com/alpha",
+                    "Beta,BETA,Fallback clue,0.1,template_fallback,title_tokens,Test,,-1,",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        vocabulary = build_solver_vocabulary(
+            terms_path=terms_path,
+            lang="en",
+            filler_path=None,
+            filler_min_len=3,
+            filler_max_len=5,
+            filler_max_per_length=0,
+            filler_weight=0.01,
+        )
+
+        self.assertIn("ALPHA", vocabulary.clue_answers)
+        self.assertNotIn("BETA", vocabulary.clue_answers)
+        self.assertIn("BETA", vocabulary.unsupported_answers)
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     @unittest.skipIf(rust_csp is None, "rust_csp is not installed")
     def test_rust_solver_matches_python_on_branching_fixture(self) -> None:

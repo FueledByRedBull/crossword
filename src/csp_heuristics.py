@@ -6,6 +6,7 @@ import csv
 from typing import Any, Callable
 
 from .lexicon import load_lexicon_scores, load_word_list
+from .provenance import has_packageable_clue_provenance, infer_clue_class
 
 QUALITY_GATE_MIN_FILL_PERCENT = 0.70
 QUALITY_GATE_MAX_FILLER_RATIO = 0.25
@@ -20,7 +21,9 @@ class SolverVocabulary:
     themed_set: set[str]
     clue_answers: set[str]
     source_backed_answers: set[str]
+    template_fallback_answers: set[str]
     fallback_only_answers: set[str]
+    unsupported_answers: set[str]
     clue_answers_available: bool
     filler_words: list[str]
     filler_raw_count: int
@@ -49,26 +52,6 @@ def normalize_solver_token(token: str, *, lang: str) -> str:
     if lang == "en":
         return "".join(ch for ch in text if "A" <= ch <= "Z")
     return "".join(ch for ch in text if ch.isalpha())
-
-
-def infer_clue_class(row: dict[str, Any]) -> str:
-    clue_class = str(row.get("clue_class") or "").strip().lower()
-    if clue_class in {"source_backed", "template_fallback", "synthetic_filler"}:
-        return clue_class
-
-    source_method = str(row.get("source_method") or "").strip().lower()
-    if source_method == "package_filler_fallback":
-        return "synthetic_filler"
-
-    sentence_offset = safe_float(row.get("sentence_offset"), default=-1.0)
-    has_provenance = bool(str(row.get("revid") or "").strip() or str(row.get("oldid_url") or "").strip())
-    if sentence_offset >= 0 and has_provenance:
-        return "source_backed"
-    if int(sentence_offset) == -1:
-        return "template_fallback"
-    if has_provenance:
-        return "source_backed"
-    return "template_fallback"
 
 
 def build_solver_vocabulary(
@@ -100,6 +83,7 @@ def build_solver_vocabulary(
     clue_answers_path = Path(terms_path).with_name("clues.csv")
     clue_answers: set[str] = set()
     source_backed_answers: set[str] = set()
+    template_fallback_answers: set[str] = set()
     fallback_only_answers: set[str] = set()
     if clue_answers_path.exists():
         with clue_answers_path.open("r", encoding="utf-8", newline="") as handle:
@@ -107,16 +91,21 @@ def build_solver_vocabulary(
             for row in reader:
                 answer = normalize_solver_token(row.get("normalized_answer") or "", lang=lang)
                 if answer:
-                    clue_answers.add(answer)
                     clue_class = infer_clue_class(row)
+                    if not has_packageable_clue_provenance(row):
+                        continue
+                    clue_answers.add(answer)
                     if clue_class == "source_backed":
                         source_backed_answers.add(answer)
                     elif clue_class == "template_fallback":
+                        template_fallback_answers.add(answer)
                         fallback_only_answers.add(answer)
     clue_answers &= set(word_scores)
     source_backed_answers &= clue_answers
+    template_fallback_answers &= clue_answers
     fallback_only_answers &= clue_answers
     fallback_only_answers -= source_backed_answers
+    template_fallback_answers -= source_backed_answers
     clue_answers_available = bool(clue_answers)
     if clue_answers_available:
         clue_answer_lengths = {len(answer) for answer in clue_answers}
@@ -128,6 +117,7 @@ def build_solver_vocabulary(
 
     themed_words = sorted(word_scores, key=lambda word: (word_scores[word], word), reverse=True)
     themed_set = set(word_scores.keys())
+    unsupported_answers = themed_set - clue_answers
 
     common_lexicon = load_lexicon_scores(common_lexicon_path)
     enforce_lexicon_cutoff = True
@@ -203,7 +193,9 @@ def build_solver_vocabulary(
         themed_set=themed_set,
         clue_answers=clue_answers,
         source_backed_answers=source_backed_answers,
+        template_fallback_answers=template_fallback_answers,
         fallback_only_answers=fallback_only_answers,
+        unsupported_answers=unsupported_answers,
         clue_answers_available=clue_answers_available,
         filler_words=filler_words,
         filler_raw_count=filler_raw_count,
@@ -497,6 +489,7 @@ def run_template_trial(
                 "position": slot.cells[0],
             }
         )
+    unfilled_short_slot_count = sum(1 for slot in slots if slot.id not in assigned_ids and slot.length <= 5)
 
     assigned_count = len(final_assignments)
     themed_assigned_count = sum(1 for word in final_assignments.values() if word in themed_set)
@@ -542,16 +535,17 @@ def run_template_trial(
     )
 
     quality_objective = (
-        (1.15 * fill_percent)
+        (1.35 * fill_percent)
         + (0.75 * (0.0 if assigned_count == 0 else themed_assigned_count / assigned_count))
-        + (0.85 * source_backed_entry_ratio)
-        + (0.35 * clued_entry_ratio)
+        + (0.90 * source_backed_entry_ratio)
+        + (0.25 * clued_entry_ratio)
         + (0.35 * long_slot_theme_ratio)
-        - (1.05 * filler_used_ratio)
+        - (1.10 * filler_used_ratio)
         - (0.30 * len(invalid_slots))
         - (0.70 * long_slot_non_theme_count)
-        - (0.55 * fallback_only_entry_ratio)
-        - (0.65 * fallback_only_long_ratio)
+        - (0.75 * fallback_only_entry_ratio)
+        - (0.90 * fallback_only_long_ratio)
+        - (0.10 * unfilled_short_slot_count)
     )
 
     solved_flag = bool(result.get("solved", False))
@@ -600,6 +594,7 @@ def run_template_trial(
         "fallback_only_long_count": fallback_only_long_count,
         "fallback_only_long_ratio": fallback_only_long_ratio,
         "long_slot_theme_ratio": long_slot_theme_ratio,
+        "unfilled_short_slot_count": unfilled_short_slot_count,
         "unclued_removed_count": unclued_removed_count,
         "phase_a": {
             "steps": phase_a_result.get("steps", 0),

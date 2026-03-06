@@ -109,6 +109,31 @@ LEADING_DETERMINERS_EN = {
     "THOSE",
 }
 
+GENERIC_GRID_JUNK_EN = {
+    "ALSO",
+    "AREA",
+    "FIRST",
+    "FORM",
+    "FOUR",
+    "KIND",
+    "LESS",
+    "MANY",
+    "MORE",
+    "MOST",
+    "PART",
+    "SECOND",
+    "SOME",
+    "TERMS",
+    "THIRD",
+    "THREE",
+    "TODAY",
+    "TYPE",
+    "USED",
+    "USES",
+    "WORK",
+    "YEARS",
+}
+
 from .text_normalize import normalize_text, strip_diacritics, tokenize
 
 RARE_LETTERS = {"Q", "X", "Z", "J"}
@@ -280,6 +305,34 @@ def clueability_score(answer: str, normalized: str, *, lang: str = "en") -> floa
     )
 
 
+def genericness_penalty(
+    answer: str,
+    normalized: str,
+    *,
+    lang: str = "en",
+    lexicon_score: float = 0.0,
+    lead_bold_signal: bool = False,
+    title_support_score: float = 0.0,
+    source_title_count: int = 1,
+    support_sentence_count: int = 0,
+) -> float:
+    if lang != "en" or not normalized:
+        return 0.0
+    if " " in answer.strip():
+        return 0.0
+    if normalized not in GENERIC_GRID_JUNK_EN:
+        return 0.0
+    if lead_bold_signal or title_support_score >= 0.5 or source_title_count >= 2 or support_sentence_count > 0:
+        return 0.0
+
+    penalty = 0.35
+    if lexicon_score >= 0.7:
+        penalty += 0.25
+    elif lexicon_score >= 0.45:
+        penalty += 0.15
+    return min(0.75, penalty)
+
+
 def _clean_answer_text(text: str, *, lang: str = "en") -> str:
     cleaned = " ".join(text.strip(" \t\r\n\"'()[]{}.,;:").split())
     if not cleaned or lang != "en":
@@ -424,6 +477,32 @@ def extract_terms_lead_bold(
         )
         if candidate is None:
             continue
+        results.append(candidate)
+    return results
+
+
+def extract_terms_title_tokens(
+    title: str,
+    *,
+    source_title: str,
+    lang: str = "en",
+) -> list[TermCandidate]:
+    if not title:
+        return []
+    seen: set[str] = set()
+    results: list[TermCandidate] = []
+    raw_candidates = [title, *title.replace("(", " ").replace(")", " ").replace(",", " ").split()]
+    for raw_candidate in raw_candidates:
+        candidate = _build_term_candidate(
+            raw_candidate,
+            source_title=source_title,
+            source_method="title_tokens",
+            lead_bold_signal=False,
+            lang=lang,
+        )
+        if candidate is None or candidate.normalized_answer in seen:
+            continue
+        seen.add(candidate.normalized_answer)
         results.append(candidate)
     return results
 

@@ -59,15 +59,17 @@ The CSP stage accepts complete or strong partial fills. Current quality gates ar
 
 Passing puzzles can still be `fill_status = "partial"` if they clear the gate and package cleanly as `puzzle_status = "ok"`.
 
+The solve stage also carries a separate `preferred_fill_target = 0.85`. That is not a hard acceptance gate; it is the retry/rescue target that drives selection expansion, rescue-only `min_df` relaxation, and short-slot completion before packaging.
+
 ## Clue Quality
 
 Clues are tagged into three classes throughout the pipeline:
 
 - `source_backed`: extracted from a real cached article sentence with provenance
 - `template_fallback`: article-backed fallback clue text when sentence extraction misses
-- `synthetic_filler`: packaging-only short-fill fallback used as a last resort
+- `synthetic_filler`: debug/search-only short-fill fallback class that is not packageable
 
-`synthetic_filler` clues are retained only to cover short bridge entries during packaging. They do not count as source-backed coverage, and the CSP objective treats fallback-heavy grids as lower quality than source-backed alternatives.
+Packaged puzzles may use bounded `template_fallback` clues, but they must carry page-level provenance. `synthetic_filler` clues do not count as source-backed coverage and are rejected from final packaging.
 
 ## Solver Behavior
 
@@ -111,14 +113,15 @@ The offline integration corpus currently covers:
 
 The test suite runs that corpus on the Python backend and, when installed, the Rust backend. It checks per-seed gate clearance plus aggregate quality:
 
-- average `fill_percent >= 0.71`
+- average `fill_percent >= 0.73`
 - average `filler_used_ratio <= 0.10`
 - average `long_slot_theme_ratio >= 0.95`
-- average `source_backed_entry_ratio >= 0.65`
-- average `fallback_only_entry_ratio <= 0.35`
-- average `synthetic_filler_clue_count <= 0.75`
+- average `used_source_backed_entry_ratio >= 0.90`
+- average `used_template_fallback_entry_ratio <= 0.10`
+- average `packaged_synthetic_filler_count == 0`
+- average `used_clue_provenance_missing_count == 0`
 
-The benchmark runner writes these quality metrics into `benchmarks_summary.json` per seed and in the top-level `aggregate` block. That summary now tracks fill, filler pressure, long-slot theme usage, clue coverage, source-backed coverage, fallback-only usage, synthetic filler clue count, and pass rates across a seed set.
+The benchmark runner writes these quality metrics into `benchmarks_summary.json` per seed and in the top-level `aggregate` block. That summary now tracks fill, filler pressure, long-slot theme usage, used-clue source-backed coverage, used template-fallback usage, packaged synthetic filler count, used-clue provenance completeness, and pass rates across a seed set.
 
 ## Key Outputs
 
