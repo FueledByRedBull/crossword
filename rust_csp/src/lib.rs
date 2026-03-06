@@ -363,15 +363,7 @@ fn solve_crossword(
         }];
 
         while !states.is_empty() && total_steps < max_steps {
-            states.sort_by(|a, b| {
-                let ar = state_rank(&a.assignments, &a.domains, a.quality);
-                let br = state_rank(&b.assignments, &b.domains, b.quality);
-                br.0
-                    .cmp(&ar.0)
-                    .then_with(|| br.1.partial_cmp(&ar.1).unwrap_or(Ordering::Equal))
-                    .then_with(|| br.2.cmp(&ar.2))
-            });
-            let state = states.remove(0);
+            let state = states.pop().unwrap();
             if state.assigned_count == slot_count {
                 solved = true;
                 if better_candidate(
@@ -482,8 +474,7 @@ fn solve_crossword(
                 continue;
             }
 
-            states.extend(child_states);
-            states.sort_by(|a, b| {
+            child_states.sort_by(|a, b| {
                 let ar = state_rank(&a.assignments, &a.domains, a.quality);
                 let br = state_rank(&b.assignments, &b.domains, b.quality);
                 br.0
@@ -492,9 +483,19 @@ fn solve_crossword(
                     .then_with(|| br.2.cmp(&ar.2))
             });
 
-            let mut deduped: Vec<State> = Vec::new();
-            let mut seen: HashSet<Vec<(usize, usize)>> = HashSet::new();
-            for candidate_state in states.drain(..) {
+            let mut deduped_children: Vec<State> = Vec::new();
+            let mut seen: HashSet<Vec<(usize, usize)>> = states
+                .iter()
+                .map(|existing_state| {
+                    existing_state
+                        .assignments
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, value)| value.map(|word_idx| (idx, word_idx)))
+                        .collect()
+                })
+                .collect();
+            for candidate_state in child_states.into_iter() {
                 let signature: Vec<(usize, usize)> = candidate_state
                     .assignments
                     .iter()
@@ -505,12 +506,14 @@ fn solve_crossword(
                     continue;
                 }
                 seen.insert(signature);
-                deduped.push(candidate_state);
-                if deduped.len() >= beam_width {
+                deduped_children.push(candidate_state);
+                if deduped_children.len() >= beam_width {
                     break;
                 }
             }
-            states = deduped;
+            for candidate_state in deduped_children.into_iter().rev() {
+                states.push(candidate_state);
+            }
         }
 
         if solved {

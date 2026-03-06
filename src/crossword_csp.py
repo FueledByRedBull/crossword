@@ -228,8 +228,7 @@ def solve_crossword(
         ]
 
         while states and total_steps < max_steps:
-            states.sort(key=state_rank, reverse=True)
-            state = states.pop(0)
+            state = states.pop()
             assignments = state["assignments"]
             used_words = state["used_words"]
             domains = state["domains"]
@@ -294,18 +293,21 @@ def solve_crossword(
             if not child_states:
                 continue
 
-            ranked = sorted(states + child_states, key=state_rank, reverse=True)
-            deduped: list[dict] = []
-            seen_signatures: set[tuple[tuple[int, str], ...]] = set()
-            for candidate_state in ranked:
+            ranked_children = sorted(child_states, key=state_rank, reverse=True)
+            deduped_children: list[dict] = []
+            seen_signatures = {
+                tuple(sorted(existing_state["assignments"].items())) for existing_state in states
+            }
+            for candidate_state in ranked_children:
                 signature = tuple(sorted(candidate_state["assignments"].items()))
                 if signature in seen_signatures:
                     continue
                 seen_signatures.add(signature)
-                deduped.append(candidate_state)
-                if len(deduped) >= beam_width:
+                deduped_children.append(candidate_state)
+                if len(deduped_children) >= beam_width:
                     break
-            states = deduped
+            for candidate_state in reversed(deduped_children):
+                states.append(candidate_state)
 
         if solved:
             break
