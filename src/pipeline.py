@@ -167,6 +167,45 @@ def _safe_float(value, *, default: float = 0.0) -> float:
         return default
 
 
+def _safe_int(value, *, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _infer_clue_class(row: dict) -> str:
+    clue_class = (row.get("clue_class") or "").strip().lower()
+    if clue_class in {"source_backed", "template_fallback", "synthetic_filler"}:
+        return clue_class
+
+    source_method = (row.get("source_method") or "").strip().lower()
+    if source_method == "package_filler_fallback":
+        return "synthetic_filler"
+
+    sentence_offset = _safe_int(row.get("sentence_offset"), default=-1)
+    has_provenance = bool((row.get("revid") or "").strip() or (row.get("oldid_url") or "").strip())
+    if sentence_offset >= 0 and has_provenance:
+        return "source_backed"
+    if sentence_offset == -1:
+        return "template_fallback"
+    if has_provenance:
+        return "source_backed"
+    return "template_fallback"
+
+
+def _clue_class_rank(clue_class: str) -> int:
+    if clue_class == "source_backed":
+        return 2
+    if clue_class == "template_fallback":
+        return 1
+    if clue_class == "synthetic_filler":
+        return 0
+    return -1
+
+
 def _unique_term_inventory_by_length(terms: list[dict]) -> dict[int, int]:
     by_length: dict[int, set[str]] = {}
     for term in terms:
@@ -189,6 +228,29 @@ def _should_expand_selection_inventory(
         return False
     inventory = _unique_term_inventory_by_length(terms)
     return inventory.get(4, 0) < 12 or inventory.get(5, 0) < 12
+
+
+def _quality_rescue_target_count(
+    *,
+    size: int,
+    current_selected_count: int,
+    terms: list[dict],
+) -> int:
+    base_target = max(current_selected_count, 12 if size >= 15 else current_selected_count)
+    if size < 15:
+        return base_target
+
+    inventory = _unique_term_inventory_by_length(terms)
+    shortage_extra = min(
+        4,
+        max(
+            max(0, 12 - inventory.get(4, 0)),
+            max(0, 12 - inventory.get(5, 0)),
+        ),
+    )
+    if current_selected_count >= 12 and shortage_extra > 0:
+        return min(16, base_target + shortage_extra)
+    return base_target
 
 
 def _load_selected_titles(path: str | Path) -> list[str]:
@@ -238,7 +300,7 @@ def _expand_selected_titles_from_scores(
     return expanded
 
 
-def _solve_result_rank(diagnostics: dict) -> tuple[int, float, float]:
+def _solve_result_rank(diagnostics: dict) -> tuple[int, float, float, float, float]:
     status = diagnostics.get("fill_status")
     if status == "complete":
         status_rank = 2
@@ -247,11 +309,19 @@ def _solve_result_rank(diagnostics: dict) -> tuple[int, float, float]:
     else:
         status_rank = 0
     fill_percent = _safe_float(diagnostics.get("fill_percent"), default=0.0)
+    source_backed_ratio = _safe_float(
+        diagnostics.get("source_backed_entry_ratio"),
+        default=0.0,
+    )
+    long_slot_theme_ratio = _safe_float(
+        diagnostics.get("long_slot_theme_ratio"),
+        default=0.0,
+    )
     filler_ratio = _safe_float(
         (diagnostics.get("filler") or {}).get("used_ratio"),
         default=1.0,
     )
-    return (status_rank, fill_percent, -filler_ratio)
+    return (status_rank, fill_percent, source_backed_ratio, long_slot_theme_ratio, -filler_ratio)
 
 
 def _inventory_min_k_target(
@@ -1075,12 +1145,14 @@ def run_term_extraction_stage(
     from .term_extractor import get_stopwords
 
     stopwords = get_stopwords(lang)
-    merged = merge_terms(
+    merged, merge_diagnostics = merge_terms(
         term_lists,
+        lang=lang,
         min_len=min_len,
         max_len=max_len,
         min_alpha_ratio=min_alpha_ratio,
         stopwords=stopwords,
+        return_stats=True,
     )
 
     df = term_frequency_across_docs(list(extracts.values()), lang=lang)
@@ -1106,6 +1178,10 @@ def run_term_extraction_stage(
         theme_score = 0.0 if max_df == 0 else freq / max_df
         shape = shape_penalty(term.normalized_answer)
         crossword_score = crosswordability_score(term.normalized_answer)
+        source_title_count = len(term.source_titles)
+        source_diversity_score = min(1.0, source_title_count / 3.0)
+        cleanliness_score = term.answer_cleanliness_score
+        clueability = term.clueability_score
         lexicon_score = lexicon_score_for_token(term.normalized_answer, lexicon)
         if lexicon_score > 0.0:
             lexicon_hits += 1
@@ -1129,10 +1205,13 @@ def run_term_extraction_stage(
         lead_bold_bonus = 1.0 if term.lead_bold_signal else 0.0
         residual_weight = max(0.0, 1.0 - lexicon_weight)
         answer_score = (
-            (0.4 * residual_weight * theme_score)
-            + (0.3 * residual_weight * entity_score)
-            + (0.2 * residual_weight * lead_bold_bonus)
-            + (0.1 * residual_weight * crossword_score)
+            (0.22 * residual_weight * theme_score)
+            + (0.18 * residual_weight * entity_score)
+            + (0.10 * residual_weight * lead_bold_bonus)
+            + (0.12 * residual_weight * crossword_score)
+            + (0.15 * residual_weight * cleanliness_score)
+            + (0.13 * residual_weight * clueability)
+            + (0.10 * residual_weight * source_diversity_score)
             + (lexicon_weight * lexicon_score)
         )
 
@@ -1143,11 +1222,16 @@ def run_term_extraction_stage(
                 "length": term.length,
                 "source_method": term.source_method,
                 "lead_bold_signal": term.lead_bold_signal,
+                "token_count": term.token_count,
                 "source_titles": "|".join(sorted(term.source_titles)),
                 "source_mentions": sorted(term.source_titles),
+                "source_title_count": source_title_count,
                 "doc_frequency": freq,
                 "theme_score": round(theme_score, 4),
                 "entity_type_score": round(entity_score, 4),
+                "answer_cleanliness_score": round(cleanliness_score, 4),
+                "clueability_score": round(clueability, 4),
+                "source_diversity_score": round(source_diversity_score, 4),
                 "crosswordability_score": round(crossword_score, 4),
                 "lexicon_score": round(lexicon_score, 4),
                 "shape_penalty": round(shape, 4),
@@ -1158,9 +1242,12 @@ def run_term_extraction_stage(
     filtered_terms.sort(
         key=lambda row: (
             row["answer_score"],
+            row["answer_cleanliness_score"],
+            row["clueability_score"],
+            row["source_title_count"],
             row["doc_frequency"],
+            -row["token_count"],
             row["crosswordability_score"],
-            row["length"],
         ),
         reverse=True,
     )
@@ -1177,10 +1264,15 @@ def run_term_extraction_stage(
                 "length",
                 "source_method",
                 "lead_bold_signal",
+                "token_count",
                 "source_titles",
+                "source_title_count",
                 "doc_frequency",
                 "theme_score",
                 "entity_type_score",
+                "answer_cleanliness_score",
+                "clueability_score",
+                "source_diversity_score",
                 "crosswordability_score",
                 "lexicon_score",
                 "shape_penalty",
@@ -1195,10 +1287,15 @@ def run_term_extraction_stage(
                     row["length"],
                     row["source_method"],
                     row["lead_bold_signal"],
+                    row["token_count"],
                     row["source_titles"],
+                    row["source_title_count"],
                     row["doc_frequency"],
                     row["theme_score"],
                     row["entity_type_score"],
+                    row["answer_cleanliness_score"],
+                    row["clueability_score"],
+                    row["source_diversity_score"],
                     row["crosswordability_score"],
                     row["lexicon_score"],
                     row["shape_penalty"],
@@ -1218,6 +1315,12 @@ def run_term_extraction_stage(
         "spacy_model_version": spacy_model_version if backend_used == "spacy" else None,
         "entity_type_scoring": entity_type_scoring,
         "entity_type_hits": entity_hits if entity_type_scoring else 0,
+        "dirty_phrase_reject_count": merge_diagnostics.dirty_phrase_reject_count,
+        "multiword_reject_count": merge_diagnostics.multiword_reject_count,
+        "stopword_boundary_reject_count": merge_diagnostics.stopword_boundary_reject_count,
+        "low_cleanliness_reject_count": merge_diagnostics.low_cleanliness_reject_count,
+        "promoted_by_lead_bold_count": merge_diagnostics.promoted_by_lead_bold_count,
+        "promoted_by_source_diversity_count": merge_diagnostics.promoted_by_source_diversity_count,
         "lexicon": {
             "path": str(lexicon_path) if lexicon_path is not None else None,
             "loaded": bool(lexicon),
@@ -1614,6 +1717,7 @@ def run_clue_extraction_stage(
         normalized_answer: str,
         answer_key_value: str,
         clue_text: str,
+        clue_class: str,
         source_method: str,
         source_page: str,
         revid: int | None,
@@ -1626,6 +1730,7 @@ def run_clue_extraction_stage(
             "normalized_answer": normalized_answer or answer_key_value,
             "clue": clue_text,
             "clue_score": clue_score,
+            "clue_class": clue_class,
             "source_method": source_method,
             "source_page": source_page,
             "revid": revid,
@@ -1671,6 +1776,7 @@ def run_clue_extraction_stage(
                 normalized_answer=normalized_answer,
                 answer_key_value=key,
                 clue_text=clue_text,
+                clue_class="source_backed",
                 source_method=term["source_method"],
                 source_page=source_title or "",
                 revid=payload.get("revid"),
@@ -1725,6 +1831,7 @@ def run_clue_extraction_stage(
                     normalized_answer=normalized_answer,
                     answer_key_value=key,
                     clue_text=clue_text,
+                    clue_class="source_backed",
                     source_method=term["source_method"],
                     source_page=source_title or "",
                     revid=payload.get("revid"),
@@ -1794,6 +1901,7 @@ def run_clue_extraction_stage(
             "normalized_answer": term.get("normalized_answer") or key,
             "clue": fallback_text,
             "clue_score": 0.05,
+            "clue_class": "template_fallback",
             "source_method": term.get("source_method") or "template_fallback",
             "source_page": fallback_title,
             "revid": fallback_revid,
@@ -1823,6 +1931,7 @@ def run_clue_extraction_stage(
                 "normalized_answer",
                 "clue",
                 "clue_score",
+                "clue_class",
                 "source_method",
                 "source_page",
                 "revid",
@@ -1837,6 +1946,7 @@ def run_clue_extraction_stage(
                     row.get("normalized_answer", ""),
                     row["clue"],
                     row.get("clue_score", ""),
+                    row.get("clue_class", ""),
                     row.get("source_method", ""),
                     row.get("source_page", ""),
                     row.get("revid", ""),
@@ -1846,6 +1956,10 @@ def run_clue_extraction_stage(
             )
 
     provenance_missing = validate_clue_provenance(clues)
+    clue_class_counts: dict[str, int] = {}
+    for row in clues:
+        clue_class = _infer_clue_class(row)
+        clue_class_counts[clue_class] = clue_class_counts.get(clue_class, 0) + 1
     diagnostics = {
         "stage": "clue_extraction",
         "lang": lang,
@@ -1863,6 +1977,9 @@ def run_clue_extraction_stage(
         "diversity_rejected_after_retry": len(final_rejected),
         "fallback_template_added": fallback_template_added,
         "fallback_template_failed": fallback_template_failed,
+        "clue_class_counts": clue_class_counts,
+        "source_backed_clue_count": clue_class_counts.get("source_backed", 0),
+        "template_fallback_clue_count": clue_class_counts.get("template_fallback", 0),
         "provenance_missing_count": len(provenance_missing),
         "provenance_missing": provenance_missing[:10],
         "errors": errors,
@@ -2029,6 +2146,8 @@ def run_csp_solve_stage(
     themed_set = vocabulary.themed_set
     clue_answers = vocabulary.clue_answers
     clue_answers_available = vocabulary.clue_answers_available
+    source_backed_answers = getattr(vocabulary, "source_backed_answers", set())
+    fallback_only_answers = getattr(vocabulary, "fallback_only_answers", set())
     filler_words = vocabulary.filler_words
     filler_raw_count = vocabulary.filler_raw_count
     filler_added = vocabulary.filler_added
@@ -2071,7 +2190,13 @@ def run_csp_solve_stage(
         scored_templates = []
     else:
         ranking_words = themed_words
-        if clue_answers_available:
+        if source_backed_answers:
+            ranking_words = sorted(
+                source_backed_answers,
+                key=lambda word: (word_scores.get(word, 0.0), word),
+                reverse=True,
+            )
+        elif clue_answers_available:
             ranking_words = sorted(
                 clue_answers,
                 key=lambda word: (word_scores.get(word, 0.0), word),
@@ -2134,7 +2259,7 @@ def run_csp_solve_stage(
 
     template_trials_log: list[dict] = []
     best_trial: dict | None = None
-    best_rank: tuple[int, float, float, int, int] | None = None
+    best_rank: tuple[int, float, int, float, float, float, int, float, int, int] | None = None
 
     for idx, template in enumerate(templates_to_try):
         trial_seed = random_seed + (idx * 101)
@@ -2150,6 +2275,8 @@ def run_csp_solve_stage(
             themed_words=themed_words,
             themed_set=themed_set,
             clue_answers=clue_answers,
+            source_backed_answers=source_backed_answers,
+            fallback_only_answers=fallback_only_answers,
             clue_answers_available=clue_answers_available,
             word_scores=word_scores,
             long_filler_weight=long_filler_weight,
@@ -2171,6 +2298,22 @@ def run_csp_solve_stage(
             clue_answers_available=clue_answers_available,
             long_slot_non_theme_count=trial["long_slot_non_theme_count"],
         )
+        trial_source_backed_entry_ratio = _safe_float(
+            trial.get("source_backed_entry_ratio"),
+            default=0.0,
+        )
+        trial_fallback_only_assigned_count = _safe_int(
+            trial.get("fallback_only_assigned_count"),
+            default=0,
+        )
+        trial_fallback_only_long_count = _safe_int(
+            trial.get("fallback_only_long_count"),
+            default=0,
+        )
+        trial_long_slot_theme_ratio = _safe_float(
+            trial.get("long_slot_theme_ratio"),
+            default=0.0,
+        )
         template_trials_log.append(
             {
                 "template": template.name,
@@ -2190,7 +2333,11 @@ def run_csp_solve_stage(
                 "quality_objective": trial["quality_objective"],
                 "filler_used_ratio": trial["filler_used_ratio"],
                 "clued_entry_ratio": trial["clued_entry_ratio"],
+                "source_backed_entry_ratio": trial_source_backed_entry_ratio,
                 "long_slot_non_theme_count": trial["long_slot_non_theme_count"],
+                "long_slot_theme_ratio": trial_long_slot_theme_ratio,
+                "fallback_only_assigned_count": trial_fallback_only_assigned_count,
+                "fallback_only_long_count": trial_fallback_only_long_count,
                 "quality_gate": {
                     "passed": trial_quality_gate_passed,
                     "reasons": trial_quality_gate_reasons,
@@ -2212,11 +2359,13 @@ def run_csp_solve_stage(
             1 if trial_quality_gate_passed else 0,
             trial["fill_percent"],
             -len(trial["invalid_slots"]),
-            trial["clued_entry_ratio"],
+            trial_source_backed_entry_ratio,
+            trial_long_slot_theme_ratio,
             -trial["filler_used_ratio"],
+            -trial_fallback_only_assigned_count,
+            trial["quality_objective"],
             -trial["long_slot_non_theme_count"],
             _status_rank(trial["fill_status"]),
-            trial["quality_objective"],
             trial["fill_count"],
         )
         if best_trial is None or rank > best_rank:
@@ -2247,8 +2396,14 @@ def run_csp_solve_stage(
     filler_used_count = best_trial["filler_used_count"]
     filler_used_ratio = best_trial["filler_used_ratio"]
     clued_entry_ratio = best_trial["clued_entry_ratio"]
+    source_backed_entry_count = _safe_int(best_trial.get("source_backed_entry_count"), default=0)
+    source_backed_entry_ratio = _safe_float(best_trial.get("source_backed_entry_ratio"), default=0.0)
+    fallback_only_assigned_count = _safe_int(best_trial.get("fallback_only_assigned_count"), default=0)
+    fallback_only_entry_ratio = _safe_float(best_trial.get("fallback_only_entry_ratio"), default=0.0)
     long_slot_assigned_count = best_trial["long_slot_assigned_count"]
     long_slot_non_theme_count = best_trial["long_slot_non_theme_count"]
+    fallback_only_long_count = _safe_int(best_trial.get("fallback_only_long_count"), default=0)
+    fallback_only_long_ratio = _safe_float(best_trial.get("fallback_only_long_ratio"), default=0.0)
     long_slot_theme_ratio = best_trial["long_slot_theme_ratio"]
     quality_objective = best_trial["quality_objective"]
     unclued_removed_count = best_trial["unclued_removed_count"]
@@ -2327,8 +2482,14 @@ def run_csp_solve_stage(
             "clued_assigned_count": clued_assigned_count,
             "clue_answers_available": clue_answers_available,
             "clued_entry_ratio": clued_entry_ratio,
+            "source_backed_entry_count": source_backed_entry_count,
+            "source_backed_entry_ratio": source_backed_entry_ratio,
+            "fallback_only_assigned_count": fallback_only_assigned_count,
+            "fallback_only_entry_ratio": fallback_only_entry_ratio,
             "long_slot_assigned_count": long_slot_assigned_count,
             "long_slot_non_theme_count": long_slot_non_theme_count,
+            "fallback_only_long_count": fallback_only_long_count,
+            "fallback_only_long_ratio": fallback_only_long_ratio,
             "long_slot_theme_ratio": long_slot_theme_ratio,
         },
     )
@@ -2378,9 +2539,17 @@ def run_csp_solve_stage(
         "clue_answers_available": clue_answers_available,
         "clue_answers_count": len(clue_answers),
         "clued_entry_ratio": clued_entry_ratio,
+        "source_backed_answers_count": len(source_backed_answers),
+        "source_backed_entry_count": source_backed_entry_count,
+        "source_backed_entry_ratio": source_backed_entry_ratio,
         "filler_used_ratio": filler_used_ratio,
+        "fallback_only_answers_count": len(fallback_only_answers),
+        "fallback_only_assigned_count": fallback_only_assigned_count,
+        "fallback_only_entry_ratio": fallback_only_entry_ratio,
         "long_slot_assigned_count": long_slot_assigned_count,
         "long_slot_non_theme_count": long_slot_non_theme_count,
+        "fallback_only_long_count": fallback_only_long_count,
+        "fallback_only_long_ratio": fallback_only_long_ratio,
         "long_slot_theme_ratio": long_slot_theme_ratio,
         "quality_objective": quality_objective,
         "unclued_removed_count": unclued_removed_count,
@@ -2454,7 +2623,9 @@ def run_packaging_stage(
     for clue in clues:
         normalized = clue.get("normalized_answer") or ""
         if normalized:
-            clue_by_normalized[normalized] = clue
+            existing = clue_by_normalized.get(normalized)
+            if existing is None or _clue_class_rank(_infer_clue_class(clue)) > _clue_class_rank(_infer_clue_class(existing)):
+                clue_by_normalized[normalized] = clue
 
     def _has_valid_clue(clue_row: dict) -> bool:
         text = (clue_row.get("clue") or "").strip()
@@ -2470,6 +2641,7 @@ def run_packaging_stage(
     across_entries: list[dict] = []
     down_entries: list[dict] = []
     unclued_assigned_slots: list[dict] = []
+    entry_clue_classes: list[str] = []
     if grid_artifact is not None:
         normalized_assignments = dict(grid_artifact.assignments)
     else:
@@ -2525,6 +2697,7 @@ def run_packaging_stage(
                     "normalized_answer": answer,
                     "clue": "Short fill used to complete crossings.",
                     "clue_score": 0.01,
+                    "clue_class": "synthetic_filler",
                     "source_method": "package_filler_fallback",
                     "source_page": "Generated filler",
                     "revid": "",
@@ -2533,7 +2706,6 @@ def run_packaging_stage(
                 }
                 clue_by_normalized[answer] = clue
                 clues.append(clue)
-                synthetic_filler_clue_count += 1
             else:
                 unclued_assigned_slots.append(
                     {
@@ -2553,6 +2725,7 @@ def run_packaging_stage(
             "col": slot["cells"][0][1],
             "length": slot["length"],
         }
+        entry_clue_classes.append(_infer_clue_class(clue))
         if slot["direction"] == "across":
             across_entries.append(entry)
         else:
@@ -2563,7 +2736,12 @@ def run_packaging_stage(
     unfilled_slots = grid_artifact.unfilled_slots if grid_artifact is not None else grid_payload.get("unfilled_slots", [])
     assigned_slot_count = len(normalized_assignments)
     clued_entry_count = len(across_entries) + len(down_entries)
+    source_backed_entry_count = sum(1 for clue_class in entry_clue_classes if clue_class == "source_backed")
+    fallback_only_entry_count = sum(1 for clue_class in entry_clue_classes if clue_class == "template_fallback")
+    synthetic_filler_clue_count = sum(1 for clue_class in entry_clue_classes if clue_class == "synthetic_filler")
     clued_entry_ratio = 0.0 if assigned_slot_count == 0 else clued_entry_count / assigned_slot_count
+    source_backed_entry_ratio = 0.0 if assigned_slot_count == 0 else source_backed_entry_count / assigned_slot_count
+    fallback_only_entry_ratio = 0.0 if assigned_slot_count == 0 else fallback_only_entry_count / assigned_slot_count
     puzzle_status = "ok"
     if not selected_titles or not clues:
         puzzle_status = "insufficient_vocabulary"
@@ -2596,6 +2774,10 @@ def run_packaging_stage(
             "assigned_slot_count": assigned_slot_count,
             "clued_entry_count": clued_entry_count,
             "clued_entry_ratio": clued_entry_ratio,
+            "source_backed_entry_count": source_backed_entry_count,
+            "source_backed_entry_ratio": source_backed_entry_ratio,
+            "fallback_only_entry_count": fallback_only_entry_count,
+            "fallback_only_entry_ratio": fallback_only_entry_ratio,
             "unclued_assigned_slots_count": len(unclued_assigned_slots),
             "unclued_assigned_slots": unclued_assigned_slots,
             "synthetic_filler_clue_count": synthetic_filler_clue_count,
@@ -2618,6 +2800,10 @@ def run_packaging_stage(
         "assigned_slot_count": assigned_slot_count,
         "clued_entry_count": clued_entry_count,
         "clued_entry_ratio": clued_entry_ratio,
+        "source_backed_entry_count": source_backed_entry_count,
+        "source_backed_entry_ratio": source_backed_entry_ratio,
+        "fallback_only_entry_count": fallback_only_entry_count,
+        "fallback_only_entry_ratio": fallback_only_entry_ratio,
         "unclued_assigned_slots_count": len(unclued_assigned_slots),
         "synthetic_filler_clue_count": synthetic_filler_clue_count,
         "errors": errors,
@@ -2896,7 +3082,11 @@ def run_generate_pipeline(
         expanded_titles = _expand_selected_titles_from_scores(
             selected_titles=current_selected_titles,
             candidate_scores_path=scores_path,
-            target_count=max(len(current_selected_titles), 12),
+            target_count=_quality_rescue_target_count(
+                size=size,
+                current_selected_count=len(current_selected_titles),
+                terms=terms.terms,
+            ),
         )
         if len(expanded_titles) > len(current_selected_titles):
             expanded_selected_path = _write_selected_titles(

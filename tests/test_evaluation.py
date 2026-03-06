@@ -14,6 +14,9 @@ class EvaluationTests(unittest.TestCase):
                 "fill_percent": 0.74,
                 "filler_used_ratio": 0.05,
                 "clued_entry_ratio": 1.0,
+                "source_backed_entry_ratio": 0.9,
+                "fallback_only_entry_count": 1,
+                "fallback_only_entry_ratio": 0.1,
                 "long_slot_theme_ratio": 1.0,
                 "quality_objective": 1.42,
                 "synthetic_filler_clue_count": 2,
@@ -25,6 +28,8 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(result.puzzle_status, "ok")
         self.assertAlmostEqual(result.fill_percent, 0.74)
         self.assertAlmostEqual(result.filler_used_ratio, 0.05)
+        self.assertAlmostEqual(result.source_backed_entry_ratio, 0.9)
+        self.assertEqual(result.fallback_only_entry_count, 1)
         self.assertAlmostEqual(result.long_slot_theme_ratio, 1.0)
         self.assertEqual(result.synthetic_filler_clue_count, 2)
 
@@ -39,8 +44,12 @@ class EvaluationTests(unittest.TestCase):
                     "fill_percent": 0.72,
                     "filler_used_ratio": 0.10,
                     "clued_entry_ratio": 1.0,
+                    "source_backed_entry_ratio": 0.8,
+                    "fallback_only_entry_count": 1,
+                    "fallback_only_entry_ratio": 0.2,
                     "long_slot_theme_ratio": 1.0,
                     "leakage_rate": 0.0,
+                    "synthetic_filler_clue_count": 0,
                 },
                 {
                     "seed": "B",
@@ -50,8 +59,12 @@ class EvaluationTests(unittest.TestCase):
                     "fill_percent": 0.60,
                     "filler_used_ratio": 0.20,
                     "clued_entry_ratio": 0.8,
+                    "source_backed_entry_ratio": 0.3,
+                    "fallback_only_entry_count": 2,
+                    "fallback_only_entry_ratio": 0.5,
                     "long_slot_theme_ratio": 0.5,
                     "leakage_rate": 0.1,
+                    "synthetic_filler_clue_count": 1,
                 },
             ]
         )
@@ -63,6 +76,9 @@ class EvaluationTests(unittest.TestCase):
         self.assertAlmostEqual(aggregate.average_filler_used_ratio, 0.15)
         self.assertAlmostEqual(aggregate.average_long_slot_theme_ratio, 0.75)
         self.assertAlmostEqual(aggregate.average_clued_entry_ratio, 0.9)
+        self.assertAlmostEqual(aggregate.average_source_backed_entry_ratio, 0.55)
+        self.assertAlmostEqual(aggregate.average_fallback_only_entry_ratio, 0.35)
+        self.assertAlmostEqual(aggregate.average_synthetic_filler_clue_count, 0.5)
         self.assertAlmostEqual(aggregate.fill_pass_rate, 0.5)
         self.assertAlmostEqual(aggregate.puzzle_ok_rate, 0.5)
 

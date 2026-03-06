@@ -10,11 +10,13 @@ from src.csp_heuristics import (
     build_solver_vocabulary,
     evaluate_quality_gate,
     prune_conflicting_assignments,
+    run_template_trial,
 )
 from src.pipeline import (
     _expand_selected_titles_from_scores,
     _effective_min_k_for_size,
     _inventory_min_k_target,
+    _quality_rescue_target_count,
     _should_expand_selection_inventory,
     run_candidate_scoring_stage,
     run_clue_extraction_stage,
@@ -529,6 +531,57 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(result.diagnostics["clue_count"], 1)
         self.assertEqual(result.diagnostics["fallback_template_added"], 1)
+        self.assertEqual(result.diagnostics["template_fallback_clue_count"], 1)
+        clue_payload = clues_path.read_text(encoding="utf-8")
+        self.assertIn("template_fallback", clue_payload)
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_clue_stage_marks_source_backed_clue_class(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "clue_source_backed"
+        terms_path = tmp_dir / "terms.csv"
+        clues_path = tmp_dir / "clues.csv"
+        diagnostics_path = tmp_dir / "diagnostics_clues.json"
+
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        terms_path.write_text(
+            "\n".join(
+                [
+                    "answer,normalized_answer,source_titles,source_method",
+                    "Entropy,ENTROPY,Entropy,spacy",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        with (
+            patch(
+                "src.pipeline.WikiClient.fetch_page_extract_with_revid",
+                return_value={
+                    "title": "Entropy",
+                    "extract": "Entropy is a measure of disorder in thermodynamics.",
+                    "revid": 123,
+                },
+            ),
+            patch(
+                "src.pipeline.clue_pass_extract_with_offset",
+                return_value=("Entropy is a measure of disorder in thermodynamics.", 0),
+            ),
+            patch("src.pipeline.clue_pass_validate", return_value=True),
+        ):
+            result = run_clue_extraction_stage(
+                seed_title="Thermodynamics",
+                lang="en",
+                diagnostics_path=diagnostics_path,
+                terms_path=terms_path,
+                clues_path=clues_path,
+            )
+
+        self.assertEqual(result.diagnostics["source_backed_clue_count"], 1)
+        clue_payload = clues_path.read_text(encoding="utf-8")
+        self.assertIn("source_backed", clue_payload)
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -600,6 +653,86 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(result.diagnostics["synthetic_filler_clue_count"], 1)
         self.assertEqual(result.diagnostics["clued_entry_count"], 1)
+        self.assertEqual(result.diagnostics["clued_entry_ratio"], 1.0)
+        self.assertEqual(result.diagnostics["source_backed_entry_ratio"], 0.0)
+        self.assertEqual(result.diagnostics["fallback_only_entry_ratio"], 0.0)
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_packaging_reports_source_backed_entry_ratio(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "package_source_backed"
+        selected_path = tmp_dir / "selected_candidates.json"
+        grid_path = tmp_dir / "grid.json"
+        clues_path = tmp_dir / "clues.csv"
+        puzzle_path = tmp_dir / "puzzle.json"
+        attribution_path = tmp_dir / "attribution.json"
+        diagnostics_path = tmp_dir / "diagnostics_package.json"
+
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        selected_path.write_text(
+            json.dumps(
+                {
+                    "seed_title": "Test",
+                    "lang": "en",
+                    "selected_k": 1,
+                    "selected_titles": ["Seed"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        grid_path.write_text(
+            json.dumps(
+                {
+                    "seed_title": "Test",
+                    "lang": "en",
+                    "template": "open",
+                    "size": 5,
+                    "min_slot_len": 3,
+                    "effective_min_slot_len": 4,
+                    "grid": [["A", "B", "C", "D"]],
+                    "assignments": {"0": "ABCD"},
+                    "slots": [
+                        {
+                            "id": 0,
+                            "direction": "across",
+                            "length": 4,
+                            "cells": [[0, 0], [0, 1], [0, 2], [0, 3]],
+                        }
+                    ],
+                    "fill_status": "partial",
+                    "fill_percent": 1.0,
+                    "unfilled_slots": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        clues_path.write_text(
+            "\n".join(
+                [
+                    "answer,normalized_answer,clue,clue_score,clue_class,source_method,source_page,revid,sentence_offset,oldid_url",
+                    "ABCD,ABCD,Source clue,0.9,source_backed,spacy,Test,1,0,https://example.com",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = run_packaging_stage(
+            seed_title="Test",
+            lang="en",
+            selected_path=selected_path,
+            grid_path=grid_path,
+            clues_path=clues_path,
+            puzzle_path=puzzle_path,
+            attribution_path=attribution_path,
+            diagnostics_path=diagnostics_path,
+        )
+
+        self.assertEqual(result.diagnostics["clued_entry_ratio"], 1.0)
+        self.assertEqual(result.diagnostics["source_backed_entry_ratio"], 1.0)
+        self.assertEqual(result.diagnostics["fallback_only_entry_ratio"], 0.0)
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -917,6 +1050,328 @@ class PipelineTests(unittest.TestCase):
         self.assertAlmostEqual(result.diagnostics["fill_percent"], 0.86, places=6)
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_csp_prefers_source_backed_trial_over_fallback_heavy_peer(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "csp_source_backed_rank"
+        diagnostics_path = tmp_dir / "diagnostics_csp.json"
+        grid_path = tmp_dir / "grid.json"
+        terms_path = tmp_dir / "terms.csv"
+
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        terms_path.write_text("answer,normalized_answer\n", encoding="utf-8")
+
+        base_trial = {
+            "rendered": [["A"]],
+            "result": {
+                "solved": False,
+                "assignments": {0: "ALPHA"},
+                "steps": 1,
+                "restarts": 0,
+                "local_repair_applied": False,
+            },
+            "slots": [],
+            "active_slots": [],
+            "auto_block": {
+                "added_blocks": [],
+                "long_slots_before": [],
+                "long_slots_after": [],
+                "iterations": 0,
+            },
+            "fill_percent": 0.8,
+            "fill_status": "partial",
+            "fill_count": 20,
+            "total_cells": 25,
+            "unfilled_slots": [],
+            "trial_errors": [],
+            "invalid_slots": [],
+            "removed_assignments": [],
+            "implicit_added_count": 0,
+            "solved_final": False,
+            "themed_assigned_count": 1,
+            "clued_assigned_count": 1,
+            "assigned_count": 1,
+            "filler_used_count": 0,
+            "filler_used_ratio": 0.0,
+            "clued_entry_ratio": 1.0,
+            "long_slot_assigned_count": 1,
+            "long_slot_non_theme_count": 0,
+            "long_slot_theme_ratio": 1.0,
+            "unclued_removed_count": 0,
+            "phase_a": {
+                "steps": 1,
+                "restarts": 0,
+                "assigned_count": 1,
+                "preferred_long_words_count": 0,
+            },
+        }
+        source_backed_trial = {
+            **base_trial,
+            "template": SimpleNamespace(name="cleaner"),
+            "quality_objective": 1.8,
+            "source_backed_entry_count": 1,
+            "source_backed_entry_ratio": 1.0,
+            "fallback_only_assigned_count": 0,
+            "fallback_only_entry_ratio": 0.0,
+            "fallback_only_long_count": 0,
+            "fallback_only_long_ratio": 0.0,
+        }
+        fallback_trial = {
+            **base_trial,
+            "template": SimpleNamespace(name="fallback_heavy"),
+            "quality_objective": 2.5,
+            "source_backed_entry_count": 0,
+            "source_backed_entry_ratio": 0.0,
+            "fallback_only_assigned_count": 1,
+            "fallback_only_entry_ratio": 1.0,
+            "fallback_only_long_count": 1,
+            "fallback_only_long_ratio": 1.0,
+        }
+
+        vocabulary = SimpleNamespace(
+            word_scores={"ALPHA": 1.0},
+            words=["ALPHA"],
+            themed_words=["ALPHA"],
+            themed_set={"ALPHA"},
+            clue_answers={"ALPHA"},
+            source_backed_answers={"ALPHA"},
+            fallback_only_answers=set(),
+            clue_answers_available=True,
+            filler_words=[],
+            filler_raw_count=0,
+            filler_added=0,
+            filler_limit_per_length=0,
+            filler_weight=0.01,
+            long_filler_weight=0.0025,
+            min_word_len=5,
+            max_word_len=5,
+        )
+        passing_gate = SimpleNamespace(
+            passed=True,
+            reason="ok",
+            term_count=1,
+            min_required=40,
+            max_allowed=250,
+        )
+
+        with (
+            patch("src.pipeline.build_solver_vocabulary", return_value=vocabulary),
+            patch("src.pipeline.evaluate_vocab_gate", return_value=passing_gate),
+            patch(
+                "src.pipeline.get_templates",
+                return_value=[SimpleNamespace(name="cleaner"), SimpleNamespace(name="fallback_heavy")],
+            ),
+            patch(
+                "src.pipeline.select_best_template",
+                return_value={
+                    "selected": "cleaner",
+                    "scored": [{"template": "cleaner"}, {"template": "fallback_heavy"}],
+                },
+            ),
+            patch(
+                "src.pipeline.run_template_trial",
+                side_effect=[fallback_trial, source_backed_trial],
+            ),
+        ):
+            result = run_csp_solve_stage(
+                seed_title="Test",
+                lang="en",
+                terms_path=terms_path,
+                diagnostics_path=diagnostics_path,
+                grid_path=grid_path,
+                size=5,
+                min_slot_len=3,
+                max_steps=100,
+                require_gate=False,
+                template_trials=2,
+            )
+
+        self.assertEqual(result.diagnostics["template"], "cleaner")
+        self.assertEqual(result.diagnostics["source_backed_entry_ratio"], 1.0)
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_run_template_trial_penalizes_long_fallback_more_than_short_fallback(self) -> None:
+        long_slot = SimpleNamespace(id=0, direction="across", length=6, cells=[(0, i) for i in range(6)])
+        short_slot = SimpleNamespace(id=1, direction="across", length=4, cells=[(1, i) for i in range(4)])
+        slots = [long_slot, short_slot]
+
+        def build_grid_fn(_template):
+            return [
+                [".", ".", ".", ".", ".", "."],
+                [".", ".", ".", "."],
+            ]
+
+        def auto_block_long_slots_fn(grid, **_kwargs):
+            return {
+                "grid": [list(row) for row in grid],
+                "added_blocks": [],
+                "long_slots_before": [],
+                "long_slots_after": [],
+                "iterations": 0,
+            }
+
+        def build_slots_fn(_grid, min_len):
+            return [slot for slot in slots if slot.length >= min_len]
+
+        def render_grid_fn(grid, slot_records, assignments):
+            rendered = [list(row) for row in grid]
+            slot_map = {slot.id: slot for slot in slot_records}
+            for slot_id, word in assignments.items():
+                slot = slot_map[slot_id]
+                for index, (row, col) in enumerate(slot.cells):
+                    rendered[row][col] = word[index]
+            return rendered
+
+        def solver_factory(assignments):
+            def _solver(_grid, _slots, _words, **_kwargs):
+                return {
+                    "solved": True,
+                    "assignments": assignments,
+                    "steps": 1,
+                    "restarts": 0,
+                    "local_repair_applied": False,
+                }
+
+            return _solver
+
+        common_kwargs = {
+            "template": SimpleNamespace(name="fixture"),
+            "trial_seed": 13,
+            "build_grid_fn": build_grid_fn,
+            "auto_block_long_slots_fn": auto_block_long_slots_fn,
+            "build_slots_fn": build_slots_fn,
+            "render_grid_fn": render_grid_fn,
+            "words": ["SOURCE", "TEMPLE", "CORE", "FILL"],
+            "themed_words": ["SOURCE", "TEMPLE", "CORE", "FILL"],
+            "themed_set": {"SOURCE", "TEMPLE", "CORE", "FILL"},
+            "clue_answers": {"SOURCE", "TEMPLE", "CORE", "FILL"},
+            "source_backed_answers": {"SOURCE", "CORE"},
+            "fallback_only_answers": {"TEMPLE", "FILL"},
+            "clue_answers_available": True,
+            "word_scores": {"SOURCE": 1.0, "TEMPLE": 1.0, "CORE": 1.0, "FILL": 1.0},
+            "long_filler_weight": 0.01,
+            "max_word_len": 6,
+            "effective_min_slot_len": 3,
+            "min_domain": 1,
+            "max_steps": 100,
+            "max_restarts": 0,
+            "use_ac3": False,
+            "beam_width": 8,
+            "enable_local_repair": False,
+            "repair_steps": 0,
+        }
+
+        long_fallback_trial = run_template_trial(
+            solver=solver_factory({0: "TEMPLE", 1: "CORE"}),
+            **common_kwargs,
+        )
+        short_fallback_trial = run_template_trial(
+            solver=solver_factory({0: "SOURCE", 1: "FILL"}),
+            **common_kwargs,
+        )
+
+        self.assertEqual(long_fallback_trial["fallback_only_assigned_count"], 1)
+        self.assertEqual(short_fallback_trial["fallback_only_assigned_count"], 1)
+        self.assertEqual(long_fallback_trial["fallback_only_long_count"], 1)
+        self.assertEqual(short_fallback_trial["fallback_only_long_count"], 0)
+        self.assertLess(
+            long_fallback_trial["quality_objective"],
+            short_fallback_trial["quality_objective"],
+        )
+
+    def test_run_template_trial_only_penalizes_fallback_when_source_backed_depth_covers_length(self) -> None:
+        slots = [
+            SimpleNamespace(id=0, direction="across", length=6, cells=[(0, i) for i in range(6)]),
+            SimpleNamespace(id=1, direction="across", length=6, cells=[(1, i) for i in range(6)]),
+        ]
+
+        def build_grid_fn(_template):
+            return [
+                [".", ".", ".", ".", ".", "."],
+                [".", ".", ".", ".", ".", "."],
+            ]
+
+        def auto_block_long_slots_fn(grid, **_kwargs):
+            return {
+                "grid": [list(row) for row in grid],
+                "added_blocks": [],
+                "long_slots_before": [],
+                "long_slots_after": [],
+                "iterations": 0,
+            }
+
+        def build_slots_fn(_grid, min_len):
+            return [slot for slot in slots if slot.length >= min_len]
+
+        def render_grid_fn(grid, slot_records, assignments):
+            rendered = [list(row) for row in grid]
+            slot_map = {slot.id: slot for slot in slot_records}
+            for slot_id, word in assignments.items():
+                slot = slot_map[slot_id]
+                for index, (row, col) in enumerate(slot.cells):
+                    rendered[row][col] = word[index]
+            return rendered
+
+        phase_b_scores_by_case: dict[str, dict[str, float]] = {}
+
+        def solver_factory(case_name: str):
+            call_count = {"value": 0}
+
+            def _solver(_grid, _slots, _words, **kwargs):
+                call_count["value"] += 1
+                if call_count["value"] == 2:
+                    phase_b_scores_by_case[case_name] = dict(kwargs.get("word_scores") or {})
+                return {
+                    "solved": False,
+                    "assignments": {},
+                    "steps": 1,
+                    "restarts": 0,
+                    "local_repair_applied": False,
+                }
+
+            return _solver
+
+        common_kwargs = {
+            "template": SimpleNamespace(name="fixture"),
+            "trial_seed": 13,
+            "build_grid_fn": build_grid_fn,
+            "auto_block_long_slots_fn": auto_block_long_slots_fn,
+            "build_slots_fn": build_slots_fn,
+            "render_grid_fn": render_grid_fn,
+            "words": ["SOURCE", "ANCHOR", "TEMPLE"],
+            "themed_words": ["SOURCE", "ANCHOR", "TEMPLE"],
+            "themed_set": {"SOURCE", "ANCHOR", "TEMPLE"},
+            "clue_answers": {"SOURCE", "ANCHOR", "TEMPLE"},
+            "fallback_only_answers": {"TEMPLE"},
+            "clue_answers_available": True,
+            "word_scores": {"SOURCE": 1.0, "ANCHOR": 1.0, "TEMPLE": 1.0},
+            "long_filler_weight": 0.01,
+            "max_word_len": 6,
+            "effective_min_slot_len": 3,
+            "min_domain": 1,
+            "max_steps": 100,
+            "max_restarts": 0,
+            "use_ac3": False,
+            "beam_width": 8,
+            "enable_local_repair": False,
+            "repair_steps": 0,
+        }
+
+        run_template_trial(
+            solver=solver_factory("shallow"),
+            source_backed_answers={"SOURCE"},
+            **common_kwargs,
+        )
+        run_template_trial(
+            solver=solver_factory("deep"),
+            source_backed_answers={"SOURCE", "ANCHOR"},
+            **common_kwargs,
+        )
+
+        self.assertAlmostEqual(phase_b_scores_by_case["shallow"]["TEMPLE"], 1.02)
+        self.assertLess(phase_b_scores_by_case["deep"]["TEMPLE"], phase_b_scores_by_case["shallow"]["TEMPLE"])
 
     def test_csp_raises_effective_min_slot_len_to_clue_floor(self) -> None:
         tmp_dir = Path("tests") / "tmp_outputs" / "csp_clue_floor"
@@ -1269,6 +1724,17 @@ class PipelineTests(unittest.TestCase):
                 12,
             )
 
+    def test_quality_rescue_target_count_can_expand_past_twelve(self) -> None:
+        self.assertEqual(
+            _quality_rescue_target_count(
+                size=15,
+                current_selected_count=12,
+                terms=[{"normalized_answer": f"A{i:03d}"} for i in range(10)]
+                + [{"normalized_answer": f"B{i:03d}C"} for i in range(12)],
+            ),
+            14,
+        )
+
     def test_generate_pipeline_expands_selection_after_failed_short_inventory(self) -> None:
         tmp_dir = Path("tests") / "tmp_outputs" / "generate_quality_rescue"
         if tmp_dir.exists():
@@ -1293,6 +1759,8 @@ class PipelineTests(unittest.TestCase):
                     "10,Kappa,KEEP",
                     "11,Lambda,KEEP",
                     "12,Mu,KEEP",
+                    "13,Nu,KEEP",
+                    "14,Xi,KEEP",
                 ]
             ),
             encoding="utf-8",
@@ -1302,8 +1770,21 @@ class PipelineTests(unittest.TestCase):
                 {
                     "seed_title": "Thermodynamics",
                     "lang": "en",
-                    "selected_k": 7,
-                    "selected_titles": ["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta"],
+                    "selected_k": 12,
+                    "selected_titles": [
+                        "Alpha",
+                        "Beta",
+                        "Gamma",
+                        "Delta",
+                        "Epsilon",
+                        "Zeta",
+                        "Eta",
+                        "Theta",
+                        "Iota",
+                        "Kappa",
+                        "Lambda",
+                        "Mu",
+                    ],
                 }
             ),
             encoding="utf-8",
@@ -1386,6 +1867,8 @@ class PipelineTests(unittest.TestCase):
         second_terms_selected = Path(mocked_terms.call_args_list[1].kwargs["selected_path"])
         self.assertEqual(second_terms_selected.name, "selected_candidates_quality_rescue.json")
         self.assertEqual(Path(mocked_package.call_args.kwargs["selected_path"]).name, "selected_candidates_quality_rescue.json")
+        rescue_payload = json.loads((tmp_dir / "selected_candidates_quality_rescue.json").read_text(encoding="utf-8"))
+        self.assertEqual(rescue_payload["selected_k"], 14)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 

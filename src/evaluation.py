@@ -20,6 +20,9 @@ class BenchmarkResult:
     fill_percent: float
     filler_used_ratio: float
     clued_entry_ratio: float
+    source_backed_entry_ratio: float
+    fallback_only_entry_count: int
+    fallback_only_entry_ratio: float
     long_slot_theme_ratio: float
     quality_objective: float
     provenance_missing_count: int
@@ -39,6 +42,9 @@ class BenchmarkAggregate:
     average_filler_used_ratio: float
     average_long_slot_theme_ratio: float
     average_clued_entry_ratio: float
+    average_source_backed_entry_ratio: float
+    average_fallback_only_entry_ratio: float
+    average_synthetic_filler_clue_count: float
     average_leakage_rate: float
     fill_pass_rate: float
     puzzle_ok_rate: float
@@ -63,6 +69,9 @@ def summarize_benchmark(payload: dict) -> BenchmarkResult:
         fill_percent=payload.get("fill_percent", 0.0),
         filler_used_ratio=payload.get("filler_used_ratio", 0.0),
         clued_entry_ratio=payload.get("clued_entry_ratio", 0.0),
+        source_backed_entry_ratio=payload.get("source_backed_entry_ratio", 0.0),
+        fallback_only_entry_count=payload.get("fallback_only_entry_count", 0),
+        fallback_only_entry_ratio=payload.get("fallback_only_entry_ratio", 0.0),
         long_slot_theme_ratio=payload.get("long_slot_theme_ratio", 0.0),
         quality_objective=payload.get("quality_objective", 0.0),
         provenance_missing_count=payload.get("provenance_missing_count", 0),
@@ -85,6 +94,9 @@ def summarize_benchmark_collection(results: list[dict] | list[BenchmarkResult]) 
             average_filler_used_ratio=0.0,
             average_long_slot_theme_ratio=0.0,
             average_clued_entry_ratio=0.0,
+            average_source_backed_entry_ratio=0.0,
+            average_fallback_only_entry_ratio=0.0,
+            average_synthetic_filler_clue_count=0.0,
             average_leakage_rate=0.0,
             fill_pass_rate=0.0,
             puzzle_ok_rate=0.0,
@@ -106,6 +118,9 @@ def summarize_benchmark_collection(results: list[dict] | list[BenchmarkResult]) 
         average_filler_used_ratio=sum(result.filler_used_ratio for result in normalized) / count,
         average_long_slot_theme_ratio=sum(result.long_slot_theme_ratio for result in normalized) / count,
         average_clued_entry_ratio=sum(result.clued_entry_ratio for result in normalized) / count,
+        average_source_backed_entry_ratio=sum(result.source_backed_entry_ratio for result in normalized) / count,
+        average_fallback_only_entry_ratio=sum(result.fallback_only_entry_ratio for result in normalized) / count,
+        average_synthetic_filler_clue_count=sum(result.synthetic_filler_clue_count for result in normalized) / count,
         average_leakage_rate=sum(result.leakage_rate for result in normalized) / count,
         fill_pass_rate=fill_pass_count / count,
         puzzle_ok_rate=puzzle_ok_count / count,

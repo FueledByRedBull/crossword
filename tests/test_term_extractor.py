@@ -1,6 +1,9 @@
 import unittest
 
 from src.term_extractor import (
+    TermCandidate,
+    answer_cleanliness_score,
+    clueability_score,
     crosswordability_score,
     extract_terms_lead_bold,
     extract_terms_nltk,
@@ -70,6 +73,77 @@ class TermExtractorTests(unittest.TestCase):
         self.assertNotIn("THEHEAT", normalized)
         self.assertNotIn("ANAXIOM", normalized)
 
+    def test_merge_terms_rejects_dirty_stopword_boundary_phrase(self) -> None:
+        dirty = TermCandidate(
+            answer="Energy of",
+            normalized_answer="ENERGYOF",
+            length=8,
+            source_method="spacy",
+            lead_bold_signal=False,
+            source_titles={"ArticleA"},
+            token_count=2,
+            answer_cleanliness_score=0.2,
+            clueability_score=0.3,
+        )
+        clean = TermCandidate(
+            answer="Entropy",
+            normalized_answer="ENTROPY",
+            length=7,
+            source_method="spacy",
+            lead_bold_signal=False,
+            source_titles={"ArticleA"},
+            token_count=1,
+            answer_cleanliness_score=1.0,
+            clueability_score=0.9,
+        )
+
+        merged = merge_terms([[dirty, clean]], min_len=4, max_len=12, lang="en")
+        normalized = {term.normalized_answer for term in merged}
+
+        self.assertNotIn("ENERGYOF", normalized)
+        self.assertIn("ENTROPY", normalized)
+
+    def test_merge_terms_keeps_lead_bold_even_when_phrase_is_dirty(self) -> None:
+        lead_bold_terms = extract_terms_lead_bold(
+            ["The field of"], source_title="Thermodynamics", lang="en"
+        )
+
+        merged = merge_terms([lead_bold_terms], min_len=4, max_len=12, lang="en")
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].answer, "field of")
+
+    def test_merge_terms_keeps_cleanest_surface_for_duplicate_answer(self) -> None:
+        noisy = TermCandidate(
+            answer="Field of",
+            normalized_answer="FIELDOF",
+            length=7,
+            source_method="spacy",
+            lead_bold_signal=False,
+            source_titles={"ArticleA"},
+            token_count=2,
+            answer_cleanliness_score=0.45,
+            clueability_score=0.5,
+        )
+        cleaner = TermCandidate(
+            answer="Fieldof",
+            normalized_answer="FIELDOF",
+            length=7,
+            source_method="lead_bold",
+            lead_bold_signal=True,
+            source_titles={"ArticleB"},
+            token_count=1,
+            answer_cleanliness_score=0.95,
+            clueability_score=0.9,
+        )
+
+        merged = merge_terms([[noisy], [cleaner]], min_len=4, max_len=12, lang="en")
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].answer, "Fieldof")
+        self.assertIn("ArticleA", merged[0].source_titles)
+        self.assertIn("ArticleB", merged[0].source_titles)
+
 
 class ShapePenaltyTests(unittest.TestCase):
     def test_rare_letters_penalized(self) -> None:
@@ -102,6 +176,13 @@ class ShapePenaltyTests(unittest.TestCase):
         good = crosswordability_score("NATION")
         poor = crosswordability_score("QXZJQXZJ")
         self.assertGreater(good, poor)
+
+    def test_cleanliness_and_clueability_scores_reward_clean_phrases(self) -> None:
+        clean = "Entropy"
+        dirty = "energy of"
+
+        self.assertGreater(answer_cleanliness_score(clean), answer_cleanliness_score(dirty))
+        self.assertGreater(clueability_score(clean, "ENTROPY"), clueability_score(dirty, "ENERGYOF"))
 
 
 class NltkBackendParityTests(unittest.TestCase):

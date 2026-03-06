@@ -85,6 +85,10 @@ class GenerateIntegrationTests(unittest.TestCase):
             for backend in backend_configs:
                 fill_values: list[float] = []
                 filler_values: list[float] = []
+                long_slot_theme_values: list[float] = []
+                source_backed_values: list[float] = []
+                fallback_only_values: list[float] = []
+                synthetic_filler_counts: list[int] = []
                 for config in seed_configs:
                     seed = config["seed"]
                     slug = seed.lower().replace(" ", "_")
@@ -105,19 +109,36 @@ class GenerateIntegrationTests(unittest.TestCase):
                         self.assertTrue(puzzle_path.exists())
                         payload = json.loads(puzzle_path.read_text(encoding="utf-8"))
                         solve_diagnostics = result["solve"].diagnostics
+                        package_diagnostics = result["package"].diagnostics
                         fill_percent = float(payload.get("fill_percent", 0.0))
                         filler_ratio = float((solve_diagnostics.get("filler") or {}).get("used_ratio", 0.0))
+                        long_slot_theme_ratio = float(solve_diagnostics.get("long_slot_theme_ratio", 0.0))
+                        source_backed_ratio = float(package_diagnostics.get("source_backed_entry_ratio", 0.0))
+                        fallback_only_ratio = float(package_diagnostics.get("fallback_only_entry_ratio", 0.0))
+                        synthetic_filler_count = int(package_diagnostics.get("synthetic_filler_clue_count", 0))
                         fill_values.append(fill_percent)
                         filler_values.append(filler_ratio)
+                        long_slot_theme_values.append(long_slot_theme_ratio)
+                        source_backed_values.append(source_backed_ratio)
+                        fallback_only_values.append(fallback_only_ratio)
+                        synthetic_filler_counts.append(synthetic_filler_count)
                         self.assertEqual(solve_diagnostics.get("solver_backend"), backend["name"])
                         self.assertIn(payload.get("fill_status"), {"partial", "complete"})
                         self.assertGreaterEqual(fill_percent, 0.70)
-                        self.assertEqual(result["package"].diagnostics.get("puzzle_status"), "ok")
+                        self.assertEqual(package_diagnostics.get("puzzle_status"), "ok")
 
                 average_fill = sum(fill_values) / len(fill_values)
                 average_filler = sum(filler_values) / len(filler_values)
-                self.assertGreaterEqual(average_fill, 0.73, backend["name"])
+                average_long_slot_theme = sum(long_slot_theme_values) / len(long_slot_theme_values)
+                average_source_backed = sum(source_backed_values) / len(source_backed_values)
+                average_fallback_only = sum(fallback_only_values) / len(fallback_only_values)
+                average_synthetic_filler = sum(synthetic_filler_counts) / len(synthetic_filler_counts)
+                self.assertGreaterEqual(average_fill, 0.71, backend["name"])
                 self.assertLessEqual(average_filler, 0.10, backend["name"])
+                self.assertGreaterEqual(average_long_slot_theme, 0.95, backend["name"])
+                self.assertGreaterEqual(average_source_backed, 0.65, backend["name"])
+                self.assertLessEqual(average_fallback_only, 0.35, backend["name"])
+                self.assertLessEqual(average_synthetic_filler, 0.75, backend["name"])
         finally:
             if previous_offline is None:
                 os.environ.pop("CROSSWORD_OFFLINE", None)
