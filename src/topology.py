@@ -320,6 +320,13 @@ TOPOLOGY_SCORE_WEIGHTS_DEFAULT: dict[str, float] = {
     "crossing": 0.2,
 }
 
+SHORTAGE_LENGTH_WEIGHTS: dict[int, float] = {
+    4: 2.0,
+    5: 2.0,
+    6: 1.4,
+    7: 1.2,
+}
+
 
 def score_template(
     words: list[str],
@@ -442,6 +449,25 @@ def score_template_from_length_hist(
     )
     fill_conflict = 0.0 if total_slots == 0 else shortage_slots / total_slots
 
+    weighted_shortage = 0.0
+    weighted_slot_total = 0.0
+    shortage_by_length: dict[int, dict[str, float | int]] = {}
+    for length, count in sorted(slot_lengths.items()):
+        available = length_hist.get(length, 0)
+        shortage = max(0, count - available)
+        weight = SHORTAGE_LENGTH_WEIGHTS.get(length, 1.0)
+        weighted_shortage += shortage * weight
+        weighted_slot_total += count * weight
+        shortage_by_length[length] = {
+            "slot_count": count,
+            "available": available,
+            "shortage": shortage,
+            "weight": weight,
+        }
+    weighted_shortage_penalty = (
+        0.0 if weighted_slot_total == 0.0 else weighted_shortage / weighted_slot_total
+    )
+
     long_slot_penalty = 0.0
     long_slot_count_before = 0
     long_slot_count_after = 0
@@ -485,6 +511,8 @@ def score_template_from_length_hist(
         "disconnected_penalty": disconnected_penalty,
         "slot_count": len(slots),
         "fill_conflict": fill_conflict,
+        "weighted_shortage_penalty": weighted_shortage_penalty,
+        "shortage_by_length": shortage_by_length,
         "long_slot_penalty": long_slot_penalty,
         "long_slot_count_before": long_slot_count_before,
         "long_slot_count_after": long_slot_count_after,
@@ -504,6 +532,7 @@ def select_best_template(
     *,
     weights: dict[str, float] | None = None,
     fill_conflict_weight: float = 0.5,
+    weighted_shortage_penalty_weight: float = 1.0,
     long_slot_penalty_weight: float = 2.0,
     auto_block_penalty_weight: float = 0.2,
     disconnected_penalty_weight: float = 2.0,
@@ -534,6 +563,7 @@ def select_best_template(
         row["selection_score"] = (
             row["score"]
             - (fill_conflict_weight * row["fill_conflict"])
+            - (weighted_shortage_penalty_weight * row["weighted_shortage_penalty"])
             - (long_slot_penalty_weight * row["long_slot_penalty"])
             - (auto_block_penalty_weight * row["auto_block_density"])
             - (disconnected_penalty_weight * row.get("disconnected_penalty", 0.0))

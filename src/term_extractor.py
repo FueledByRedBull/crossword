@@ -98,6 +98,16 @@ STOPWORDS_EL = {
     "OS",
 }
 
+LEADING_DETERMINERS_EN = {
+    "A",
+    "AN",
+    "THE",
+    "THIS",
+    "THAT",
+    "THESE",
+    "THOSE",
+}
+
 from .text_normalize import normalize_text, strip_diacritics, tokenize
 
 RARE_LETTERS = {"Q", "X", "Z", "J"}
@@ -195,8 +205,14 @@ def shape_penalty(normalized: str) -> float:
 def crosswordability_score(normalized: str) -> float:
     return max(0.0, 1.0 - shape_penalty(normalized))
 
-def _clean_answer_text(text: str) -> str:
-    return " ".join(text.strip(" \t\r\n\"'()[]{}.,;:").split())
+def _clean_answer_text(text: str, *, lang: str = "en") -> str:
+    cleaned = " ".join(text.strip(" \t\r\n\"'()[]{}.,;:").split())
+    if not cleaned or lang != "en":
+        return cleaned
+    parts = cleaned.split()
+    while parts and parts[0].upper() in LEADING_DETERMINERS_EN:
+        parts = parts[1:]
+    return " ".join(parts)
 
 
 def extract_terms_spacy(doc, *, source_title: str, lang: str = "en") -> list[TermCandidate]:
@@ -204,7 +220,7 @@ def extract_terms_spacy(doc, *, source_title: str, lang: str = "en") -> list[Ter
     seen: set[str] = set()
 
     for chunk in getattr(doc, "noun_chunks", []):
-        raw = _clean_answer_text(chunk.text)
+        raw = _clean_answer_text(chunk.text, lang=lang)
         if not raw:
             continue
         if raw in seen:
@@ -225,7 +241,7 @@ def extract_terms_spacy(doc, *, source_title: str, lang: str = "en") -> list[Ter
         )
 
     for ent in getattr(doc, "ents", []):
-        raw = _clean_answer_text(ent.text)
+        raw = _clean_answer_text(ent.text, lang=lang)
         if not raw or raw in seen:
             continue
         seen.add(raw)
@@ -272,7 +288,7 @@ def extract_terms_nltk(
         parser = nltk.RegexpParser(grammar)
         tree = parser.parse(tagged)
         for subtree in tree.subtrees(filter=lambda t: t.label() == "NP"):
-            raw = _clean_answer_text(" ".join(word for word, _ in subtree.leaves()))
+            raw = _clean_answer_text(" ".join(word for word, _ in subtree.leaves()), lang=lang)
             if not raw or raw in seen:
                 continue
             seen.add(raw)
@@ -303,7 +319,7 @@ def extract_terms_lead_bold(
 ) -> list[TermCandidate]:
     results: list[TermCandidate] = []
     for term in terms:
-        raw = _clean_answer_text(term)
+        raw = _clean_answer_text(term, lang=lang)
         if not raw:
             continue
         normalized = _normalize_answer(raw, lang=lang)

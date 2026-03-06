@@ -12,10 +12,15 @@ from src.csp_heuristics import (
     prune_conflicting_assignments,
 )
 from src.pipeline import (
+    _expand_selected_titles_from_scores,
+    _effective_min_k_for_size,
+    _inventory_min_k_target,
+    _should_expand_selection_inventory,
     run_candidate_scoring_stage,
     run_clue_extraction_stage,
     run_k_selection_stage,
     run_packaging_stage,
+    run_generate_pipeline,
     run_rescue_ladder,
     run_csp_solve_stage,
     run_seed_ingestion_stage,
@@ -161,6 +166,7 @@ class PipelineTests(unittest.TestCase):
         with (
             patch("src.pipeline.run_seed_ingestion_stage", return_value=mocked_seed),
             patch("src.pipeline.WikiClient.fetch_page_extract", side_effect=fake_extract),
+            patch("src.pipeline.WikiClient.fetch_lead_wikitext", return_value={"wikitext": ""}),
         ):
             run_candidate_scoring_stage(
                 seed_title="Seed",
@@ -220,6 +226,72 @@ class PipelineTests(unittest.TestCase):
             )
 
         self.assertEqual(result.selected["selected_titles"], ["TOP_A", "TOP_B"])
+
+        shutil.rmtree(output_path.parent, ignore_errors=True)
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+    def test_k_selection_uses_union_of_extracted_answer_inventory(self) -> None:
+        output_path = Path("tests") / "tmp_outputs" / "selected_union.json"
+        diagnostics_path = Path("tests") / "tmp_outputs" / "diagnostics_k_union.json"
+        trace_path = Path("tests") / "tmp_outputs" / "trace_union.csv"
+        cache_dir = Path("tests") / "tmp_cache_pipeline_k_union"
+
+        if output_path.parent.exists():
+            shutil.rmtree(output_path.parent, ignore_errors=True)
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+
+        mocked_scoring = SimpleNamespace(
+            scores=[
+                {"rank": 1, "title": "TOP_A"},
+                {"rank": 2, "title": "TOP_B"},
+            ],
+            diagnostics={"errors": []},
+            rel_scores=[0.9, 0.8],
+            pairwise=[
+                [1.0, 0.0],
+                [0.0, 1.0],
+            ],
+            ranked_indices=[0, 1],
+            term_scores=[1.0, 1.0],
+            term_length_hists=[{4: 2}, {4: 2}],
+            term_answer_inventories=[{"HEAT", "WORK"}, {"HEAT", "AXIS"}],
+        )
+        seen_hists: list[dict[int, int]] = []
+
+        def fake_score_template(length_hist, template, min_len=3, **kwargs):  # noqa: ANN001,ARG001
+            seen_hists.append(dict(length_hist))
+            return {
+                "template": template.name,
+                "score": 1.0,
+                "fill_conflict": 0.0,
+                "weighted_shortage_penalty": 0.0,
+                "long_slot_penalty": 0.0,
+                "auto_block_density": 0.0,
+                "disconnected_penalty": 0.0,
+            }
+
+        with (
+            patch("src.pipeline.run_candidate_scoring_stage", return_value=mocked_scoring),
+            patch("src.pipeline.get_templates", return_value=[SimpleNamespace(name="only")]),
+            patch("src.pipeline.score_template_from_length_hist", side_effect=fake_score_template),
+        ):
+            run_k_selection_stage(
+                seed_title="Thermodynamics",
+                lang="en",
+                cache_dir=cache_dir,
+                diagnostics_path=diagnostics_path,
+                trace_path=trace_path,
+                selected_path=output_path,
+                min_k=1,
+                max_k=2,
+                size=13,
+                inventory_min_df=1,
+            )
+
+        self.assertGreaterEqual(len(seen_hists), 2)
+        self.assertEqual(seen_hists[0].get(4), 2)
+        self.assertEqual(seen_hists[1].get(4), 3)
 
         shutil.rmtree(output_path.parent, ignore_errors=True)
         shutil.rmtree(cache_dir, ignore_errors=True)
@@ -333,6 +405,52 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("ALPHA", vocabulary.themed_set)
         self.assertIn("CAT", vocabulary.themed_set)
         self.assertNotIn("BRAVO", vocabulary.themed_set)
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_clue_aware_vocabulary_caps_filler_to_short_lengths(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "vocab_short_filler_only"
+        terms_path = tmp_dir / "terms.csv"
+        clues_path = tmp_dir / "clues.csv"
+        filler_path = tmp_dir / "filler.txt"
+
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        terms_path.write_text(
+            "\n".join(
+                [
+                    "answer,normalized_answer,length,source_method,lead_bold_signal,source_titles,doc_frequency,theme_score,entity_type_score,crosswordability_score,lexicon_score,shape_penalty,answer_score",
+                    "Alpha,ALPHA,5,spacy,False,Test,1,1,0,1,0,0,1",
+                    "Sound,SOUND,5,spacy,False,Test,1,1,0,1,0,0,0.8",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        clues_path.write_text(
+            "\n".join(
+                [
+                    "answer,normalized_answer,clue,clue_score,source_method,source_page,revid,sentence_offset,oldid_url",
+                    "Alpha,ALPHA,First clue,0.9,spacy,Test,1,0,https://example.com",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        filler_path.write_text("BRIDGE\nBARRIER\nABSENCE\n", encoding="utf-8")
+
+        vocabulary = build_solver_vocabulary(
+            terms_path=terms_path,
+            lang="en",
+            filler_path=filler_path,
+            filler_min_len=3,
+            filler_max_len=12,
+            filler_max_per_length=100,
+            filler_weight=0.01,
+        )
+
+        self.assertEqual(vocabulary.effective_filler_max_len, 5)
+        self.assertNotIn("BARRIER", vocabulary.words)
+        self.assertNotIn("ABSENCE", vocabulary.words)
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -909,6 +1027,365 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.diagnostics["effective_min_slot_len"], 5)
         self.assertEqual(mocked_trial.call_args.kwargs["effective_min_slot_len"], 5)
 
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_csp_uses_topology_order_as_hint_without_forcing_single_template(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "csp_topology_hint"
+        diagnostics_path = tmp_dir / "diagnostics_csp.json"
+        grid_path = tmp_dir / "grid.json"
+        terms_path = tmp_dir / "terms.csv"
+
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        terms_path.write_text("answer,normalized_answer\n", encoding="utf-8")
+
+        vocabulary = SimpleNamespace(
+            word_scores={"ALPHA": 1.0, "BETA": 0.8},
+            words=["ALPHA", "BETA"],
+            themed_words=["ALPHA", "BETA"],
+            themed_set={"ALPHA", "BETA"},
+            clue_answers={"ALPHA", "BETA"},
+            clue_answers_available=True,
+            filler_words=[],
+            filler_raw_count=0,
+            filler_added=0,
+            filler_limit_per_length=0,
+            filler_weight=0.01,
+            long_filler_weight=0.0025,
+            min_word_len=4,
+            max_word_len=5,
+        )
+        passing_gate = SimpleNamespace(
+            passed=True,
+            reason="ok",
+            term_count=2,
+            min_required=40,
+            max_allowed=250,
+        )
+
+        trials = [
+            {
+                "template": SimpleNamespace(name="medium_open"),
+                "rendered": [["#"]],
+                "result": {"solved": False, "assignments": {}, "steps": 0, "restarts": 0, "local_repair_applied": False},
+                "slots": [],
+                "active_slots": [],
+                "auto_block": {"added_blocks": [], "long_slots_before": [], "long_slots_after": [], "iterations": 0},
+                "fill_percent": 0.62,
+                "fill_status": "failed",
+                "fill_count": 0,
+                "total_cells": 0,
+                "unfilled_slots": [],
+                "trial_errors": [],
+                "invalid_slots": [],
+                "removed_assignments": [],
+                "implicit_added_count": 0,
+                "solved_final": False,
+                "quality_objective": 0.62,
+                "themed_assigned_count": 0,
+                "clued_assigned_count": 0,
+                "assigned_count": 0,
+                "filler_used_count": 0,
+                "filler_used_ratio": 0.0,
+                "clued_entry_ratio": 0.0,
+                "long_slot_assigned_count": 0,
+                "long_slot_non_theme_count": 0,
+                "long_slot_theme_ratio": 1.0,
+                "unclued_removed_count": 0,
+                "phase_a": {"steps": 0, "restarts": 0, "assigned_count": 0, "preferred_long_words_count": 0},
+            },
+            {
+                "template": SimpleNamespace(name="nyt_classic"),
+                "rendered": [["#"]],
+                "result": {"solved": False, "assignments": {}, "steps": 0, "restarts": 0, "local_repair_applied": False},
+                "slots": [],
+                "active_slots": [],
+                "auto_block": {"added_blocks": [], "long_slots_before": [], "long_slots_after": [], "iterations": 0},
+                "fill_percent": 0.65,
+                "fill_status": "failed",
+                "fill_count": 0,
+                "total_cells": 0,
+                "unfilled_slots": [],
+                "trial_errors": [],
+                "invalid_slots": [],
+                "removed_assignments": [],
+                "implicit_added_count": 0,
+                "solved_final": False,
+                "quality_objective": 0.65,
+                "themed_assigned_count": 0,
+                "clued_assigned_count": 0,
+                "assigned_count": 0,
+                "filler_used_count": 0,
+                "filler_used_ratio": 0.0,
+                "clued_entry_ratio": 0.0,
+                "long_slot_assigned_count": 0,
+                "long_slot_non_theme_count": 0,
+                "long_slot_theme_ratio": 1.0,
+                "unclued_removed_count": 0,
+                "phase_a": {"steps": 0, "restarts": 0, "assigned_count": 0, "preferred_long_words_count": 0},
+            },
+        ]
+
+        with (
+            patch("src.pipeline.build_solver_vocabulary", return_value=vocabulary),
+            patch("src.pipeline.evaluate_vocab_gate", return_value=passing_gate),
+            patch(
+                "src.pipeline.get_templates",
+                return_value=[SimpleNamespace(name="symmetric_sparse"), SimpleNamespace(name="medium_open"), SimpleNamespace(name="nyt_classic")],
+            ),
+            patch(
+                "src.pipeline.select_best_template",
+                return_value={
+                    "selected": "symmetric_sparse",
+                    "scored": [
+                        {"template": "symmetric_sparse"},
+                        {"template": "medium_open"},
+                        {"template": "nyt_classic"},
+                    ],
+                },
+            ),
+            patch("src.pipeline.run_template_trial", side_effect=trials) as mocked_trial,
+        ):
+            result = run_csp_solve_stage(
+                seed_title="Test",
+                lang="en",
+                terms_path=terms_path,
+                diagnostics_path=diagnostics_path,
+                grid_path=grid_path,
+                size=5,
+                min_slot_len=3,
+                max_steps=100,
+                require_gate=False,
+                template_trials=2,
+                template_priority_names=["medium_open", "nyt_classic"],
+            )
+
+        tried_templates = [
+            call.kwargs["template"].name
+            for call in mocked_trial.call_args_list
+        ]
+        self.assertEqual(tried_templates, ["medium_open", "nyt_classic"])
+        self.assertEqual(result.diagnostics["template"], "nyt_classic")
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_should_expand_selection_inventory_on_failed_short_pool(self) -> None:
+        should_expand = _should_expand_selection_inventory(
+            size=15,
+            terms=[
+                {"normalized_answer": "HEAT"},
+                {"normalized_answer": "WORK"},
+                {"normalized_answer": "STATE"},
+            ],
+            solve_diagnostics={"fill_status": "failed", "fill_percent": 0.71},
+        )
+        self.assertTrue(should_expand)
+
+    def test_expand_selected_titles_from_scores_appends_ranked_titles(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "expand_selection"
+        scores_path = tmp_dir / "candidate_scores.csv"
+
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        scores_path.write_text(
+            "\n".join(
+                [
+                    "rank,title,status",
+                    "1,Alpha,KEEP",
+                    "2,Beta,KEEP",
+                    "3,Gamma,KEEP",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        expanded = _expand_selected_titles_from_scores(
+            selected_titles=["Alpha"],
+            candidate_scores_path=scores_path,
+            target_count=3,
+        )
+
+        self.assertEqual(expanded, ["Alpha", "Beta", "Gamma"])
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_inventory_min_k_target_uses_short_answer_thresholds(self) -> None:
+        self.assertEqual(
+            _inventory_min_k_target(
+                size=15,
+                ranked_indices=[0, 1, 2],
+                term_answer_inventories=[
+                    {"HEAT", "WORK", "FORM", "TIME"},
+                    {"ATOMS", "STATE", "PHASE", "FORCE"},
+                    {"BULK", "LAWS", "BASIS", "FIELD", "FIRST", "STUDY"},
+                ],
+                inventory_min_df=1,
+            ),
+            3,
+        )
+        self.assertEqual(
+            _inventory_min_k_target(
+                size=15,
+                ranked_indices=[0, 1],
+                term_answer_inventories=[
+                    {"HEAT", "WORK"},
+                    {"ATOMS"},
+                ],
+                inventory_min_df=1,
+            ),
+            2,
+        )
+
+    def test_effective_min_k_for_15x15_uses_inventory_target(self) -> None:
+        self.assertEqual(
+            _effective_min_k_for_size(
+                size=15,
+                min_k=5,
+                candidate_count=20,
+                ranked_indices=[0, 1, 2],
+                term_answer_inventories=[
+                    {"HEAT", "WORK", "FORM", "TIME"},
+                    {"ATOMS", "STATE", "PHASE", "FORCE"},
+                    {
+                        "BULK", "LAWS", "RATE", "HELP", "SOME", "STUDY",
+                        "BASIS", "FIELD", "FIRST", "TERMS", "UNITS", "GIBBS",
+                    },
+                ],
+                inventory_min_df=1,
+            ),
+            5,
+        )
+        with patch("src.pipeline._inventory_min_k_target", return_value=17):
+            self.assertEqual(
+                _effective_min_k_for_size(
+                    size=15,
+                    min_k=5,
+                    candidate_count=20,
+                    ranked_indices=list(range(20)),
+                    term_answer_inventories=[set() for _ in range(20)],
+                    inventory_min_df=2,
+                ),
+                12,
+            )
+
+    def test_generate_pipeline_expands_selection_after_failed_short_inventory(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "generate_quality_rescue"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        scores_path = tmp_dir / "candidate_scores.csv"
+        selected_path = tmp_dir / "selected_candidates.json"
+        scores_path.write_text(
+            "\n".join(
+                [
+                    "rank,title,status",
+                    "1,Alpha,KEEP",
+                    "2,Beta,KEEP",
+                    "3,Gamma,KEEP",
+                    "4,Delta,KEEP",
+                    "5,Epsilon,KEEP",
+                    "6,Zeta,KEEP",
+                    "7,Eta,KEEP",
+                    "8,Theta,KEEP",
+                    "9,Iota,KEEP",
+                    "10,Kappa,KEEP",
+                    "11,Lambda,KEEP",
+                    "12,Mu,KEEP",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        selected_path.write_text(
+            json.dumps(
+                {
+                    "seed_title": "Thermodynamics",
+                    "lang": "en",
+                    "selected_k": 7,
+                    "selected_titles": ["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        low_inventory_terms = [
+            {"normalized_answer": "HEAT"},
+            {"normalized_answer": "WORK"},
+            {"normalized_answer": "STATE"},
+        ]
+        high_inventory_terms = (
+            [{"normalized_answer": f"A{i:03d}B"} for i in range(12)]
+            + [{"normalized_answer": f"C{i:03d}D"} for i in range(12)]
+        )
+        low_terms_result = SimpleNamespace(
+            terms_path=tmp_dir / "answer_candidates.csv",
+            diagnostics_path=tmp_dir / "diagnostics_terms.json",
+            terms=low_inventory_terms,
+            diagnostics={"term_count": len(low_inventory_terms)},
+        )
+        high_terms_result = SimpleNamespace(
+            terms_path=tmp_dir / "answer_candidates.csv",
+            diagnostics_path=tmp_dir / "diagnostics_terms_rescue.json",
+            terms=high_inventory_terms,
+            diagnostics={"term_count": len(high_inventory_terms)},
+        )
+        gate_result = SimpleNamespace(
+            diagnostics_path=tmp_dir / "diagnostics_vocab_gate.json",
+            diagnostics={"passed": True},
+        )
+        clue_result = SimpleNamespace(
+            clues_path=tmp_dir / "clues.csv",
+            diagnostics_path=tmp_dir / "diagnostics_clues.json",
+            clues=[],
+            diagnostics={},
+        )
+        topology_result = SimpleNamespace(
+            diagnostics_path=tmp_dir / "diagnostics_topology.json",
+            diagnostics={"selected_template": "nyt_classic", "scored": [{"template": "nyt_classic"}]},
+        )
+        failed_solve = SimpleNamespace(
+            grid_path=tmp_dir / "grid.json",
+            diagnostics_path=tmp_dir / "diagnostics_csp.json",
+            diagnostics={"fill_status": "failed", "fill_percent": 0.71, "filler": {"used_ratio": 0.3}},
+        )
+        improved_solve = SimpleNamespace(
+            grid_path=tmp_dir / "grid.json",
+            diagnostics_path=tmp_dir / "diagnostics_csp.json",
+            diagnostics={"fill_status": "partial", "fill_percent": 0.74, "filler": {"used_ratio": 0.15}},
+        )
+        package_result = SimpleNamespace(
+            puzzle_path=tmp_dir / "puzzle.json",
+            attribution_path=tmp_dir / "attribution.json",
+            diagnostics_path=tmp_dir / "diagnostics_package.json",
+            diagnostics={"puzzle_status": "ok"},
+        )
+
+        with (
+            patch("src.pipeline.run_candidate_scoring_stage", return_value=SimpleNamespace()),
+            patch("src.pipeline.run_k_selection_stage", return_value=SimpleNamespace()),
+            patch("src.pipeline.run_term_extraction_stage", side_effect=[low_terms_result, high_terms_result]) as mocked_terms,
+            patch("src.pipeline.run_vocab_gate_stage", return_value=gate_result),
+            patch("src.pipeline.run_clue_extraction_stage", side_effect=[clue_result, clue_result]),
+            patch("src.pipeline.run_topology_selection_stage", side_effect=[topology_result, topology_result]),
+            patch("src.pipeline.run_csp_solve_stage", side_effect=[failed_solve, improved_solve]),
+            patch("src.pipeline.run_packaging_stage", return_value=package_result) as mocked_package,
+        ):
+            run_generate_pipeline(
+                seed_title="Thermodynamics",
+                lang="en",
+                output_dir=tmp_dir,
+                cache_dir="data/cache/wiki",
+                rescue=True,
+                size=15,
+                min_df=2,
+                use_topology=False,
+            )
+
+        self.assertEqual(mocked_terms.call_count, 2)
+        second_terms_selected = Path(mocked_terms.call_args_list[1].kwargs["selected_path"])
+        self.assertEqual(second_terms_selected.name, "selected_candidates_quality_rescue.json")
+        self.assertEqual(Path(mocked_package.call_args.kwargs["selected_path"]).name, "selected_candidates_quality_rescue.json")
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 

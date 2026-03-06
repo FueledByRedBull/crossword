@@ -73,6 +73,13 @@ class TopologyTests(unittest.TestCase):
         selection = select_best_template(words, size=15, min_len=4)
         self.assertEqual(selection["selected"], "symmetric_sparse")
 
+    def test_weighted_shortage_penalty_emphasizes_short_slot_gaps(self) -> None:
+        nyt = next(template for template in get_templates(15) if template.name == "nyt_classic")
+        score = score_template_from_length_hist({4: 2, 5: 2, 7: 20}, nyt, min_len=4)
+        self.assertGreater(score["weighted_shortage_penalty"], score["fill_conflict"])
+        self.assertEqual(score["shortage_by_length"][4]["shortage"], 16)
+        self.assertEqual(score["shortage_by_length"][5]["shortage"], 18)
+
     def test_auto_block_reduces_overlong_slots(self) -> None:
         template = next(template for template in get_templates(15) if template.name == "open")
         grid = build_grid(template)

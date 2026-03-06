@@ -76,6 +76,7 @@ class ScoringStageResult:
     ranked_indices: list[int]
     term_scores: list[float]
     term_length_hists: list[dict[int, int]]
+    term_answer_inventories: list[set[str]]
 
 
 @dataclass
@@ -150,6 +151,13 @@ def _term_length_histogram(
     return hist
 
 
+def _length_histogram_from_answers(answers: set[str]) -> dict[int, int]:
+    hist: dict[int, int] = {}
+    for answer in answers:
+        hist[len(answer)] = hist.get(len(answer), 0) + 1
+    return hist
+
+
 def _safe_float(value, *, default: float = 0.0) -> float:
     try:
         if value is None or value == "":
@@ -157,6 +165,223 @@ def _safe_float(value, *, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _unique_term_inventory_by_length(terms: list[dict]) -> dict[int, int]:
+    by_length: dict[int, set[str]] = {}
+    for term in terms:
+        normalized = (term.get("normalized_answer") or "").strip().upper()
+        if not normalized:
+            continue
+        by_length.setdefault(len(normalized), set()).add(normalized)
+    return {length: len(values) for length, values in by_length.items()}
+
+
+def _should_expand_selection_inventory(
+    *,
+    size: int,
+    terms: list[dict],
+    solve_diagnostics: dict,
+) -> bool:
+    if size < 15:
+        return False
+    if solve_diagnostics.get("fill_status") != "failed":
+        return False
+    inventory = _unique_term_inventory_by_length(terms)
+    return inventory.get(4, 0) < 12 or inventory.get(5, 0) < 12
+
+
+def _load_selected_titles(path: str | Path) -> list[str]:
+    import json
+
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    return list(payload.get("selected_titles", []))
+
+
+def _write_selected_titles(
+    *,
+    path: str | Path,
+    seed_title: str,
+    lang: str,
+    titles: list[str],
+) -> Path:
+    payload = {
+        "seed_title": seed_title,
+        "lang": lang,
+        "selected_k": len(titles),
+        "selected_titles": titles,
+    }
+    return write_json(path, payload)
+
+
+def _expand_selected_titles_from_scores(
+    *,
+    selected_titles: list[str],
+    candidate_scores_path: str | Path,
+    target_count: int,
+) -> list[str]:
+    import csv
+
+    expanded = list(selected_titles)
+    if len(expanded) >= target_count or not Path(candidate_scores_path).exists():
+        return expanded
+
+    with Path(candidate_scores_path).open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            title = (row.get("title") or "").strip()
+            if not title or title in expanded:
+                continue
+            expanded.append(title)
+            if len(expanded) >= target_count:
+                break
+    return expanded
+
+
+def _solve_result_rank(diagnostics: dict) -> tuple[int, float, float]:
+    status = diagnostics.get("fill_status")
+    if status == "complete":
+        status_rank = 2
+    elif status == "partial":
+        status_rank = 1
+    else:
+        status_rank = 0
+    fill_percent = _safe_float(diagnostics.get("fill_percent"), default=0.0)
+    filler_ratio = _safe_float(
+        (diagnostics.get("filler") or {}).get("used_ratio"),
+        default=1.0,
+    )
+    return (status_rank, fill_percent, -filler_ratio)
+
+
+def _inventory_min_k_target(
+    *,
+    size: int,
+    ranked_indices: list[int],
+    term_answer_inventories: list[set[str]],
+    inventory_min_df: int = 2,
+) -> int | None:
+    if size < 15 or not ranked_indices or not term_answer_inventories:
+        return None
+
+    short_targets = {4: 12, 5: 12}
+    inventory_counts: dict[str, int] = {}
+    for position, idx in enumerate(ranked_indices, start=1):
+        for answer in term_answer_inventories[idx]:
+            inventory_counts[answer] = inventory_counts.get(answer, 0) + 1
+        inventory_by_length = {4: set(), 5: set()}
+        for answer, count in inventory_counts.items():
+            if count < inventory_min_df:
+                continue
+            if len(answer) in inventory_by_length:
+                inventory_by_length[len(answer)].add(answer)
+        if all(len(inventory_by_length[length]) >= target for length, target in short_targets.items()):
+            return position
+    return len(ranked_indices)
+
+
+def _effective_min_k_for_size(
+    *,
+    size: int,
+    min_k: int,
+    candidate_count: int,
+    ranked_indices: list[int] | None = None,
+    term_answer_inventories: list[set[str]] | None = None,
+    inventory_min_df: int = 2,
+) -> int:
+    recommended_min_k = min_k
+    inventory_min_k = _inventory_min_k_target(
+        size=size,
+        ranked_indices=ranked_indices or [],
+        term_answer_inventories=term_answer_inventories or [],
+        inventory_min_df=inventory_min_df,
+    )
+    if inventory_min_k is not None:
+        if size >= 15:
+            inventory_min_k = min(inventory_min_k, 12)
+        recommended_min_k = max(recommended_min_k, inventory_min_k)
+    elif size >= 15:
+        recommended_min_k = max(recommended_min_k, 12)
+    return min(max(1, recommended_min_k), max(1, candidate_count))
+
+
+def _resolve_nlp_backend(
+    *,
+    lang: str,
+    nlp_backend: str = "auto",
+) -> tuple[object | None, str | None, list[str], str | None, str | None]:
+    errors: list[str] = []
+    backend = nlp_backend.lower()
+    if backend not in {"auto", "spacy", "nltk"}:
+        errors.append(f"unsupported_nlp_backend:{nlp_backend}")
+        backend = "auto"
+
+    nlp = None
+    backend_used = None
+    spacy_version = None
+    spacy_model_version = None
+
+    if backend in {"auto", "spacy"}:
+        try:
+            import spacy
+        except ImportError as exc:  # pragma: no cover
+            errors.append(f"spacy_missing:{exc}")
+            spacy = None
+
+        if spacy is not None:
+            model_name = "en_core_web_sm" if lang == "en" else "el_core_news_sm"
+            try:
+                nlp = spacy.load(model_name)
+                backend_used = "spacy"
+            except Exception as exc:  # pragma: no cover
+                errors.append(f"spacy_model_load_failed:{model_name}:{exc}")
+
+            spacy_version = getattr(spacy, "__version__", None)
+            if nlp is not None:
+                try:
+                    spacy_model_version = nlp.meta.get("version")
+                except Exception:  # pragma: no cover
+                    pass
+
+    if backend_used is None and backend in {"auto", "nltk"}:
+        try:
+            import nltk  # noqa: F401
+
+            backend_used = "nltk"
+        except Exception as exc:  # pragma: no cover
+            errors.append(f"nltk_unavailable:{exc}")
+
+    return nlp, backend_used, errors, spacy_version, spacy_model_version
+
+
+def _extract_answer_inventory(
+    *,
+    title: str,
+    extract: str,
+    lead_bold_terms: list[str],
+    lang: str,
+    nlp: object | None,
+    backend_used: str | None,
+    min_len: int = 4,
+    max_len: int = 12,
+    min_alpha_ratio: float = 0.8,
+) -> set[str]:
+    from .term_extractor import get_stopwords
+
+    term_lists: list[list] = []
+    if backend_used == "spacy" and nlp is not None:
+        term_lists.append(extract_terms_spacy(nlp(extract), source_title=title, lang=lang))
+    elif backend_used == "nltk":
+        term_lists.append(extract_terms_nltk(extract, source_title=title, lang=lang))
+    term_lists.append(extract_terms_lead_bold(lead_bold_terms, source_title=title, lang=lang))
+    merged = merge_terms(
+        term_lists,
+        min_len=min_len,
+        max_len=max_len,
+        min_alpha_ratio=min_alpha_ratio,
+        stopwords=get_stopwords(lang),
+    )
+    return {term.normalized_answer for term in merged if term.normalized_answer}
 
 
 def run_seed_ingestion_stage(
@@ -377,6 +602,7 @@ def run_candidate_scoring_stage(
             ranked_indices=[],
             term_scores=[],
             term_length_hists=[],
+            term_answer_inventories=[],
         )
 
     cache = DiskCache(cache_dir)
@@ -389,8 +615,12 @@ def run_candidate_scoring_stage(
         seed_extract = ""
         errors.append(f"seed_extract_failed: {exc}")
 
+    nlp, backend_used, backend_errors, _, _ = _resolve_nlp_backend(lang=lang, nlp_backend="auto")
+    errors.extend(backend_errors)
+
     texts = [seed_extract]
     titles = [seed_title]
+    term_answer_inventories: list[set[str]] = []
     for candidate in candidates:
         title = candidate["title"]
         try:
@@ -398,13 +628,29 @@ def run_candidate_scoring_stage(
         except Exception as exc:  # pragma: no cover
             extract = ""
             errors.append(f"candidate_extract_failed:{title}:{exc}")
+        try:
+            lead_wikitext = client.fetch_lead_wikitext(title).get("wikitext", "")
+        except Exception as exc:  # pragma: no cover
+            lead_wikitext = ""
+            errors.append(f"lead_wikitext_failed:{title}:{exc}")
         titles.append(title)
         texts.append(extract)
+        term_answer_inventories.append(
+            _extract_answer_inventory(
+                title=title,
+                extract=extract,
+                lead_bold_terms=client.extract_lead_bold_terms(lead_wikitext),
+                lang=lang,
+                nlp=nlp,
+                backend_used=backend_used,
+            )
+        )
 
     term_length_hists = [
-        _term_length_histogram(text, lang=lang, min_len=4, max_len=12) for text in texts[1:]
+        _length_histogram_from_answers(inventory)
+        for inventory in term_answer_inventories
     ]
-    term_counts = [sum(hist.values()) for hist in term_length_hists]
+    term_counts = [len(inventory) for inventory in term_answer_inventories]
     max_term_count = max(term_counts) if term_counts else 1
     max_term_count = max(1, max_term_count)
     term_scores = [count / max_term_count for count in term_counts]
@@ -517,6 +763,7 @@ def run_candidate_scoring_stage(
         ranked_indices=ranked_indices,
         term_scores=term_scores,
         term_length_hists=term_length_hists,
+        term_answer_inventories=term_answer_inventories,
     )
 
 
@@ -545,6 +792,7 @@ def run_k_selection_stage(
     weights: dict[str, float] | None = None,
     size: int = 15,
     min_slot_len: int = 3,
+    inventory_min_df: int = 2,
     lexicon_path: str | Path | None = "data/lexicon/combined_wordfreq.txt",
     lexicon_weight: float = 0.08,
 ) -> KSelectionStageResult:
@@ -592,20 +840,50 @@ def run_k_selection_stage(
     pairwise = scoring.pairwise
     ranked_indices = scoring.ranked_indices
     term_scores = scoring.term_scores
-    max_k_effective = min(max_k or len(ranked_indices), len(ranked_indices))
+    term_answer_inventories = getattr(scoring, "term_answer_inventories", [])
+    max_k_limit = max_k or len(ranked_indices)
+    if max_k is None and size >= 15:
+        max_k_limit = min(max_k_limit, 12)
+    max_k_effective = min(max_k_limit, len(ranked_indices))
+    inventory_min_k_target = _inventory_min_k_target(
+        size=size,
+        ranked_indices=ranked_indices[:max_k_effective],
+        term_answer_inventories=term_answer_inventories,
+        inventory_min_df=inventory_min_df,
+    )
+    effective_min_k = _effective_min_k_for_size(
+        size=size,
+        min_k=min_k,
+        candidate_count=max_k_effective,
+        ranked_indices=ranked_indices[:max_k_effective],
+        term_answer_inventories=term_answer_inventories,
+        inventory_min_df=inventory_min_df,
+    )
 
     template_fit_by_k: list[float] = []
     fill_conflict_by_k: list[float] = []
-    if scoring.term_length_hists:
+    if term_answer_inventories or scoring.term_length_hists:
         templates = get_templates(size)
         fit_weight = weights.get("w4", 0.5)
         conflict_weight = weights.get("w5", 0.5)
         for k in range(1, max_k_effective + 1):
             selected = ranked_indices[:k]
-            length_hist: dict[int, int] = {}
-            for idx in selected:
-                for length, count in scoring.term_length_hists[idx].items():
-                    length_hist[length] = length_hist.get(length, 0) + count
+            if term_answer_inventories:
+                inventory_counts: dict[str, int] = {}
+                for idx in selected:
+                    for answer in term_answer_inventories[idx]:
+                        inventory_counts[answer] = inventory_counts.get(answer, 0) + 1
+                inventory = {
+                    answer
+                    for answer, count in inventory_counts.items()
+                    if count >= inventory_min_df
+                }
+                length_hist = _length_histogram_from_answers(inventory)
+            else:
+                length_hist = {}
+                for idx in selected:
+                    for length, count in scoring.term_length_hists[idx].items():
+                        length_hist[length] = length_hist.get(length, 0) + count
             if not length_hist:
                 template_fit_by_k.append(0.0)
                 fill_conflict_by_k.append(1.0)
@@ -633,8 +911,8 @@ def run_k_selection_stage(
         rel_scores=rel_scores,
         pairwise=pairwise,
         weights=weights,
-        min_k=min_k,
-        max_k=max_k,
+        min_k=effective_min_k,
+        max_k=max_k_effective,
         epsilon=epsilon,
         m=m,
         term_scores=term_scores,
@@ -679,6 +957,10 @@ def run_k_selection_stage(
         "lang": lang,
         "seed_title": seed_title,
         "selected_k": selection.selected_k,
+        "effective_min_k": effective_min_k,
+        "effective_max_k": max_k_effective,
+        "inventory_min_k_target": inventory_min_k_target,
+        "inventory_min_df": inventory_min_df,
         "trace_written": True,
         "selected_written": True,
         "weights": weights,
@@ -686,8 +968,8 @@ def run_k_selection_stage(
         "errors": mapping_errors,
         "notes": [
             "pairwise_similarity_cosine",
-            "term_quality_proxy_unique_token_count",
-            "template_fit_proxy_length_hist",
+            "term_quality_proxy_extracted_answer_count",
+            "template_fit_proxy_extracted_answer_inventory",
         ],
     }
     final_diagnostics = write_json(diagnostics_path, diagnostics)
@@ -755,45 +1037,11 @@ def run_term_extraction_stage(
             diagnostics=diagnostics,
         )
 
-    nlp_backend = nlp_backend.lower()
-    allowed_backends = {"auto", "spacy", "nltk"}
-    if nlp_backend not in allowed_backends:
-        errors.append(f"unsupported_nlp_backend:{nlp_backend}")
-        nlp_backend = "auto"
-
-    nlp = None
-    backend_used = None
-    if nlp_backend in {"auto", "spacy"}:
-        try:
-            import spacy
-        except ImportError as exc:  # pragma: no cover
-            errors.append(f"spacy_missing:{exc}")
-            spacy = None
-
-        if spacy is not None:
-            model_name = "en_core_web_sm" if lang == "en" else "el_core_news_sm"
-            try:
-                nlp = spacy.load(model_name)
-                backend_used = "spacy"
-            except Exception as exc:  # pragma: no cover
-                errors.append(f"spacy_model_load_failed:{model_name}:{exc}")
-
-        spacy_version = getattr(spacy, "__version__", None) if spacy is not None else None
-        spacy_model_version = None
-        if nlp is not None:
-            try:
-                spacy_model_version = nlp.meta.get("version")
-            except Exception:  # pragma: no cover
-                pass
-
-    if backend_used is None and nlp_backend in {"auto", "nltk"}:
-        try:
-            import nltk  # noqa: F401
-
-            backend_used = "nltk"
-        except Exception as exc:  # pragma: no cover
-            errors.append(f"nltk_unavailable:{exc}")
-            backend_used = None
+    nlp, backend_used, backend_errors, spacy_version, spacy_model_version = _resolve_nlp_backend(
+        lang=lang,
+        nlp_backend=nlp_backend,
+    )
+    errors.extend(backend_errors)
 
     lead_terms: dict[str, list[str]] = {}
     extracts: dict[str, str] = {}
@@ -1653,24 +1901,25 @@ def run_topology_selection_stage(
         final_diagnostics = write_json(diagnostics_path, diagnostics)
         return TopologyStageResult(diagnostics_path=final_diagnostics, diagnostics=diagnostics)
 
-    import csv
-
-    words: list[str] = []
-    word_scores: dict[str, float] = {}
-    with Path(terms_path).open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            normalized = (row.get("normalized_answer") or "").strip().upper()
-            if not normalized:
-                continue
-            answer_score = _safe_float(row.get("answer_score"), default=0.0)
-            lexicon_score = _safe_float(row.get("lexicon_score"), default=0.0)
-            crossword_score = _safe_float(row.get("crosswordability_score"), default=0.0)
-            composite = (0.6 * answer_score) + (0.25 * lexicon_score) + (0.15 * crossword_score)
-            previous = word_scores.get(normalized)
-            if previous is None or composite > previous:
-                word_scores[normalized] = composite
-    words = sorted(word_scores, key=lambda word: (word_scores[word], word), reverse=True)
+    vocabulary = build_solver_vocabulary(
+        terms_path=terms_path,
+        lang=lang,
+        filler_path=None,
+        filler_min_len=min_slot_len,
+        filler_max_len=size,
+        filler_max_per_length=0,
+        filler_weight=0.0,
+    )
+    words = vocabulary.words
+    ranking_words = vocabulary.themed_words
+    inventory_source = "themed"
+    if vocabulary.clue_answers_available:
+        ranking_words = sorted(
+            vocabulary.clue_answers,
+            key=lambda word: (vocabulary.word_scores.get(word, 0.0), word),
+            reverse=True,
+        )
+        inventory_source = "clued"
 
     gate_result = evaluate_vocab_gate(len(words), min_required=gate_min, max_allowed=gate_max)
     if require_gate and not gate_result.passed:
@@ -1686,14 +1935,14 @@ def run_topology_selection_stage(
         final_diagnostics = write_json(diagnostics_path, diagnostics)
         return TopologyStageResult(diagnostics_path=final_diagnostics, diagnostics=diagnostics)
 
-    min_word_len = min((len(word) for word in words), default=None)
-    max_word_len = max((len(word) for word in words), default=None)
+    min_word_len = min((len(word) for word in ranking_words), default=None)
+    max_word_len = max((len(word) for word in ranking_words), default=None)
     effective_min_slot_len = min_slot_len
     if min_word_len is not None:
         effective_min_slot_len = max(min_slot_len, min_word_len)
 
     selection = select_best_template(
-        words,
+        ranking_words,
         size=size,
         min_len=effective_min_slot_len,
         max_word_len=max_word_len,
@@ -1710,6 +1959,8 @@ def run_topology_selection_stage(
         "effective_min_slot_len": effective_min_slot_len,
         "min_word_len": min_word_len,
         "max_word_len": max_word_len,
+        "inventory_source": inventory_source,
+        "ranking_word_count": len(ranking_words),
         "errors": errors,
     }
     final_diagnostics = write_json(diagnostics_path, diagnostics)
@@ -1741,6 +1992,7 @@ def run_csp_solve_stage(
     filler_max_per_length: int = 1200,
     filler_weight: float = 0.01,
     use_rust: bool | None = None,
+    template_priority_names: list[str] | None = None,
     require_gate: bool = True,
     gate_min: int = 40,
     gate_max: int = 250,
@@ -1783,6 +2035,7 @@ def run_csp_solve_stage(
     filler_limit_per_length = vocabulary.filler_limit_per_length
     filler_weight = vocabulary.filler_weight
     long_filler_weight = vocabulary.long_filler_weight
+    effective_filler_max_len = getattr(vocabulary, "effective_filler_max_len", filler_max_len)
     min_word_len = vocabulary.min_word_len
     max_word_len = vocabulary.max_word_len
 
@@ -1817,8 +2070,15 @@ def run_csp_solve_stage(
         templates_to_try = [next((t for t in templates if t.name == template_name), templates[0])]
         scored_templates = []
     else:
+        ranking_words = themed_words
+        if clue_answers_available:
+            ranking_words = sorted(
+                clue_answers,
+                key=lambda word: (word_scores.get(word, 0.0), word),
+                reverse=True,
+            )
         selection = select_best_template(
-            words,
+            ranking_words,
             size=size,
             min_len=effective_min_slot_len,
             max_word_len=max_word_len,
@@ -1826,6 +2086,19 @@ def run_csp_solve_stage(
         )
         scored_templates = selection.get("scored", [])
         ordered_names = [row["template"] for row in scored_templates]
+        if template_priority_names:
+            priority_order = {
+                name: index for index, name in enumerate(template_priority_names)
+            }
+            default_order = {
+                name: index for index, name in enumerate(ordered_names)
+            }
+            ordered_names.sort(
+                key=lambda name: (
+                    priority_order.get(name, len(priority_order)),
+                    default_order.get(name, len(default_order)),
+                )
+            )
         templates_to_try = [
             next(t for t in templates if t.name == name)
             for name in ordered_names[:template_trials]
@@ -2024,7 +2297,7 @@ def run_csp_solve_stage(
             "path": str(filler_path) if filler_path is not None else None,
             "loaded": bool(filler_words),
             "min_len": filler_min_len,
-            "max_len": filler_max_len,
+            "max_len": effective_filler_max_len,
             "max_per_length": filler_limit_per_length,
             "weight": filler_weight,
             "word_count": len(filler_words),
@@ -2433,6 +2706,7 @@ def run_generate_pipeline(
     diagnostics_rescue = output_dir / "diagnostics_rescue.json"
     diagnostics_terms_rescue = output_dir / "diagnostics_terms_rescue.json"
     selected_rescue_path = output_dir / "selected_candidates_rescue.json"
+    selected_quality_rescue_path = output_dir / "selected_candidates_quality_rescue.json"
     grid_path = output_dir / "grid.json"
     diagnostics_csp = output_dir / "diagnostics_csp.json"
     diagnostics_topology = output_dir / "diagnostics_topology.json"
@@ -2483,6 +2757,7 @@ def run_generate_pipeline(
         m=m,
         size=size,
         min_slot_len=min_slot_len,
+        inventory_min_df=min_df,
         weights=k_weights,
         lexicon_path=lexicon_path,
         lexicon_weight=candidate_lexicon_weight,
@@ -2570,8 +2845,13 @@ def run_generate_pipeline(
     )
 
     template_for_csp = template_name
+    template_priority_names: list[str] | None = None
     if template_for_csp is None and use_topology:
-        template_for_csp = topology.diagnostics.get("selected_template")
+        template_priority_names = [
+            row.get("template")
+            for row in topology.diagnostics.get("scored", [])
+            if row.get("template")
+        ]
 
     solve = run_csp_solve_stage(
         seed_title=seed_title,
@@ -2597,10 +2877,126 @@ def run_generate_pipeline(
         filler_max_per_length=filler_max_per_length,
         filler_weight=filler_weight,
         use_rust=use_rust,
+        template_priority_names=template_priority_names,
         require_gate=not skip_gate,
         gate_min=gate_min,
         gate_max=gate_max,
     )
+
+    if (
+        rescue
+        and template_name is None
+        and _should_expand_selection_inventory(
+            size=size,
+            terms=terms.terms,
+            solve_diagnostics=solve.diagnostics,
+        )
+    ):
+        current_selected_titles = _load_selected_titles(selected_for_package)
+        expanded_titles = _expand_selected_titles_from_scores(
+            selected_titles=current_selected_titles,
+            candidate_scores_path=scores_path,
+            target_count=max(len(current_selected_titles), 12),
+        )
+        if len(expanded_titles) > len(current_selected_titles):
+            expanded_selected_path = _write_selected_titles(
+                path=selected_quality_rescue_path,
+                seed_title=seed_title,
+                lang=lang,
+                titles=expanded_titles,
+            )
+            expanded_terms = run_term_extraction_stage(
+                seed_title=seed_title,
+                lang=lang,
+                cache_dir=cache_dir,
+                diagnostics_path=diagnostics_terms_rescue,
+                selected_path=expanded_selected_path,
+                terms_path=terms_path,
+                min_len=min_len,
+                max_len=max_len,
+                min_alpha_ratio=min_alpha_ratio,
+                min_df=min_df,
+                nlp_backend=nlp_backend,
+                entity_type_scoring=entity_type_scoring,
+                wikidata_cache_dir=wikidata_cache_dir,
+                lexicon_path=lexicon_path,
+                lexicon_weight=term_lexicon_weight,
+            )
+            expanded_gate = run_vocab_gate_stage(
+                seed_title=seed_title,
+                lang=lang,
+                diagnostics_path=diagnostics_gate,
+                terms_path=terms_path,
+                min_required=gate_min,
+                max_allowed=gate_max,
+            )
+            if skip_gate or expanded_gate.diagnostics.get("passed", False):
+                expanded_clues = run_clue_extraction_stage(
+                    seed_title=seed_title,
+                    lang=lang,
+                    cache_dir=cache_dir,
+                    diagnostics_path=diagnostics_clues,
+                    terms_path=terms_path,
+                    clues_path=clues_path,
+                    min_words=clue_min_words,
+                    max_words=clue_max_words,
+                    diversity_cap=diversity_cap,
+                )
+                expanded_topology = run_topology_selection_stage(
+                    seed_title=seed_title,
+                    lang=lang,
+                    terms_path=terms_path,
+                    diagnostics_path=diagnostics_topology,
+                    size=size,
+                    min_slot_len=min_slot_len,
+                    require_gate=not skip_gate,
+                    gate_min=gate_min,
+                    gate_max=gate_max,
+                )
+                expanded_template_for_csp = template_name
+                expanded_template_priority_names: list[str] | None = None
+                if expanded_template_for_csp is None and use_topology:
+                    expanded_template_priority_names = [
+                        row.get("template")
+                        for row in expanded_topology.diagnostics.get("scored", [])
+                        if row.get("template")
+                    ]
+                expanded_solve = run_csp_solve_stage(
+                    seed_title=seed_title,
+                    lang=lang,
+                    terms_path=terms_path,
+                    diagnostics_path=diagnostics_csp,
+                    grid_path=grid_path,
+                    size=size,
+                    min_slot_len=min_slot_len,
+                    template_name=expanded_template_for_csp,
+                    max_steps=max_steps,
+                    min_domain=min_domain,
+                    max_restarts=max_restarts,
+                    random_seed=random_seed,
+                    use_ac3=use_ac3,
+                    beam_width=beam_width,
+                    enable_local_repair=enable_local_repair,
+                    repair_steps=repair_steps,
+                    template_trials=template_trials,
+                    filler_path=filler_path,
+                    filler_min_len=filler_min_len,
+                    filler_max_len=filler_max_len,
+                    filler_max_per_length=filler_max_per_length,
+                    filler_weight=filler_weight,
+                    use_rust=use_rust,
+                    template_priority_names=expanded_template_priority_names,
+                    require_gate=not skip_gate,
+                    gate_min=gate_min,
+                    gate_max=gate_max,
+                )
+                if _solve_result_rank(expanded_solve.diagnostics) > _solve_result_rank(solve.diagnostics):
+                    selected_for_package = expanded_selected_path
+                    terms = expanded_terms
+                    gate = expanded_gate
+                    clues = expanded_clues
+                    topology = expanded_topology
+                    solve = expanded_solve
 
     package = run_packaging_stage(
         seed_title=seed_title,

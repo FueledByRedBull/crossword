@@ -26,6 +26,7 @@ class SolverVocabulary:
     filler_limit_per_length: int
     filler_weight: float
     long_filler_weight: float
+    effective_filler_max_len: int
     min_word_len: int | None
     max_word_len: int | None
 
@@ -124,10 +125,14 @@ def build_solver_vocabulary(
             return False
         return True
 
+    effective_filler_max_len = filler_max_len
+    if clue_answers_available:
+        effective_filler_max_len = min(effective_filler_max_len, 5)
+
     filler_raw_words = load_word_list(
         filler_path,
         min_len=filler_min_len,
-        max_len=filler_max_len,
+        max_len=effective_filler_max_len,
         max_per_length=filler_max_per_length,
     )
     filler_raw_count = len(filler_raw_words)
@@ -172,6 +177,7 @@ def build_solver_vocabulary(
         filler_limit_per_length=filler_limit_per_length,
         filler_weight=normalized_filler_weight,
         long_filler_weight=long_filler_weight,
+        effective_filler_max_len=effective_filler_max_len,
         min_word_len=min_word_len,
         max_word_len=max_word_len,
     )

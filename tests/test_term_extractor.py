@@ -60,6 +60,16 @@ class TermExtractorTests(unittest.TestCase):
         self.assertIn("ArticleA", sources)
         self.assertIn("ArticleB", sources)
 
+    def test_lead_bold_strips_leading_determiners(self) -> None:
+        terms = extract_terms_lead_bold(
+            ["The heat", "An axiom"], source_title="Thermodynamics", lang="en"
+        )
+        normalized = {term.normalized_answer for term in terms}
+        self.assertIn("HEAT", normalized)
+        self.assertIn("AXIOM", normalized)
+        self.assertNotIn("THEHEAT", normalized)
+        self.assertNotIn("ANAXIOM", normalized)
+
 
 class ShapePenaltyTests(unittest.TestCase):
     def test_rare_letters_penalized(self) -> None:
