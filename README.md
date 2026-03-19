@@ -69,7 +69,7 @@ Clues are tagged into three classes throughout the pipeline:
 - `template_fallback`: article-backed fallback clue text when sentence extraction misses
 - `synthetic_filler`: debug/search-only short-fill fallback class that is not packageable
 
-Packaged puzzles may use bounded `template_fallback` clues, but they must carry page-level provenance. `synthetic_filler` clues do not count as source-backed coverage and are rejected from final packaging.
+`synthetic_filler` clues do not count as source-backed coverage and are rejected from final packaging. The current pipeline does not inject generic placeholder clue text when extraction misses.
 
 ## Solver Behavior
 
@@ -77,7 +77,7 @@ Packaged puzzles may use bounded `template_fallback` clues, but they must carry 
   Phase A is a thematic prepass for long slots.
   Phase B is the full solve with quality-gated selection.
 - `--use-topology` is a ranking hint for template order, not a hard template lock.
-- Python and Rust CSP backends are kept in parity by direct fixture tests and the offline seed corpus.
+- Python and Rust CSP backends are checked by direct fixture tests and the offline seed corpus when the Rust extension is installed.
 - English filler vocabulary is ASCII A-Z only, filtered aggressively, and capped to short bridge lengths when clue answers are available.
 
 ## Tuning Weights
@@ -104,7 +104,7 @@ Expected runtime for that full matrix is typically 6-14 hours.
 
 ## Regression Coverage
 
-The offline integration corpus currently covers:
+The offline integration corpus currently covers the English cached path:
 
 - `Thermodynamics`
 - `Quantum mechanics`

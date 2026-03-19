@@ -448,11 +448,39 @@ def _build_parser() -> argparse.ArgumentParser:
     rescue_parser.add_argument("--gate-max", type=int, default=250, help="Maximum terms allowed")
     rescue_parser.add_argument("--min-len", type=int, default=4, help="Minimum answer length")
     rescue_parser.add_argument("--max-len", type=int, default=12, help="Maximum answer length")
+    rescue_parser.add_argument("--min-df", type=int, default=2, help="Minimum doc frequency")
     rescue_parser.add_argument(
         "--min-alpha-ratio",
         type=float,
         default=0.8,
         help="Minimum alphabetic ratio for candidate term",
+    )
+    rescue_parser.add_argument(
+        "--nlp-backend",
+        choices=["auto", "spacy", "nltk"],
+        default="auto",
+        help="NLP backend for rescue term extraction",
+    )
+    rescue_parser.add_argument(
+        "--entity-type-scoring",
+        action="store_true",
+        help="Enable Wikidata entity-type scoring during rescue term extraction",
+    )
+    rescue_parser.add_argument(
+        "--wikidata-cache-dir",
+        default="data/cache/wikidata",
+        help="Disk cache directory for Wikidata API calls during rescue",
+    )
+    rescue_parser.add_argument(
+        "--lexicon-path",
+        default="data/lexicon/combined_wordfreq.txt",
+        help="Optional external lexicon file (word[,score]) for rescue term extraction",
+    )
+    rescue_parser.add_argument(
+        "--lexicon-weight",
+        type=float,
+        default=0.15,
+        help="Weight of lexicon score in rescue answer ranking",
     )
 
     topo_parser = subparsers.add_parser(
@@ -878,6 +906,12 @@ def main() -> None:
             min_len=args.min_len,
             max_len=args.max_len,
             min_alpha_ratio=args.min_alpha_ratio,
+            min_df=args.min_df,
+            nlp_backend=args.nlp_backend,
+            entity_type_scoring=args.entity_type_scoring,
+            wikidata_cache_dir=args.wikidata_cache_dir,
+            lexicon_path=args.lexicon_path,
+            lexicon_weight=args.lexicon_weight,
         )
         print(f"Rescue diagnostics: {args.diagnostics}")
     elif args.command == "topology":

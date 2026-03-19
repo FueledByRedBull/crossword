@@ -44,6 +44,38 @@ def _is_connected(grid: list[list[str]]) -> bool:
     return len(visited) == len(whites)
 
 
+def _has_orphan_white_cells(grid: list[list[str]], *, min_slot_len: int) -> bool:
+    size = len(grid)
+    for r in range(size):
+        for c in range(size):
+            if grid[r][c] == "#":
+                continue
+
+            horizontal = 1
+            left = c - 1
+            while left >= 0 and grid[r][left] != "#":
+                horizontal += 1
+                left -= 1
+            right = c + 1
+            while right < size and grid[r][right] != "#":
+                horizontal += 1
+                right += 1
+
+            vertical = 1
+            up = r - 1
+            while up >= 0 and grid[up][c] != "#":
+                vertical += 1
+                up -= 1
+            down = r + 1
+            while down < size and grid[down][c] != "#":
+                vertical += 1
+                down += 1
+
+            if horizontal < min_slot_len and vertical < min_slot_len:
+                return True
+    return False
+
+
 class TopologyTests(unittest.TestCase):
     def test_extract_slots_open(self) -> None:
         template = get_templates(5)[0]
@@ -87,6 +119,11 @@ class TopologyTests(unittest.TestCase):
         slots = extract_slots(blocked["grid"], min_len=1)
         self.assertTrue(blocked["added_blocks"])
         self.assertTrue(all(slot["length"] <= 12 for slot in slots))
+
+    def test_auto_block_avoids_orphan_white_cells(self) -> None:
+        grid = [["." for _ in range(6)] for _ in range(6)]
+        blocked = auto_block_long_slots(grid, max_slot_len=5, min_slot_len=3, symmetric=False)
+        self.assertFalse(_has_orphan_white_cells(blocked["grid"], min_slot_len=3))
 
     # --- New template validation tests ---
 

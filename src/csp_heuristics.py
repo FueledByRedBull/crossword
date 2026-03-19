@@ -367,7 +367,12 @@ def run_template_trial(
     repair_steps: int,
 ) -> dict[str, Any]:
     grid = build_grid_fn(template)
-    auto_block = auto_block_long_slots_fn(grid, max_slot_len=max_word_len, symmetric=True)
+    auto_block = auto_block_long_slots_fn(
+        grid,
+        max_slot_len=max_word_len,
+        min_slot_len=effective_min_slot_len,
+        symmetric=True,
+    )
     grid = auto_block["grid"]
     slots = build_slots_fn(grid, min_len=effective_min_slot_len)
     domains = {slot.id: [word for word in words if len(word) == slot.length] for slot in slots}

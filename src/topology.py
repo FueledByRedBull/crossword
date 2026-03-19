@@ -241,6 +241,7 @@ def auto_block_long_slots(
     grid: list[list[str]],
     *,
     max_slot_len: int | None,
+    min_slot_len: int = 3,
     symmetric: bool = True,
     max_added_blocks: int = 64,
 ) -> dict:
@@ -268,14 +269,48 @@ def auto_block_long_slots(
             mirror = (size - 1 - cell[0], size - 1 - cell[1])
             if mirror != cell:
                 placements.append(mirror)
-        changed = False
+        changed: list[tuple[int, int]] = []
         for r, c in placements:
             if adjusted[r][c] == "#":
                 continue
             adjusted[r][c] = "#"
             added_blocks.add((r, c))
-            changed = True
-        return changed
+            changed.append((r, c))
+        if not changed:
+            return False
+
+        for r in range(size):
+            for c in range(size):
+                if adjusted[r][c] == "#":
+                    continue
+
+                horizontal = 1
+                left = c - 1
+                while left >= 0 and adjusted[r][left] != "#":
+                    horizontal += 1
+                    left -= 1
+                right = c + 1
+                while right < size and adjusted[r][right] != "#":
+                    horizontal += 1
+                    right += 1
+
+                vertical = 1
+                up = r - 1
+                while up >= 0 and adjusted[up][c] != "#":
+                    vertical += 1
+                    up -= 1
+                down = r + 1
+                while down < size and adjusted[down][c] != "#":
+                    vertical += 1
+                    down += 1
+
+                if horizontal < min_slot_len and vertical < min_slot_len:
+                    for rr, cc in changed:
+                        adjusted[rr][cc] = "."
+                        added_blocks.discard((rr, cc))
+                    return False
+
+        return True
 
     while len(added_blocks) < max_added_blocks:
         long_slots = [

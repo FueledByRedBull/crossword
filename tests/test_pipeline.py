@@ -351,6 +351,41 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('"unfilled_slots"', grid_payload)
         shutil.rmtree(terms_path.parent, ignore_errors=True)
 
+    def test_csp_use_rust_fails_loudly_when_backend_missing(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "csp_missing_rust"
+        diagnostics_path = tmp_dir / "diagnostics_csp.json"
+        grid_path = tmp_dir / "grid.json"
+        terms_path = tmp_dir / "terms.csv"
+
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        terms_path.write_text(
+            "answer,normalized_answer,length,source_method,lead_bold_signal,source_titles,doc_frequency\nCAT,CAT,3,spacy,False,Test,1\n",
+            encoding="utf-8",
+        )
+
+        with patch("src.pipeline.load_rust_csp", return_value=(None, "rust_solver_missing_entrypoint")):
+            result = run_csp_solve_stage(
+                seed_title="Test",
+                lang="en",
+                terms_path=terms_path,
+                diagnostics_path=diagnostics_path,
+                grid_path=grid_path,
+                size=5,
+                min_slot_len=3,
+                template_name="open",
+                max_steps=100,
+                require_gate=False,
+                use_rust=True,
+            )
+
+        self.assertFalse(result.diagnostics["solved"])
+        self.assertEqual(result.diagnostics["solver_backend"], "rust")
+        self.assertIn("rust_solver_missing_entrypoint", result.diagnostics["errors"])
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
     def test_quality_gate_accepts_strong_partial_fill(self) -> None:
         passed, reasons = evaluate_quality_gate(
             fill_percent=0.85,
@@ -499,7 +534,7 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("passed", result)
         self.assertFalse(result["passed"])
 
-    def test_clue_stage_adds_fallback_without_revid(self) -> None:
+    def test_clue_stage_leaves_missing_clue_unfilled_without_placeholder(self) -> None:
         tmp_dir = Path("tests") / "tmp_outputs" / "clue_fallback_missing_revid"
         terms_path = tmp_dir / "terms.csv"
         clues_path = tmp_dir / "clues.csv"
@@ -530,11 +565,112 @@ class PipelineTests(unittest.TestCase):
                 clues_path=clues_path,
             )
 
-        self.assertEqual(result.diagnostics["clue_count"], 1)
-        self.assertEqual(result.diagnostics["fallback_template_added"], 1)
-        self.assertEqual(result.diagnostics["template_fallback_clue_count"], 1)
+        self.assertEqual(result.diagnostics["clue_count"], 0)
+        self.assertEqual(result.diagnostics["fallback_template_added"], 0)
+        self.assertEqual(result.diagnostics["fallback_template_failed"], 1)
         clue_payload = clues_path.read_text(encoding="utf-8")
-        self.assertIn("template_fallback", clue_payload)
+        self.assertNotIn("Theme-related entry from the selected source article.", clue_payload)
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_candidate_scoring_escapes_titles_in_csv(self) -> None:
+        output_path = Path("tests") / "tmp_outputs" / "scores_quoted.csv"
+        diagnostics_path = Path("tests") / "tmp_outputs" / "diagnostics_scores_quoted.json"
+        cache_dir = Path("tests") / "tmp_cache_pipeline_scores_quoted"
+
+        if output_path.parent.exists():
+            shutil.rmtree(output_path.parent, ignore_errors=True)
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+
+        mocked_seed = SimpleNamespace(
+            diagnostics={
+                "candidates": [
+                    {"title": 'Alpha, "quoted" topic', "depth": 1, "links_back_to_seed": True},
+                ],
+                "errors": [],
+            },
+            diagnostics_path=diagnostics_path,
+        )
+
+        with (
+            patch("src.pipeline.run_seed_ingestion_stage", return_value=mocked_seed),
+            patch(
+                "src.pipeline.WikiClient.fetch_page_extract",
+                return_value={"extract": "Alpha quoted topic reference text"},
+            ),
+            patch("src.pipeline.WikiClient.fetch_lead_wikitext", return_value={"wikitext": ""}),
+        ):
+            run_candidate_scoring_stage(
+                seed_title="Seed",
+                lang="en",
+                cache_dir=cache_dir,
+                diagnostics_path=diagnostics_path,
+                scores_path=output_path,
+            )
+
+        import csv
+
+        with output_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+        self.assertEqual(rows[0]["title"], 'Alpha, "quoted" topic')
+
+        shutil.rmtree(output_path.parent, ignore_errors=True)
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+    def test_rescue_ladder_preserves_term_extraction_configuration(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "rescue_config_passthrough"
+        selected_path = tmp_dir / "selected_candidates.json"
+        diagnostics_path = tmp_dir / "diagnostics_rescue.json"
+
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        selected_path.write_text(
+            json.dumps(
+                {
+                    "seed_title": "Thermodynamics",
+                    "lang": "en",
+                    "selected_k": 1,
+                    "selected_titles": ["Entropy"],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        term_result = SimpleNamespace(
+            terms_path=tmp_dir / "answer_candidates.csv",
+            diagnostics_path=tmp_dir / "diagnostics_terms.json",
+            terms=[],
+            diagnostics={},
+        )
+
+        with patch("src.pipeline.run_term_extraction_stage", return_value=term_result) as mocked_terms:
+            result = run_rescue_ladder(
+                seed_title="Thermodynamics",
+                lang="en",
+                cache_dir="data/cache/wiki",
+                selected_path=selected_path,
+                terms_path=tmp_dir / "answer_candidates.csv",
+                diagnostics_path=diagnostics_path,
+                min_df=3,
+                nlp_backend="nltk",
+                entity_type_scoring=True,
+                wikidata_cache_dir="data/cache/wikidata",
+                lexicon_path="data/lexicon/combined_wordfreq.txt",
+                lexicon_weight=0.22,
+            )
+
+        self.assertFalse(result["passed"])
+        first_call = mocked_terms.call_args_list[0].kwargs
+        second_call = mocked_terms.call_args_list[1].kwargs
+        self.assertEqual(first_call["min_df"], 3)
+        self.assertEqual(first_call["nlp_backend"], "nltk")
+        self.assertTrue(first_call["entity_type_scoring"])
+        self.assertEqual(first_call["lexicon_weight"], 0.22)
+        self.assertEqual(second_call["min_df"], 1)
+        self.assertEqual(second_call["nlp_backend"], "nltk")
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

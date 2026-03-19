@@ -1,5 +1,7 @@
 # Wikipedia-Seeded Thematic Crossword Generator
 
+This document is target scope and backlog, not a statement that every item below is implemented or continuously validated today.
+
 ## 1. Goal and Scope
 
 Build an end-to-end system that generates coherent, educational crossword puzzles from a single Wikipedia seed article (example: `Thermodynamics`) by:

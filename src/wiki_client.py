@@ -50,7 +50,7 @@ class WikiClient:
         if cached is not None:
             return cached
         if self.offline:
-            return {}
+            raise RuntimeError(f"offline_cache_miss:{endpoint}")
 
         query = urlencode({k: v for k, v in params.items() if v is not None}, doseq=True)
         request = Request(

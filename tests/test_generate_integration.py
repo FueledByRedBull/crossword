@@ -2,15 +2,12 @@ import json
 import os
 import shutil
 import unittest
-from importlib import import_module
 from pathlib import Path
 
 from src.pipeline import run_generate_pipeline
+from src.rust_backend import load_rust_csp
 
-try:
-    rust_csp = import_module("rust_csp")
-except Exception:
-    rust_csp = None
+rust_csp, _ = load_rust_csp()
 
 
 class GenerateIntegrationTests(unittest.TestCase):

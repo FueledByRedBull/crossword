@@ -59,6 +59,7 @@ from .topology import (
     select_best_template,
 )
 from .wiki_client import WikiClient
+from .rust_backend import load_rust_csp
 
 
 @dataclass
@@ -1049,15 +1050,38 @@ def run_candidate_scoring_stage(
         )
 
     Path(scores_path).parent.mkdir(parents=True, exist_ok=True)
-    with Path(scores_path).open("w", encoding="utf-8") as handle:
-        handle.write(
-            "rank,title,depth,links_back_to_seed,rel_score,lexicon_score,red_score,selection_score,status,reason\n"
+    import csv
+
+    with Path(scores_path).open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "rank",
+                "title",
+                "depth",
+                "links_back_to_seed",
+                "rel_score",
+                "lexicon_score",
+                "red_score",
+                "selection_score",
+                "status",
+                "reason",
+            ]
         )
         for row in scored_rows:
-            handle.write(
-                f"{row['rank']},\"{row['title']}\",{row['depth']},{row['links_back_to_seed']},"
-                f"{row['rel_score']},{row['lexicon_score']},{row['red_score']},{row['selection_score']},"
-                f"{row['status']},{row['reason']}\n"
+            writer.writerow(
+                [
+                    row["rank"],
+                    row["title"],
+                    row["depth"],
+                    row["links_back_to_seed"],
+                    row["rel_score"],
+                    row["lexicon_score"],
+                    row["red_score"],
+                    row["selection_score"],
+                    row["status"],
+                    row["reason"],
+                ]
             )
 
     lexicon_hits = sum(1 for score in title_lexicon_scores if score > 0.0)
@@ -1746,6 +1770,12 @@ def run_rescue_ladder(
     min_len: int = 4,
     max_len: int = 12,
     min_alpha_ratio: float = 0.8,
+    min_df: int = 2,
+    nlp_backend: str = "auto",
+    entity_type_scoring: bool = False,
+    wikidata_cache_dir: str | Path = "data/cache/wikidata",
+    lexicon_path: str | Path | None = "data/lexicon/combined_wordfreq.txt",
+    lexicon_weight: float = 0.15,
 ) -> dict:
     errors: list[str] = []
     steps = []
@@ -1783,6 +1813,11 @@ def run_rescue_ladder(
             max_len=max_len,
             min_alpha_ratio=min_alpha_ratio,
             min_df=min_df_value,
+            nlp_backend=nlp_backend,
+            entity_type_scoring=entity_type_scoring,
+            wikidata_cache_dir=wikidata_cache_dir,
+            lexicon_path=lexicon_path,
+            lexicon_weight=lexicon_weight,
         )
 
     selected_titles = _load_selected_titles(Path(selected_path))
@@ -1799,7 +1834,7 @@ def run_rescue_ladder(
         final_diagnostics = write_json(diagnostics_path, diagnostics)
         return {"passed": False, "diagnostics": diagnostics, "diagnostics_path": final_diagnostics}
 
-    result = _run_terms(min_df_value=2, min_len_value=min_len)
+    result = _run_terms(min_df_value=min_df, min_len_value=min_len)
     gate = evaluate_vocab_gate(len(result.terms), min_required=gate_min, max_allowed=gate_max)
     if gate.passed:
         diagnostics = {
@@ -2136,7 +2171,6 @@ def run_clue_extraction_stage(
 
     fallback_template_added = 0
     fallback_template_failed = 0
-    fallback_text = "Theme-related entry from the selected source article."
     for key in unique_term_keys:
         if key in final_by_key:
             continue
@@ -2145,32 +2179,9 @@ def run_clue_extraction_stage(
             fallback_template_failed += 1
             continue
         source_titles = [title for title in term["source_titles"].split("|") if title]
-        fallback_title = ""
-        fallback_revid = None
         for title in source_titles:
-            payload = load_source_payload(title)
-            if not fallback_title:
-                fallback_title = payload.get("title", title) or title
-            if fallback_revid is None:
-                fallback_revid = payload.get("revid")
-            if fallback_title and fallback_revid:
-                break
-        if not fallback_title:
-            fallback_template_failed += 1
-            continue
-        final_by_key[key] = {
-            "answer": term["answer"],
-            "normalized_answer": term.get("normalized_answer") or key,
-            "clue": fallback_text,
-            "clue_score": 0.05,
-            "clue_class": "template_fallback",
-            "source_method": term.get("source_method") or "template_fallback",
-            "source_page": fallback_title,
-            "revid": fallback_revid,
-            "sentence_offset": -1,
-            "oldid_url": build_oldid_url(fallback_title, fallback_revid, lang=lang),
-        }
-        fallback_template_added += 1
+            load_source_payload(title)
+        fallback_template_failed += 1
 
     clues: list[dict] = []
     seen_keys: set[str] = set()
@@ -2682,12 +2693,12 @@ def run_csp_solve_stage(
             return 1
         return 0
 
-    import os
-
     solver_backend = "python"
     solver = solve_crossword
     use_rust_solver = use_rust
     if use_rust_solver is None:
+        import os
+
         use_rust_solver = os.getenv("CROSSWORD_USE_RUST", "").strip().lower() in {
             "1",
             "true",
@@ -2695,13 +2706,25 @@ def run_csp_solve_stage(
             "on",
         }
     if use_rust_solver:
-        try:
-            import rust_csp
-
-            solver = rust_csp.solve_crossword
-            solver_backend = "rust"
-        except Exception as exc:
-            errors.append(f"rust_solver_unavailable:{exc}")
+        rust_module, rust_error = load_rust_csp()
+        if rust_module is None:
+            errors.append(rust_error or "rust_solver_unavailable")
+            diagnostics = {
+                "stage": "csp_solve",
+                "lang": lang,
+                "seed_title": seed_title,
+                "solved": False,
+                "solver_backend": "rust",
+                "errors": errors,
+            }
+            final_diagnostics = write_json(diagnostics_path, diagnostics)
+            return SolveStageResult(
+                grid_path=Path(grid_path),
+                diagnostics_path=final_diagnostics,
+                diagnostics=diagnostics,
+            )
+        solver = rust_module.solve_crossword
+        solver_backend = "rust"
 
     template_trials_log: list[dict] = []
     best_trial: dict | None = None
@@ -3537,6 +3560,12 @@ def run_generate_pipeline(
             min_len=min_len,
             max_len=max_len,
             min_alpha_ratio=min_alpha_ratio,
+            min_df=min_df,
+            nlp_backend=nlp_backend,
+            entity_type_scoring=entity_type_scoring,
+            wikidata_cache_dir=wikidata_cache_dir,
+            lexicon_path=lexicon_path,
+            lexicon_weight=term_lexicon_weight,
         )
         if selected_rescue_path.exists():
             selected_for_package = selected_rescue_path

@@ -1,18 +1,22 @@
 import unittest
-from importlib import import_module
 from pathlib import Path
 import shutil
+from unittest.mock import patch
 
 from src.crossword_csp import build_slots, render_grid, solve_crossword
 from src.csp_heuristics import build_solver_vocabulary
+from src.rust_backend import load_rust_csp
 
-try:
-    rust_csp = import_module("rust_csp")
-except Exception:
-    rust_csp = None
+rust_csp, rust_csp_error = load_rust_csp()
 
 
 class CspTests(unittest.TestCase):
+    def test_load_rust_csp_requires_callable_solver(self) -> None:
+        with patch("src.rust_backend.import_module", return_value=object()):
+            module, error = load_rust_csp()
+        self.assertIsNone(module)
+        self.assertEqual(error, "rust_solver_missing_entrypoint")
+
     def test_solve_small_grid(self) -> None:
         # 5×5 grid with solid black rows at rows 2 — creates 4 across slots of
         # length 5 (rows 0,1,3,4) and 2 down slots of length 2 (pruned) + 5
@@ -143,7 +147,7 @@ class CspTests(unittest.TestCase):
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    @unittest.skipIf(rust_csp is None, "rust_csp is not installed")
+    @unittest.skipIf(rust_csp is None, rust_csp_error or "rust_csp is not installed")
     def test_rust_solver_matches_python_on_branching_fixture(self) -> None:
         grid = [
             [".", "."],
@@ -166,7 +170,7 @@ class CspTests(unittest.TestCase):
         self.assertEqual(len(rust_result["assignments"]), len(python_result["assignments"]))
         self.assertEqual(len(rust_result["assignments"]), len(slots))
 
-    @unittest.skipIf(rust_csp is None, "rust_csp is not installed")
+    @unittest.skipIf(rust_csp is None, rust_csp_error or "rust_csp is not installed")
     def test_rust_solver_matches_python_on_scored_single_slot(self) -> None:
         grid = [
             [".", ".", "."],
