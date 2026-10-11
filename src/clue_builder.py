@@ -15,7 +15,7 @@ def _fold(word: str) -> str:
 
 # No split after initials or common abbreviations ("John F. Kennedy", "Charles Mingus Jr.", "300 π.Χ.").
 _SENTENCE_END = re.compile(
-    r"(?<=[.!?])(?<!\b[^\W\d_]\.)(?<!\bJr\.)(?<!\bSr\.)(?<!\bSt\.)(?<!\bDr\.)(?<!\bMr\.)(?<!\bVol\.)\s+"
+    r"(?<=[.!?])(?<!\b[^\W\d_]\.)(?<!\bJr\.)(?<!\bSr\.)(?<!\bSt\.)(?<!\bDr\.)(?<!\bMr\.)(?<!\bVol\.)(?<!\bvs\.)\s+"
 )
 
 
@@ -191,6 +191,8 @@ class _Words(NamedTuple):
     genitive_endings: tuple[str, ...]
     outside: re.Pattern[str]
     articles: frozenset[str]
+    # The words that join the last item of a list, as written: folded, the Greek "ή" (or) is the article "η".
+    coordinators: frozenset[str]
     # How an answer's last word occurs in the subject: its last `stem_trim` letters may differ, then `endings`.
     stem_trim: int
     endings: str
@@ -241,6 +243,7 @@ _EN = _Words(
     genitive_endings=(),
     outside=re.compile(r"\b(?:the (?:former|latter|following)|(?:doing|did|does) so|likewise)\b"),
     articles=frozenset(),
+    coordinators=frozenset({"and", "or"}),
     stem_trim=0,
     endings=r"(?:e?s)?",
 )
@@ -302,6 +305,7 @@ _EL = _Words(
         r"\b(?:ακολουθ(?:ος|η|ο|οι|ες|α|ου|ης|ων|ους|ον)|παρακατω|(?:ο|η|το) πρωτ\w+\b.*\b(?:ο|η|το) δευτερ\w+)\b"
     ),
     articles=_words(_EL_ARTICLE),
+    coordinators=frozenset({"και", "κι", "ή"}),
     stem_trim=2,
     endings=r"\w{0,3}",
 )
@@ -450,6 +454,14 @@ def _clean_prefix(words: list[str], limit: int, lex: _Words, nlp=None) -> list[s
         if _fold(words[start - 1].strip(",;:")) not in lex.weak_end:
             return None if nlp is not None and _ends_in_nationality(words[:start], nlp) else words[:start]
     return None
+
+
+def lead_subject(lead: str, *, lang: str = "en") -> str:
+    """The words of a lead before its copula, parentheses and all: "Oscar-Claude Monet (1840 – 1926)"."""
+    lex = _WORDS[lang]
+    words = lead.split()
+    copula = next((i for i, word in enumerate(words) if i and _fold(word) in lex.copulas), len(words))
+    return " ".join(words[:copula])
 
 
 def _subject_tail(subject: str, answer: str, lex: _Words) -> str | None:
@@ -717,7 +729,7 @@ _PART_OF_A_NAME = re.compile(
 )
 
 
-def _blank_is_part_of_a_name(sentence: str) -> bool:
+def blank_is_part_of_a_name(sentence: str) -> bool:
     """True when a blank is followed by a capitalised word, or preceded by one that does not open the sentence."""
     return any(m.start() > 0 or m.group().startswith(BLANK) for m in _PART_OF_A_NAME.finditer(sentence.strip()))
 
@@ -732,7 +744,7 @@ _BACK_REFERENCES = {
     "and", "but", "or", "so", "yet", "nor", "now", "then", "thus", "hence", "therefore", "however", "also",
     "moreover", "furthermore", "meanwhile", "instead", "consequently", "similarly", "likewise",
     "αυτος", "αυτη", "αυτο", "αυτοι", "αυτες", "αυτα", "αυτου", "αυτης", "αυτων", "εκεινος", "εκεινη", "εκεινο",
-    "και", "αλλα", "ομως", "ωστοσο", "ετσι", "επισης", "επομενως", "τοτε", "επιπλεον", "ουτε",
+    "και", "αλλα", "ομως", "ωστοσο", "ετσι", "επισης", "επομενως", "τοτε", "επιπλεον", "ουτε", "προκειται",
 }
 
 
@@ -784,6 +796,152 @@ def _outside_reference(clue: str, nlp, lang: str) -> str | None:
     return None
 
 
+# "A, B, C etc.": the abbreviation closes a list as "and others" does. Folded, without the full stops of "κ.ά.".
+_ET_CETERA = {"etc", "κλπ", "κτλ", "κα"}
+# A list item between two commas has at most this many words: a longer stretch is a clause or an apposition.
+_MAX_LIST_ITEM_WORDS = 3
+# A blank with one of these relations is part of an item ("____ drumming"), and an item with such a child says more
+# than the blank does ("integrated ____"): not every item of the list fits it.
+_MODIFIES_A_NOUN = {"amod", "compound", "poss", "nummod"}
+_ITEM_MODIFIERS = _MODIFIES_A_NOUN | {"nmod", "acl", "relcl", "acl:relcl"}
+
+
+def _list_stretches(words: list[str], lex: _Words) -> tuple[list[tuple[int, int]], list[str]]:
+    """Split a sentence at its commas and coordinators.
+
+    Returns the stretches of words between them as (start, end) and what follows each: "," for a comma, "&" for a
+    coordinator, ",&" for both ("A, and B"), "" where a list cannot go on (other punctuation, the end of the
+    sentence). "etc." is a coordinator and a last item in one.
+    """
+    stretches: list[tuple[int, int]] = []
+    after: list[str] = []
+    start = 0
+    for i, word in enumerate(words):
+        bare = word.strip(_PUNCTUATION)
+        et_cetera = "." in word and _fold(bare).replace(".", "") in _ET_CETERA or _fold(bare) == "etc"
+        last = word.rstrip("\"')»”")[-1:]
+        if bare.lower() in lex.coordinators or et_cetera:
+            if i > start:
+                stretches.append((start, i))
+                after.append("&")
+            elif after and after[-1] == ",":
+                after[-1] = ",&"
+            start = i + 1
+            if et_cetera:
+                stretches.append((i, start))
+                after.append("")
+        elif (last and last in ",;:.!?") or not bare.strip("-–—"):  # a dash on its own ends a stretch as well
+            stretches.append((start, i + 1))
+            after.append("," if last == "," else "")
+            start = i + 1
+    if start < len(words):
+        stretches.append((start, len(words)))
+        after.append("")
+    if after:
+        after[-1] = ""
+    return stretches, after
+
+
+def _list_around_blank(words: list[str], lex: _Words) -> int | None:
+    """The number of commas in the list of three or more items that every blank is an item of, or None.
+
+    The blank has to be a whole item: "Egypt, ____ and Tunisia", "led by ____, Dizzy Gillespie, Thelonious Monk and
+    others", "pressure, temperature, and ____", but not "____ oil and wine" or "Sissle and ____'s Shuffle Along".
+    Items between two commas are short, a coordinator closes the list, and a stretch that opens on a preposition
+    the blank does not have ("In 1860, Monet and ____") or is one linking word ("however") is no item.
+    """
+    stretches, after = _list_stretches(words, lex)
+    function = lex.determiners | lex.prepositions
+
+    def size(j: int) -> int:
+        return stretches[j][1] - stretches[j][0]
+
+    def opener(j: int) -> str:
+        return _fold(words[stretches[j][0]].strip(_PUNCTUATION)) if 0 <= j < len(stretches) else ""
+
+    def aside(j: int, preposition: str | None) -> bool:
+        short_adverbial = size(j) <= _MAX_LIST_ITEM_WORDS and opener(j) in lex.prepositions
+        return (size(j) == 1 and opener(j) in _BACK_REFERENCES) or (short_adverbial and opener(j) != preposition)
+
+    def items_before(i: int, preposition: str | None) -> int:
+        """Items of the list before stretch `i`, each of them followed by a comma."""
+        count = 0
+        while i > 0 and after[i - 1] == "," and not aside(i - 1, preposition):
+            short = size(i - 1) <= _MAX_LIST_ITEM_WORDS
+            # A short stretch after a coordinator closes another list, a long one between commas is a clause or an
+            # apposition. Any other long stretch ends in the first item of this list.
+            if i > 1 and ("&" in after[i - 2] if short else after[i - 2] == ","):
+                break
+            count += 1
+            i -= 1
+            if not short:
+                break
+        return count
+
+    found = None
+    for k, (start, end) in enumerate(stretches):
+        for b in range(start, end):
+            if BLANK not in words[b]:
+                continue
+            if words[b].strip(_PUNCTUATION) != BLANK:
+                return None
+            lead = [_fold(word.strip(_PUNCTUATION)) for word in words[start:b]]
+            own = len(lead) - next((n for n, word in enumerate(reversed(lead)) if word not in function), len(lead))
+            whole = own == 0  # nothing but "the" or "με την" before the blank
+            preposition = next((word for word in lead[own:] if word in lex.prepositions), None)
+            # "Most often, in ____, mass and energy ...": with a preposition all to itself the blank is an adverbial.
+            if whole and preposition and preposition not in (opener(k - 1), opener(k + 1)):
+                return None
+            items = commas = 0
+            if k and "&" in after[k - 1] and whole:  # the last item: "A, B and ____"
+                more = items_before(k - 1, preposition) if size(k - 1) <= _MAX_LIST_ITEM_WORDS else 0
+                items, commas = 2 + more, int("," in after[k - 1]) + more
+            elif b == end - 1 and after[k]:  # the first item or one in the middle: "____, B and C", "A, ____, C and D"
+                j, items, closed = k, 1, False
+                while after[j] and not closed and not aside(j + 1, preposition):
+                    items += 1
+                    commas += int("," in after[j])
+                    closed = "&" in after[j]
+                    j += 1
+                    if size(j) > _MAX_LIST_ITEM_WORDS:
+                        break
+                if not closed:
+                    return None
+                more = items_before(k, preposition) if whole else 0
+                items, commas = items + more, commas + more
+            if items < 3:
+                return None
+            found = commas if found is None else min(found, commas)
+    return found
+
+
+def _blank_is_one_of_a_list(sentence: str, answer: str, nlp, lang: str) -> bool:
+    """True when the answer is one item of a list of three or more in its sentence: any of the others would fit.
+
+    Two commas and a coordinator ("R&B, ____, and pop music", "τη Φυσική, ____, Μεταλλουργία, Βιολογία κλπ.") make a
+    list. One comma ("Egypt, ____ and Tunisia") reads the same as "two concepts, ____ and entropy": that is a list
+    only when the parser coordinates the answer with two other words, so without `nlp` it is not counted. The parser
+    also shows an apposition ("His son, ____, conquered Jerusalem and Masada.") and an item that says more than the
+    blank ("integrated ____, machine vision, and ..."), which stay clues.
+    """
+    commas = _list_around_blank(mask_answer(sentence, answer).split(), _WORDS[lang])
+    if commas is None:
+        return False
+    if nlp is None:
+        return commas >= 2
+    doc = nlp(sentence)
+    for match in answer_pattern(answer).finditer(sentence):
+        span = [token for token in doc if match.start() <= token.idx < match.end()]
+        head = next((token for token in span if token.head == token or token.head not in span), None)
+        if head is None:
+            continue
+        if head.dep_ in _MODIFIES_A_NOUN or any(child.dep_ in _ITEM_MODIFIERS for child in head.children if child not in span):
+            return False
+        if (head.dep_ == "appos" and not head.conjuncts) or (commas < 2 and len(head.conjuncts) < 2):
+            return False
+    return True
+
+
 def clue_pass_validate(
     clue: str,
     answer: str,
@@ -812,7 +970,9 @@ def clue_pass_validate(
         return False
     if original_sentence and is_answer_subject(original_sentence, answer, nlp):
         return False
-    if require_blank and original_sentence and _blank_is_part_of_a_name(mask_answer(original_sentence, answer)):
+    if require_blank and original_sentence and blank_is_part_of_a_name(mask_answer(original_sentence, answer)):
+        return False
+    if require_blank and original_sentence and _blank_is_one_of_a_list(original_sentence, answer, nlp, lang):
         return False
     return True
 

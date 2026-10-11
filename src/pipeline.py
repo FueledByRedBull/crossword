@@ -26,13 +26,16 @@ from .term_extractor import (
     shape_penalty,
     crosswordability_score,
     term_frequency_across_docs,
+    title_short_name,
     title_to_answer,
 )
 from .layout import Placement, build_layout, layout_metrics, number_placements, validate_layout
 from .text_normalize import enumeration, strip_diacritics, tokenize
 from .vocab_gate import VocabGateResult, evaluate_vocab_gate
 from .clue_builder import (
+    BLANK,
     MAX_CLUE_WORDS,
+    blank_is_part_of_a_name,
     answer_pattern,
     clue_pass_mask_trim,
     clue_pass_validate,
@@ -40,6 +43,7 @@ from .clue_builder import (
     enforce_diversity,
     has_verb,
     is_generic_definition,
+    lead_subject,
     lead_word_counts,
     split_sentences,
     strip_trailing_sections,
@@ -368,10 +372,35 @@ def _plain_words(text: str) -> str:
     return " ".join(re.findall(r"\w+", strip_diacritics(text).casefold()))
 
 
-def _seed_mentions(title: str, seed_text: str, *, lang: str) -> int:
+def _name_mentions(name: str, text: str, *, part_of: tuple[str, ...] = (), mid_sentence: bool = False) -> int:
+    """Capitalised mentions of `name` that stand alone: outside the phrases `part_of` and next to no other
+    capitalised word ("Camille Pissarro" does not name "Camille").
+
+    With `mid_sentence` a mention that opens a sentence or a line does not count: any word has a capital there.
+    """
+    inside = [match.span() for phrase in part_of for match in answer_pattern(phrase).finditer(text)]
+    count = 0
+    for match in answer_pattern(name).finditer(text):
+        if not match.group()[0].isupper() or any(start <= match.start() < end for start, end in inside):
+            continue
+        before = split_sentences(text[max(0, match.start() - 300) : match.start()] + BLANK)[-1]
+        if blank_is_part_of_a_name(before + text[match.end() : match.end() + 3]):
+            continue
+        count += not (mid_sentence and before.rsplit("\n", 1)[-1].strip() == BLANK)
+    return count
+
+
+def _seed_mentions(title: str, seed_text: str, *, lang: str, intro: str = "") -> int:
+    """How often the seed article names the page. `intro`, the page's own, tells a proper name from a plain word."""
     phrase = _TITLE_DISAMBIGUATOR.sub("", title).strip()
     if lang != "el":
-        return len(answer_pattern(phrase).findall(seed_text))
+        pattern = answer_pattern(phrase)
+        own = [match for sentence in split_sentences(intro) for match in pattern.finditer(sentence)]
+        # A proper name is capitalised in mid-sentence and never in lower case on its own page ("Nature", the
+        # journal). Only a capitalised mention names it then: "the wave nature of light" does not.
+        if any(m.start() and m.group()[0].isupper() for m in own) and not any(m.group().islower() for m in own):
+            return _name_mentions(phrase, seed_text)
+        return len(pattern.findall(seed_text))
     # Greek inflects: each title word matches a text word that starts with its first max(4, len - 2) letters
     # and adds at most three more, so a stem is not a substring ("ύλη" is not "υλικό").
     stems = [word[: max(4, len(word) - 2)] for word in re.findall(r"\w+", strip_diacritics(phrase).casefold())]
@@ -448,17 +477,20 @@ def _collect_source_backed_clue_candidates(
     max_words: int,
     nlp: object | None,
     allow_fragments: bool = True,
+    full_name: str | None = None,
 ) -> list[dict]:
     """Fill-in candidates, complete sentences first, then the seed article's before other pages'.
 
     A fragment is a window that is not a whole sentence and not a single clause-boundary cut; the
-    term stage still counts them as support, a clue never uses one.
+    term stage still counts them as support, a clue never uses one. With `full_name` the answer is a
+    surname and the blank may stand for the whole name: "hired ____ as" from "hired Wayne Shorter as".
     """
     key = _answer_key(answer, normalized_answer, lang=lang)
     if not key:
         return []
 
     pattern = answer_pattern(answer)
+    named = answer_pattern(full_name) if full_name else None
     candidates: list[dict] = []
     seen: set[tuple[str, int, str]] = set()
     for title in source_titles:
@@ -467,6 +499,8 @@ def _collect_source_backed_clue_candidates(
         extract = payload.get("extract", "")
         revid = payload.get("revid")
         for sentence_offset, candidate_sentence in enumerate(split_sentences(extract)):
+            if named is not None:  # another person's name ("Alice Coltrane") stays, and still spoils the blank
+                candidate_sentence = named.sub(answer, candidate_sentence)
             if not pattern.search(candidate_sentence):
                 continue
             # Headings and link lists are glued to a sentence by line breaks; the clue is the line with the answer.
@@ -743,6 +777,7 @@ def run_candidate_scoring_stage(
     weights: dict[str, float] | None = None,
     lexicon_path: str | Path | None = "data/lexicon/combined_wordfreq.txt",
     lexicon_weight: float = 0.08,
+    max_len: int = 15,
 ) -> ScoringStageResult:
     weights = weights or {"a": 1.5, "b": 0.3, "c": 0.3, "d": 0.2}
     errors: list[str] = []
@@ -814,10 +849,11 @@ def run_candidate_scoring_stage(
     for candidate in candidates:
         title = candidate["title"]
         try:
-            extract = client.fetch_page_extract(title, intro_only=True).get("extract", "")
+            payload = client.fetch_page_extract(title, intro_only=True)
         except Exception as exc:  # pragma: no cover
-            extract = ""
+            payload = {}
             errors.append(f"candidate_extract_failed:{title}:{exc}")
+        extract = payload.get("extract", "")
         try:
             lead_wikitext = client.fetch_lead_wikitext(title).get("wikitext", "")
         except Exception as exc:  # pragma: no cover
@@ -831,7 +867,14 @@ def run_candidate_scoring_stage(
             _uses_seed_word(extract, seed_title, lang=lang, lexicon=lexicon)
             or _uses_seed_word(first_sentence, seed_title, lang=lang, lexicon=lexicon, derived=True)
         )
-        seed_mentions.append(_seed_mentions(title, seed_text, lang=lang))
+        if intro_on_topic[-1]:
+            seed_mentions.append(_seed_mentions(title, seed_text, lang=lang))
+        else:
+            # Only its mentions can admit this page, so they must be mentions of the answer itself: of the
+            # page's own title, not of a redirect to it ("axiomatic" for "Axiom"), and in the same sense.
+            page_title = payload.get("title") or title
+            named = page_title if title_to_answer(page_title, lang=lang, max_len=max_len) else title
+            seed_mentions.append(_seed_mentions(named, seed_text, lang=lang, intro=extract))
         term_answer_inventories.append(
             _extract_answer_inventory(
                 title=title,
@@ -1166,6 +1209,56 @@ def run_k_selection_stage(
 _MAX_ANSWER_POOL = 200
 
 
+# A page about a person opens with life dates or "born" in a parenthesis: "(1840 – 1926)", "(born 1946)",
+# "(138–78 BC)".
+_LIFE_DATES = re.compile(r"\(.*?(?:\bborn\b|\d[^()]*[\u2013\u2014][^()]*\d|\d-\d)")
+
+
+def _is_person(text: str, *, lang: str) -> bool:
+    return bool(_LIFE_DATES.search(lead_subject(text[:600], lang=lang)))
+
+
+def _seed_short_names(
+    intros: dict[str, str], seed_title: str, seed_text: str, *, lang: str, has_seed_fill_in
+) -> dict[str, tuple[str, str, int, bool]]:
+    """Pages the seed calls by the last word of their title: page title -> (display, normalized, mentions, person).
+
+    A person by the surname: "Monet" for "Claude Monet" when the seed names it alone at least twice. Of several
+    people with one surname, the one whose full name the seed uses more often than all the others' together
+    takes it; with no such person ("Williams") nobody does.
+
+    Any other page by a word the seed uses as a proper name, capitalised in mid-sentence and alone at least twice:
+    "Chicago" for "Music of Chicago", not "Rhythm" for "I Got Rhythm". The seed's sentence is its only clue, so
+    `has_seed_fill_in` must find one. Of the pages that end in the word the best-scored answers with it; `intros`
+    lists the best first. A surname, another page's own title and a word of the seed title are not free.
+    """
+    people: dict[str, list[tuple[str, tuple[str, str]]]] = {}
+    others: dict[str, list[tuple[str, tuple[str, str]]]] = {}
+    for title, intro in intros.items():
+        pair = title_short_name(title, lang=lang)
+        if pair and title != seed_title:
+            (people if _is_person(intro, lang=lang) else others).setdefault(pair[1], []).append((title, pair))
+    names = {}
+    for rivals in people.values():
+        phrases = {title: _TITLE_DISAMBIGUATOR.sub("", title).strip() for title, _ in rivals}
+        named = {title: len(answer_pattern(phrase).findall(seed_text)) for title, phrase in phrases.items()}
+        for title, pair in rivals:
+            if len(rivals) == 1 or 2 * named[title] > sum(named.values()):
+                mentions = _name_mentions(pair[0], seed_text, part_of=(phrases[title],))
+                if mentions >= 2:
+                    names[title] = (*pair, mentions, True)
+    taken = set(people) | {pair[1] for title in intros if (pair := title_to_answer(title, lang=lang))}
+    for normalized, pages in others.items():
+        title, pair = pages[0]
+        if normalized in taken or _shared_words(pair[0]) & _shared_words(seed_title):
+            continue
+        phrases = tuple(_TITLE_DISAMBIGUATOR.sub("", page).strip() for page, _ in pages)
+        mentions = _name_mentions(pair[0], seed_text, part_of=phrases, mid_sentence=True)
+        if mentions >= 2 and has_seed_fill_in(*pair):
+            names[title] = (*pair, mentions, False)
+    return names
+
+
 def _build_title_answer_rows(
     *,
     seed_title: str,
@@ -1177,6 +1270,7 @@ def _build_title_answer_rows(
     max_len: int,
     max_title_answers: int,
     errors: list[str],
+    nlp: object | None = None,
 ) -> list[dict]:
     """Primary answer pool: titles of the most relevant linked articles, each backed by its own intro.
 
@@ -1200,40 +1294,89 @@ def _build_title_answer_rows(
     scored = [item[:4] for item in all_rows if item[4]]
     on_topic_intros = {title for title, _, intro_on_topic, _, _ in all_rows if intro_on_topic}
     best_rel = max((item[1] for item in scored), default=0.0)
-    # The cap keeps the titles with the most evidence, in the order the answers are scored by (minus the penalty).
-    scored.sort(key=lambda item: item[1] + 0.1 * min(item[3], 10) + (0.5 if item[2] else 0.0), reverse=True)
 
-    rows: list[dict] = []
-    seen: set[str] = set()
-    seen_intros: set[str] = set()
     _prefetch(errors, client.prefetch_intro_extracts, [seed_title, *(title for title, *_ in scored)])
+    pages: list[list] = []  # link title, relevance, intro on topic, seed mentions, page title, intro
     # The seed names itself, so it earns the full bonus.
     for title, rel_score, intro_on_topic, seed_mentions in [(seed_title, best_rel, True, 10), *scored]:
-        if len(rows) >= max_title_answers:
-            break
         try:
             payload = client.fetch_page_extract(title, intro_only=True)
         except Exception as exc:
             errors.append(f"title_answer_extract_failed:{title}:{exc}")
             continue
-        intro = (payload.get("extract") or "").strip()
-        # A redirect ("Big bands") is named after the page it leads to, unless that title is no answer ("Hugh Everett").
+        # A redirect ("Big bands") is named after the page it leads to.
         page_title = title if title == seed_title else payload.get("title") or title
-        pair = title_to_answer(page_title, lang=lang, max_len=max_len) or title_to_answer(
-            title, lang=lang, max_len=max_len
+        intro = (payload.get("extract") or "").strip()
+        pages.append([title, rel_score, intro_on_topic, seed_mentions, page_title, intro])
+
+    def evidence(page: list) -> tuple[bool, float]:
+        return page[0] == seed_title, page[1] + 0.1 * min(page[3], 10) + (0.5 if page[2] else 0.0)
+
+    pages.sort(key=evidence, reverse=True)
+    short_names: dict[str, tuple[str, str, int, bool]] = {}
+    if lang == "en":  # Greek names inflect: the seed rarely writes the title's own form
+        seed_payload = _fetch_extract_with_revid(client, seed_title, full=True)
+
+        def has_seed_fill_in(display: str, normalized: str) -> bool:
+            fills = _collect_source_backed_clue_candidates(
+                answer=display,
+                normalized_answer=normalized,
+                source_titles=[seed_title],
+                source_payloads={seed_title: seed_payload},
+                seed_title=seed_title,
+                term_source_method="article_title",
+                lang=lang,
+                min_words=6,
+                max_words=12,
+                nlp=nlp,
+                allow_fragments=False,
+            )
+            return any(nlp is None or has_verb(row["clue"], nlp) for row in fills)
+
+        short_names = _seed_short_names(
+            {page[4]: page[5] for page in pages},
+            seed_title,
+            seed_payload["extract"],
+            lang=lang,
+            has_seed_fill_in=has_seed_fill_in,
         )
-        # A second title for the same page is skipped.
+    for page in pages:
+        if page[4] in short_names:
+            page[3] = short_names[page[4]][2]  # the mentions of the answer itself
+    # The cap keeps the titles with the most evidence, in the order the answers are scored by (minus the penalty).
+    pages.sort(key=evidence, reverse=True)
+
+    owners = {name[1]: page for page, name in short_names.items()}  # "Monet" is the painter, not "Monet (crater)"
+    rows: list[dict] = []
+    seen: set[str] = set()
+    seen_intros: set[str] = set()
+    for title, rel_score, intro_on_topic, seed_mentions, page_title, intro in pages:
+        if len(rows) >= max_title_answers:
+            break
+        # The seed's short name for the page, else the page's title, else the redirect's when that is no answer
+        # ("Hugh Everett").
+        pair = (
+            short_names[page_title][:2]
+            if page_title in short_names
+            else title_to_answer(page_title, lang=lang, max_len=max_len)
+            or title_to_answer(title, lang=lang, max_len=max_len)
+        )
+        # A second title for the same page is skipped, and so is another page under a person's surname.
         if pair is None or pair[1] in seen or not intro or intro in seen_intros:
+            continue
+        if owners.get(pair[1], page_title) != page_title:
             continue
         display, normalized = pair
         seen.add(normalized)
         seen_intros.add(intro)
         pattern = answer_pattern(display)
-        # A selected article the seed merely names is no source for other answers' fill-ins.
+        # A selected article the seed merely names is no source for other answers' fill-ins, and a short name
+        # of a page that is no person takes them from the seed alone.
+        seed_only = page_title in short_names and not short_names[page_title][3]
         mentioning = [
             other
             for other, text in extracts.items()
-            if other != page_title and other in on_topic_intros and pattern.search(text)
+            if other != page_title and other in on_topic_intros and pattern.search(text) and not seed_only
         ]
         source_titles = [page_title, *([seed_title] if seed_mentions and title != seed_title else []), *mentioning]
         lexicon_score = lexicon_score_for_token(normalized, lexicon)
@@ -1268,6 +1411,7 @@ def _build_title_answer_rows(
                 "shape_penalty": round(shape_penalty(normalized), 4),
                 "answer_score": round(score, 4),
                 "intro_on_topic": intro_on_topic,
+                "page_is_person": _is_person(intro, lang=lang),
             }
         )
     return rows
@@ -1540,6 +1684,7 @@ def run_term_extraction_stage(
             max_len=max_len,
             max_title_answers=max_title_answers,
             errors=errors,
+            nlp=nlp,
         )
         if scores_path is not None
         else []
@@ -1593,6 +1738,7 @@ def run_term_extraction_stage(
                 "shape_penalty",
                 "answer_score",
                 "intro_on_topic",
+                "page_is_person",
             ]
         )
         for row in filtered_terms:
@@ -1620,6 +1766,7 @@ def run_term_extraction_stage(
                     row["shape_penalty"],
                     row["answer_score"],
                     row.get("intro_on_topic", ""),
+                    row.get("page_is_person", ""),
                 ]
             )
 
@@ -1758,6 +1905,7 @@ def run_rescue_ladder(
     lexicon_path: str | Path | None = "data/lexicon/combined_wordfreq.txt",
     lexicon_weight: float = 0.15,
     scoring_args: dict | None = None,
+    min_words: int = 12,
 ) -> dict:
     errors: list[str] = []
     steps = []
@@ -1954,12 +2102,16 @@ def run_rescue_ladder(
         final_diagnostics = write_json(diagnostics_path, diagnostics)
         return {"passed": True, "diagnostics": diagnostics, "diagnostics_path": final_diagnostics}
 
+    # Too few clued answers for the gate, but enough for the smallest grid the layout accepts: the caller goes on.
+    thin = gate.term_count >= min_words
+    if thin:
+        steps.append({"action": "accept_thin_pool", "value": gate.term_count})
     diagnostics = {
         "stage": "rescue_ladder",
         "lang": lang,
         "seed_title": seed_title,
         "passed": False,
-        "reason": "insufficient_vocabulary",
+        "reason": "accept_thin_pool" if thin else "insufficient_vocabulary",
         "steps": steps,
         "gate": gate.__dict__,
         "errors": errors,
@@ -2032,6 +2184,7 @@ def run_clue_extraction_stage(
                     "source_titles": row.get("source_titles", ""),
                     "source_method": row.get("source_method", ""),
                     "intro_on_topic": row.get("intro_on_topic", ""),
+                    "page_is_person": row.get("page_is_person", ""),
                 }
             )
 
@@ -2081,10 +2234,18 @@ def run_clue_extraction_stage(
         source_titles = [title for title in term["source_titles"].split("|") if title]
         for title in source_titles:
             load_source_payload(title)
+        page = source_titles[0] if term["source_method"] == "article_title" and source_titles else ""
+        own_title = _TITLE_DISAMBIGUATOR.sub("", page).strip()
+        last_word = bool(page) and (title_short_name(page, lang=lang) or ("",))[0] == answer
+        person = term["page_is_person"] == "True"
+        # The seed's name for a page that is no person ("Chicago" for "Music of Chicago"): only the seed clues it.
+        seed_only = last_word and not person
+        if seed_only:
+            load_source_payload(seed_title)
         candidates = _collect_source_backed_clue_candidates(
             answer=answer,
             normalized_answer=normalized_answer,
-            source_titles=source_titles,
+            source_titles=[seed_title] if seed_only else source_titles,
             source_payloads=source_cache,
             seed_title=seed_title,
             term_source_method=term["source_method"],
@@ -2093,21 +2254,29 @@ def run_clue_extraction_stage(
             max_words=max_words,
             nlp=nlp,
             allow_fragments=False,
+            full_name=own_title if last_word and person else None,
         )
-        if term["source_method"] == "article_title" and source_titles:
-            definitions = _definition_clue_rows(
-                answer=answer,
-                normalized_answer=normalized_answer,
-                answer_key_value=key,
-                title=source_titles[0],
-                payload=source_cache[source_titles[0]],
-                term_source_method=term["source_method"],
-                lang=lang,
-                nlp=nlp,
-                lead_counts=lead_counts,
-                pool_size=len(leads),
-                seed_title=seed_title,
-            )
+        if page:
+            # A page defines its own name only: its title, or any name of the person it is about ("Monet", "Peter
+            # Tait" for "Peter Guthrie Tait"). Another page's redirect ("Subatomic" for "Subatomic particle") is
+            # another word, and a disambiguated page whose intro is off topic ("Sicily (theme)") may be another
+            # sense of the seed's word: both take fill-ins only.
+            other_sense = bool(_TITLE_DISAMBIGUATOR.search(page)) and term["intro_on_topic"] == "False"
+            definitions = []
+            if (answer == own_title or person) and not other_sense:
+                definitions = _definition_clue_rows(
+                    answer=answer,
+                    normalized_answer=normalized_answer,
+                    answer_key_value=key,
+                    title=page,
+                    payload=source_cache[page],
+                    term_source_method=term["source_method"],
+                    lang=lang,
+                    nlp=nlp,
+                    lead_counts=lead_counts,
+                    pool_size=len(leads),
+                    seed_title=seed_title,
+                )
             if term["intro_on_topic"] == "False":
                 # In the pool only because the seed names it: the seed's sentence ties it to the theme better
                 # than a definition of its own page.
@@ -2510,6 +2679,7 @@ def run_generate_pipeline(
         "weights": candidate_weights,
         "lexicon_path": lexicon_path,
         "lexicon_weight": candidate_lexicon_weight,
+        "max_len": max_len,
     }
     scoring = run_candidate_scoring_stage(
         **scoring_args,
@@ -2616,9 +2786,12 @@ def run_generate_pipeline(
             lexicon_path=lexicon_path,
             lexicon_weight=term_lexicon_weight,
             scoring_args=scoring_args,
+            min_words=min_words,
         )
         if selected_rescue_path.exists():
             selected_for_package = selected_rescue_path
+        if rescue_result["diagnostics"]["reason"] == "accept_thin_pool":
+            gate_min = min_words  # the gate, the layout and the package take the thin pool as it is
         clues = run_clues()
         gate = run_gate()
 

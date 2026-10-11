@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import unittest
 from collections import Counter
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -19,8 +20,10 @@ from src.pipeline import (
     _linked_titles,
     _uses_seed_word,
     _seed_mentions,
+    _seed_short_names,
     run_candidate_scoring_stage,
     run_clue_extraction_stage,
+    run_generate_pipeline,
     run_k_selection_stage,
     run_layout_stage,
     run_packaging_stage,
@@ -293,8 +296,11 @@ class PipelineTests(unittest.TestCase):
         intros: dict[str, str] | None = None,
         seed_text: str | None = None,
         extra_titles: list[str] | None = None,
+        pages: dict[str, str] | None = None,
+        max_len: int = 15,
     ):
         intros = intros or self.ROME_INTROS
+        pages = pages or {}  # a redirect: link title -> the title of the page it leads to
         candidates = [{"title": title, "depth": 1, "links_back_to_seed": True} for title in list(intros)[1:]]
         seed_result = SimpleNamespace(diagnostics={"candidates": candidates, "errors": []})
         seed_text = seed_text or "Hannibal crossed the Alps. Diocletian split the empire; later Diocletian retired."
@@ -302,7 +308,7 @@ class PipelineTests(unittest.TestCase):
             patch("src.pipeline.run_seed_ingestion_stage", return_value=seed_result),
             patch(
                 "src.pipeline.WikiClient.fetch_page_extract",
-                side_effect=lambda title, intro_only=True: {"extract": intros[title]},
+                side_effect=lambda title, intro_only=True: {"title": pages.get(title, title), "extract": intros[title]},
             ),
             patch(
                 "src.pipeline.WikiClient.fetch_page_extract_with_revid",
@@ -317,6 +323,7 @@ class PipelineTests(unittest.TestCase):
                 scores_path=Path(tmp) / "scores.csv",
                 lexicon_path=None,
                 extra_titles=extra_titles,
+                max_len=max_len,
             )
 
     def test_scoring_cuts_off_topic_candidates_and_ranks_on_topic_ones_first(self) -> None:
@@ -445,6 +452,40 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result["diagnostics"]["reason"], "widen_from_selected")
         self.assertEqual(selected, ["On", "Named", "Heat"])  # new pages that scoring did not cut
         self.assertEqual(terms.call_args.kwargs["scores_path"], widened.scores_path)
+
+    def test_scoring_counts_only_seed_mentions_of_the_answer_itself_for_a_page_with_an_off_topic_intro(self) -> None:
+        intros = {
+            "Ancient Rome": "Ancient Rome was a civilization in Italy.",
+            "Axiomatic": "An axiom is a premise.",
+            "Trade (profession)": "A craft or trade is an occupation.",
+            "Nature (journal)": "Nature is a journal. Papers appear in Nature every week.",
+            "Camille (Monet)": "Camille is a painting. It shows Camille Doncieux.",
+            "Pressure": "Pressure is a force. High pressure builds up.",
+            "New Orleans": "New Orleans is a city. The port of New Orleans is large.",
+        }
+        seed_text = (
+            "An axiomatic method is axiomatic. Trade grew: trade and more trade, by craft and craft guilds. "
+            "The nature of things is the nature of things. Camille Pissarro met Camille Corot. "
+            "Pressure and pressure. In New Orleans, bands of New Orleans played New Orleans Blues."
+        )
+        pages = {"Axiomatic": "Axiom", "Trade (profession)": "Craft"}
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.score_rome(tmp, intros, seed_text, pages=pages)
+            short = self.score_rome(tmp, intros, seed_text, pages=pages, max_len=4)
+
+        # With answers of at most four letters "Axiom" is none, so the answer and the count are the redirect's.
+        self.assertEqual({row["title"]: row["seed_mentions"] for row in short.scores}["Axiomatic"], 2)
+        self.assertEqual(
+            {row["title"]: row["seed_mentions"] for row in result.scores},
+            {
+                "Axiomatic": 0,  # a redirect to Axiom, which the seed never names
+                "Trade (profession)": 2,  # a redirect to Craft: "craft" is counted, not "trade"
+                "Nature (journal)": 0,  # a proper name on its own page; the seed means the plain word
+                "Camille (Monet)": 0,  # one part of longer names
+                "Pressure": 2,  # a plain word on its own page: any case counts
+                "New Orleans": 2,  # not "New Orleans Blues"; "In" only opens the sentence
+            },
+        )
 
     def test_scoring_counts_a_derived_form_of_the_seed_word_only_in_the_first_sentence(self) -> None:
         intros = {
@@ -790,7 +831,7 @@ class PipelineTests(unittest.TestCase):
             encoding="utf-8",
         )
         (tmp_dir / "terms.csv").write_text(
-            "\n".join(["answer,normalized_answer,source_titles,source_method,intro_on_topic", *term_rows]),
+            "\n".join(["answer,normalized_answer,source_titles,source_method,intro_on_topic,page_is_person", *term_rows]),
             encoding="utf-8",
         )
 
@@ -1021,6 +1062,59 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual([(row["clue_style"], row["source_page"]) for row in named.clues], [("fill_in_blank", "Jazz")])
         self.assertEqual([(row["clue_style"], row["source_page"]) for row in on_topic.clues], [("definition", "Olive")])
 
+    def test_clue_stage_lets_the_blank_stand_for_the_full_name_of_a_person_answered_by_the_surname(self) -> None:
+        extracts = {
+            "Wayne Shorter": "Wayne Shorter (1933 \u2013 2023) played the saxophone.",
+            "Jazz": (
+                "In 1964 the quintet hired Wayne Shorter as its new saxophonist. "
+                "Critics praised Alice Shorter for another record that year."
+            ),
+        }
+        rows = ["Shorter,SHORTER,Wayne Shorter|Jazz,article_title,True,True"]
+        result, _ = self._run_clues_for("clue_surname", rows, extracts)
+
+        # "Wayne ____" would be one part of a name; "Alice ____" is another person and still is.
+        self.assertEqual(
+            [(row["clue"], row["source_page"]) for row in result.clues],
+            [("In 1964 the quintet hired ____ as its new saxophonist.", "Jazz")],
+        )
+
+    def test_clue_stage_defines_an_answer_only_by_a_page_that_bears_its_name(self) -> None:
+        extracts = {
+            "Subatomic particle": "A subatomic particle is a particle smaller than an atom in every model.",
+            "Sicily (theme)": (
+                "Sicily was a Byzantine province existing from the late 7th to the 10th century. "
+                "The fleet of Sicily guarded the grain routes for two long centuries."
+            ),
+            "Claude Monet": "Oscar-Claude Monet (14 November 1840 \u2013 5 December 1926) was a French painter of water lilies.",
+            "Peter Guthrie Tait": "Peter Guthrie Tait (28 April 1831 \u2013 4 July 1901) was a Scottish physicist and pioneer of knots.",
+            "Music of Chicago": (
+                "Chicago is a major center for music in the Midwest. "
+                "Visitors love Chicago for its many late-night clubs."
+            ),
+            "Jazz": "Physicists probe subatomic structure with large colliders every single year.",
+        }
+        rows = [
+            "Subatomic,SUBATOMIC,Subatomic particle|Jazz,article_title,True,False",  # a redirect's name, not the page's
+            "Sicily,SICILY,Sicily (theme),article_title,False,False",  # disambiguated and off topic: maybe another sense
+            "Monet,MONET,Claude Monet,article_title,True,True",  # the surname of the person the page is about
+            "Peter Tait,PETERTAIT,Peter Guthrie Tait,article_title,True,True",  # another name of that person
+            "Chicago,CHICAGO,Music of Chicago|Jazz,article_title,True,False",  # the seed's name for a page that is no person
+        ]
+        with patch("src.pipeline.is_generic_definition", return_value=False):
+            result, _ = self._run_clues_for("clue_own_name", rows, extracts)
+
+        # Chicago is the seed's word, so only a seed sentence may clue it, and this seed has none.
+        self.assertEqual(
+            {row["answer"]: (row["clue_style"], row["source_page"]) for row in result.clues},
+            {
+                "Subatomic": ("fill_in_blank", "Jazz"),
+                "Sicily": ("fill_in_blank", "Sicily (theme)"),
+                "Monet": ("definition", "Claude Monet"),
+                "Peter Tait": ("definition", "Peter Guthrie Tait"),
+            },
+        )
+
     def test_clue_stage_prefers_a_seed_sentence_to_an_equally_clean_one_from_another_page(self) -> None:
         result, _ = self._run_clues_for(
             "clue_seed_sentence",
@@ -1181,6 +1275,7 @@ class PipelineTests(unittest.TestCase):
         cap: int = 10,
         redirects: dict[str, str] | None = None,
         extracts: dict[str, str] | None = None,
+        seed_text: str = "",
     ) -> list[dict]:
         header = "rank,title,depth,links_back_to_seed,rel_score,red_score,selection_score,intro_on_topic,seed_mentions,status,reason"
         with tempfile.TemporaryDirectory() as tmp:
@@ -1193,6 +1288,7 @@ class PipelineTests(unittest.TestCase):
                 return {"title": page, "extract": intros.get(page, "")}
 
             client.fetch_page_extract.side_effect = fetch
+            client.fetch_page_extract_with_revid.return_value = {"title": seed, "extract": seed_text, "revid": 1}
             return _build_title_answer_rows(
                 seed_title=seed,
                 scores_path=scores,
@@ -1240,6 +1336,86 @@ class PipelineTests(unittest.TestCase):
         with patch("src.pipeline.is_generic_definition", return_value=False) as generic:
             rows("el")
         self.assertEqual(generic.call_args.kwargs["seed_title"], "Φυσική")
+
+    def test_title_pool_answers_with_the_name_the_seed_uses_for_a_page(self) -> None:
+        people = {  # title -> the seed's mentions of the title, as scoring counted them
+            "Claude Monet": 1,
+            "Jean Monet (son of Claude Monet)": 0,
+            "Pierre-Auguste Renoir": 0,  # too long to be an answer under its title
+            "Edgar Degas": 1,
+            "Mary Lou Williams": 1,
+            "Tony Williams (drummer)": 1,
+        }
+        others = {
+            "Monet (crater)": 4,
+            "Mus\u00e9e Marmottan Monet": 0,
+            "Music of Chicago": 0,
+            "Sasanian Empire": 0,
+            "Parthian Empire": 0,
+            "Ancient Carthage": 0,
+            "I Got Rhythm": 0,
+            "Kind of Blue": 2,
+            "Paris": 2,
+            "School of Paris": 0,
+        }
+        rows = [f"{i},{title},1,True,0.5,0.0,0.5,True,{n},KEEP,x" for i, (title, n) in enumerate((people | others).items(), 1)]
+        for title in ("Monet (crater)", "Parthian Empire"):  # the crater ranks first; the better-scored of two empires
+            row = list(people | others).index(title)
+            rows[row] = rows[row].replace("0.5,0.0,0.5", "0.9,0.0,0.9")
+        intros = {title: f"{title} (born 1900) is a painter." for title in people}
+        intros |= {title: f"{title} is on topic." for title in others} | {"Impressionism": "Impressionism was a movement."}
+        seed_text = (
+            "Claude Monet painted. Monet and Renoir met; Monet admired Renoir. Degas came. "
+            "Mary Lou Williams played with Tony Williams; Williams and Williams. "
+            "Bands left for Chicago in 1917, and Chicago welcomed them. "
+            "Trade crossed the Empire, and the Empire taxed every load. "
+            "They razed Carthage. Rome hated Carthage. "
+            "Rhythm matters more than melody to every dancer here. Rhythm drives the whole band forward each night. "
+            "Kind of Blue sold, and Kind of Blue endures. They met in Paris, and Paris changed them."
+        )
+        extracts = {"Edgar Degas": "Degas visited Chicago and the Empire often."}  # an on-topic selected article
+        pool = self.title_pool("Impressionism", rows, intros, cap=30, seed_text=seed_text, extracts=extracts)
+
+        self.assertEqual(
+            {row["answer"]: row["source_titles"] for row in pool},
+            {
+                "Impressionism": "Impressionism",
+                # The seed uses his full name more than his son's, and names him alone twice. The museum is no
+                # person and does not compete; the crater does not get to answer with a person's surname.
+                "Monet": "Claude Monet|Impressionism",
+                "Jean Monet": "Jean Monet (son of Claude Monet)",
+                "Renoir": "Pierre-Auguste Renoir|Impressionism",  # an answer only through the surname
+                "Edgar Degas": "Edgar Degas|Impressionism",  # alone once
+                "Mary Lou Williams": "Mary Lou Williams|Impressionism",  # neither Williams is named more than the other
+                "Tony Williams": "Tony Williams (drummer)|Impressionism",
+                # No person, but a proper name in the seed, twice in mid-sentence: the seed alone is its source.
+                "Chicago": "Music of Chicago|Impressionism",
+                "Empire": "Parthian Empire|Impressionism",  # the better-scored page that ends in the word
+                "Sasanian Empire": "Sasanian Empire",
+                "Ancient Carthage": "Ancient Carthage",  # the seed has no sentence long enough to clue "Carthage"
+                "I Got Rhythm": "I Got Rhythm",  # "Rhythm" has a capital only where a sentence opens
+                "Kind of Blue": "Kind of Blue|Impressionism",  # "Blue" only inside the title
+                "Paris": "Paris|Impressionism",
+                "School of Paris": "School of Paris",  # Paris is another page's own title
+            },
+        )
+        # The mentions that count are the answer's: two for "Monet", not the one of "Claude Monet".
+        self.assertEqual({row["answer"]: row["answer_score"] for row in pool}["Monet"], 2.2)
+        self.assertEqual(
+            {row["answer"] for row in pool if row["page_is_person"]},
+            {"Monet", "Jean Monet", "Renoir", "Edgar Degas", "Mary Lou Williams", "Tony Williams"},
+        )
+        # A word of the seed title is not free, however often the seed uses it.
+        rome = _seed_short_names(
+            {"Fall of Rome": "The fall of Rome is on topic."},
+            "Ancient Rome",
+            "They left Rome early, and Rome burned.",
+            lang="en",
+            has_seed_fill_in=lambda display, normalized: True,
+        )
+        self.assertEqual(rome, {})
+        unnamed = {row["answer"] for row in self.title_pool("Impressionism", rows, intros, cap=30)}  # a seed that names none
+        self.assertEqual((("Claude Monet" in unnamed), ("Renoir" in unnamed), ("Chicago" in unnamed)), (True, False, False))
 
     def test_title_pool_admits_only_the_kept_titles_scoring_found_on_topic(self) -> None:
         rows = [
@@ -1363,6 +1539,47 @@ class PipelineTests(unittest.TestCase):
             {row["answer"]: row["source_titles"] for row in pool},
             {"Ancient Rome": "Ancient Rome", "Pompey": "Pompey|Ancient Rome", "Latium": "Latium"},
         )
+
+    def test_a_pool_too_thin_for_the_gate_but_enough_for_a_grid_is_accepted_and_laid_out(self) -> None:
+        def ladder(tmp_dir: Path, clued: int) -> dict:
+            (tmp_dir / "selected.json").write_text(json.dumps({"selected_titles": ["A"]}), encoding="utf-8")
+            gate = SimpleNamespace(passed=False, term_count=clued)
+            with (
+                patch("src.pipeline.run_term_extraction_stage"),
+                patch("src.pipeline.run_clue_extraction_stage", return_value=SimpleNamespace(clues=[])),
+                patch("src.pipeline.evaluate_vocab_gate", return_value=gate),
+            ):
+                return run_rescue_ladder(
+                    seed_title="Seed",
+                    selected_path=tmp_dir / "selected.json",
+                    terms_path=tmp_dir / "terms.csv",
+                    diagnostics_path=tmp_dir / "diagnostics_rescue.json",
+                    candidate_scores_path=tmp_dir / "missing.csv",
+                    min_words=12,
+                )["diagnostics"]
+
+        stage = SimpleNamespace(diagnostics={"passed": False}, grid_path="grid.json")
+        with tempfile.TemporaryDirectory() as tmp:
+            thin, too_thin = ladder(Path(tmp), 12), ladder(Path(tmp), 11)
+            names = ("candidate_scoring", "k_selection", "term_extraction", "clue_extraction", "vocab_gate", "layout")
+            with ExitStack() as stack:
+                rescue = stack.enter_context(patch("src.pipeline.run_rescue_ladder", return_value={"diagnostics": thin}))
+                started = {
+                    name: stack.enter_context(patch(f"src.pipeline.run_{name}_stage", return_value=stage))
+                    for name in (*names, "packaging")
+                }
+                run_generate_pipeline(seed_title="Seed", output_dir=tmp, gate_min=30, min_words=12, max_len=9)
+                self.assertEqual(started["candidate_scoring"].call_args.kwargs["max_len"], 9)
+                accepted = [started[name].call_args.kwargs for name in ("vocab_gate", "layout", "packaging")]
+                run_generate_pipeline(seed_title="Seed", output_dir=tmp, gate_min=30, min_words=12, rescue=False)
+                without_rescue = started["layout"].call_args.kwargs["gate_min"]
+
+        self.assertEqual((thin["reason"], thin["steps"][-1]), ("accept_thin_pool", {"action": "accept_thin_pool", "value": 12}))
+        self.assertEqual((too_thin["reason"], too_thin["steps"][-1]["action"]), ("insufficient_vocabulary", "shorten_min_len"))
+        # After the step the gate, the layout and the package ask for min_words answers; --no-rescue stops at the gate.
+        self.assertEqual(rescue.call_args.kwargs["min_words"], 12)
+        self.assertEqual([accepted[0]["min_required"], accepted[1]["gate_min"], accepted[2]["gate_min"]], [12, 12, 12])
+        self.assertEqual((rescue.call_count, without_rescue), (1, 30))
 
     def test_rescue_ladder_promotes_borderline_from_csv(self) -> None:
         tmp_dir = Path("tests") / "tmp_outputs" / "rescue_csv"

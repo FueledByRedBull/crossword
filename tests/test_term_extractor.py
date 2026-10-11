@@ -12,6 +12,7 @@ from src.term_extractor import (
     merge_terms,
     shape_penalty,
     term_frequency_across_docs,
+    title_short_name,
     title_to_answer,
 )
 
@@ -229,6 +230,15 @@ class TitleToAnswerTests(unittest.TestCase):
         self.assertIsNone(title_to_answer("S\u00f8ren Kierkegaard"))
         terms = extract_terms_lead_bold(["Schr\u00f6dinger"], source_title="Schrodinger", lang="en")
         self.assertEqual(terms[0].normalized_answer, "SCHRODINGER")
+
+    def test_short_name_is_the_capitalised_last_word_of_a_title_of_several_words(self) -> None:
+        self.assertEqual(title_short_name("Claude Monet"), ("Monet", "MONET"))
+        self.assertEqual(title_short_name("Tony Williams (drummer)"), ("Williams", "WILLIAMS"))
+        self.assertEqual(title_short_name("Paul Cézanne"), ("Cézanne", "CEZANNE"))
+        self.assertEqual(title_short_name("Roman Senate"), ("Senate", "SENATE"))
+        # One word, a lower-case last word, fewer than 4 or more than 9 letters, a list: no short name.
+        for title in ("Monet", "Ideal gas", "Napoleon III", "Erwin Schrödinger", "List of paintings by Claude Monet"):
+            self.assertIsNone(title_short_name(title), title)
 
     def test_rejects_generic_single_word_titles(self) -> None:
         self.assertIsNone(title_to_answer("Time"))

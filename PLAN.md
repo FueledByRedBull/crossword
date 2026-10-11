@@ -90,6 +90,7 @@ A seed is graded when it has `word_count > 0` and a known `puzzle_status`; Gates
    - Add candidates until crossword-aware marginal utility plateaus.
 5. `Term Extraction + Filtering`:
    - Take answers primarily from the titles of the most relevant linked articles, then from extracted noun phrases/entities, and apply quality filters.
+   - Answer a page by the last word of its title when the seed article uses that word on its own as a name at least twice (`MONET` for "Claude Monet", `CARTHAGE` for "Ancient Carthage"; English only).
 6. `Clue Generation`:
    - Definition clue from the article's first sentence; fill-in-the-blank as fallback.
    - Four-pass extract/mask-trim/validate/diversity pipeline.
@@ -201,7 +202,7 @@ If `J(K)` plateaus but the vocabulary readiness gate is not satisfied, apply the
 2. Promote up to 3 `BORDERLINE` candidates into the selected set.
 3. Widen from the selected articles: score the pages linked from at most 6 selected articles whose intro is on topic (an even sample of each one's links, at most 100 new pages), let the best 6 join the selected articles, and let all of them be answers.
 4. Reduce minimum answer length from `4` to `3`.
-5. If all four steps fail: emit `puzzle_status: insufficient_vocabulary` and halt gracefully.
+5. If all four steps fail: go on with the thin pool when it has at least `min_words` clued answers (`accept_thin_pool`); otherwise emit `puzzle_status: insufficient_vocabulary` and halt gracefully.
 
 #### Outputs
 
@@ -260,8 +261,8 @@ Additional notes:
 
 #### Pass 1: Extract
 
-1. Definition: the first sentence of the answer's own article with the subject removed, cut only at a clean boundary.
-2. Fill-in-the-blank: sentences that contain the answer, taken only from the seed article, the answer's own page, or a selected article whose intro is on topic.
+1. Definition: the first sentence of the answer's own article with the subject removed, cut only at a clean boundary. A page defines only its own name: its title, or a name of the person it is about. A redirect's name, a disambiguated title whose intro is off topic, and a short name of a page that is not about a person take fill-ins only.
+2. Fill-in-the-blank: sentences that contain the answer, taken only from the seed article, the answer's own page, or a selected article whose intro is on topic. A short name of a page that is not about a person takes them from the seed alone; for a person's surname the blank may stand for the full name.
 
 #### Pass 2: Mask + Trim
 
@@ -271,7 +272,7 @@ Additional notes:
 #### Pass 3: Validate
 
 1. Reject clues containing the answer or a morphological cousin of it (lemma/stem check).
-2. Reject a fill-in that points outside itself: an opening back-reference word, a pronoun with nothing before it to refer to, a demonstrative with a noun not named earlier, "the former", "the following", "doing so"; and a cut fill-in that lost its finite verb.
+2. Reject a fill-in that points outside itself: an opening back-reference word, a pronoun with nothing before it to refer to, a demonstrative with a noun not named earlier, "the former", "the following", "doing so"; and a cut fill-in that lost its finite verb. Reject a fill-in whose blank is one part of a longer proper name, or one item of a list of three or more.
 3. Reject a generic definition: no word that is rare among the pool's lead sentences; the answer's nationality with fewer than two such words; a kind-of-word head noun without its meaning; a vague quantifier opener.
 4. Reject clues below the minimum word count (3 for a definition, 6 for a fill-in) as too vague.
 

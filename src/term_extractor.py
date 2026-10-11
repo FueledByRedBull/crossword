@@ -293,6 +293,18 @@ def title_to_answer(title: str, *, lang: str = "en", max_len: int = 15) -> tuple
     return display, normalized
 
 
+def title_short_name(title: str, *, lang: str = "en") -> tuple[str, str] | None:
+    """Return (display, normalized) for the last word of a title when it could name the page alone.
+
+    "Monet" for "Claude Monet": a capitalised word of 4 to 9 letters that ends a title of two or more words.
+    """
+    words = _TITLE_DISAMBIGUATOR.sub("", title).split()
+    if len(words) < 2 or not words[-1][:1].isupper() or title.lower().startswith(_NON_TOPIC_TITLE_PREFIXES):
+        return None
+    pair = title_to_answer(words[-1], lang=lang, max_len=9)
+    return pair if pair and len(pair[1]) >= 4 else None
+
+
 def merge_plural_duplicates(rows: list[dict]) -> list[dict]:
     """Drop the weaker of X and XS/XES; the singular wins ties."""
     by_key = {row["normalized_answer"]: row for row in rows}

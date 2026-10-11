@@ -113,6 +113,7 @@ class ClueBuilderTests(unittest.TestCase):
             split_sentences(text),
             ["Charles Mingus Jr. was a bassist.", "John F. Kennedy spoke."],
         )
+        self.assertEqual(split_sentences("The Spy vs. Spy album came out in 1986."), ["The Spy vs. Spy album came out in 1986."])
 
 
 class WordBoundaryTests(unittest.TestCase):
@@ -724,6 +725,7 @@ class FillInOpeningTests(unittest.TestCase):
             "However, AllMusic separates it from ____ because of R&B's stronger gospel influences.",
             "Αυτό είναι το ____ του συστήματος.",
             "Και η ____ μεταφέρεται από το ένα σώμα στο άλλο.",
+            "Πρόκειται για την ____ του συστήματος.",
         ):
             with self.subTest(clue=clue):
                 self.assertFalse(self._passes(clue))
@@ -842,6 +844,121 @@ class FillInReferenceTests(unittest.TestCase):
             for clue in kept:
                 with self.subTest(clue=clue, tagger=nlp is not None):
                     self.assertTrue(self._passes(clue, nlp, lang="el"))
+
+
+class FillInListTests(unittest.TestCase):
+    """A blank that is one item of a list of three or more: any of the other items would fit."""
+
+    # (answer, original sentence, language). Two commas and a coordinator: seen with and without the tagger.
+    LISTS = (
+        (
+            "Paul Cézanne",
+            "Modern art begins with the post-impressionist painters like Vincent van Gogh, Paul Cézanne, Paul Gauguin, "
+            "Georges Seurat and Henri de Toulouse-Lautrec.",
+            "en",
+        ),
+        ("Hip-hop", "The mid-2010s saw an increased influence of R&B, hip-hop, and pop music on jazz.", "en"),
+        ("Temperature", "James Joule studied the relationship between heat, work, and temperature.", "en"),
+        (
+            "Thelonious Monk",
+            "Charlie Christian, Dizzy Gillespie, Charlie Parker, and Thelonious Monk were among the major innovators "
+            "of the style.",
+            "en",
+        ),
+        (
+            "Χημεία",
+            "Η Φασματοσκοπία, που έχει αστρονομική εξ ανάγκης προέλευση, χρησιμοποιείται σήμερα από τη Φυσική, Χημεία, "
+            "Μεταλλουργία, Βιολογία κλπ.",
+            "el",
+        ),
+        (
+            "Ιστορία",
+            "Ο όρος «πλανήτης» είναι αρχαίος, με δεσμούς με την ιστορία, με την αστρολογία, με την επιστήμη, με τη "
+            "μυθολογία και με τη θρησκεία.",
+            "el",
+        ),
+        ("Γαλαξίες", "Ο Σαρλ Μεσιέ κατάρτισε κατάλογο με τα απομακρυσμένα αντικείμενα όπως Γαλαξίες, Νεφελώματα, κ.ά..", "el"),
+        ("Γεωδαισία", "Ακόμα η Χρονομετρία, η Ναυτιλία, και η Γεωδαισία σχετίζονται στενά με την Αστρονομία.", "el"),
+    )
+    # One comma: a list only for the parser, which coordinates the answer with two other words.
+    LISTS_FOR_THE_PARSER = (
+        ("Sicily", "The annexation of Egypt, Sicily and Tunisia in North Africa provided a continuous supply of grains.", "en"),
+        ("Renoir", "In 1874, Monet, Renoir and Sisley exhibited together.", "en"),
+    )
+    NO_LISTS = (
+        # A pair is not a list, whatever stands before it.
+        (
+            "Renoir",
+            "During the 1860s, Monet and Renoir sometimes painted on canvases prepared with the traditional red-brown "
+            "or grey ground.",
+            "en",
+        ),
+        ("Sicily", "The annexation of Sicily and Tunisia in North Africa provided a continuous supply of grains.", "en"),
+        ("Ενέργεια", "Μέσα από τους νόμους εισάγονται δύο κεντρικές της έννοιες, η ενέργεια και η εντροπία.", "el"),
+        ("Φιλοσοφία", "Τέλος η Αστρονομία σχετίζεται στενά με τη Φιλοσοφία και τη Μεταφυσική.", "el"),
+        # A comma after the blank that opens no list.
+        (
+            "Limes",
+            "The assembled warbands of the Alamanni frequently crossed the limes, attacking Germania Superior such "
+            "that they were almost continually engaged in conflicts with the Roman Empire, whilst both Goths and "
+            "Heruli ravaged the Aegean and, later, Greece, Thrace and Macedonia.",
+            "en",
+        ),
+        ("Curia", "In medieval times, a king's council was often referred to as a curia.", "en"),
+        # A list the blank is no item of.
+        ("Mars", "The wolf was the sacred animal of Mars, with the she-wolf nursing the two founders as children.", "en"),
+        ("Sicily", "In Sicily, wine, oil and grain were the main exports.", "en"),
+        ("Thermodynamics", "Most often, in thermodynamics, mass and energy are treated as separately conserved.", "en"),
+        # The blank is part of an item that says more.
+        ("Olive", "In turn, olive oil and wine were Italy's main exports.", "en"),
+        (
+            "Herbie Hancock",
+            "Popular modal standards include Davis's \"All Blues\" and \"So What\", John Coltrane's \"Impressions\" "
+            "and Herbie Hancock's \"Maiden Voyage\".",
+            "en",
+        ),
+    )
+    # The parser alone tells these from a list: an item with a modifier of its own, and an apposition.
+    NO_LISTS_FOR_THE_PARSER = (
+        ("Optics", "Engineers have taken an interest in integrated optics, machine vision, and photonic computing.", "en"),
+        ("Titus", "The emperor's son, Titus, conquered Jerusalem and Masada.", "en"),
+    )
+
+    @staticmethod
+    def _passes(answer: str, sentence: str, lang: str, nlp) -> bool:
+        clue, _ = clue_pass_mask_trim(sentence, answer, max_words=12)
+        return clue_pass_validate(clue, answer, min_words=6, nlp=nlp, original_sentence=sentence, require_blank=True, lang=lang)
+
+    def _check(self, cases, expected: bool, *, tagger: bool) -> None:
+        for answer, sentence, lang in cases:
+            nlp = _load_nlp("el_core_news_sm" if lang == "el" else "en_core_web_sm") if tagger else None
+            if tagger and nlp is None:
+                continue
+            with self.subTest(answer=answer, tagger=tagger):
+                self.assertEqual(self._passes(answer, sentence, lang, nlp), expected)
+
+    def test_an_item_of_a_list_is_rejected_with_and_without_the_tagger(self) -> None:
+        self._check(self.LISTS, False, tagger=False)
+        self._check(self.LISTS, False, tagger=True)
+
+    def test_the_cut_clue_cannot_hide_the_list(self) -> None:
+        answer, sentence, _ = self.LISTS[0]
+        clue, _ = clue_pass_mask_trim(sentence, answer, max_words=12)
+        self.assertEqual(clue, "Modern art begins with the post-impressionist painters like Vincent van Gogh, ____, ...")
+        self.assertTrue(clue_pass_validate(clue, answer, min_words=6, require_blank=True))
+        self.assertFalse(clue_pass_validate(clue, answer, min_words=6, original_sentence=sentence, require_blank=True))
+
+    def test_a_list_with_one_comma_needs_the_parser(self) -> None:
+        self._check(self.LISTS_FOR_THE_PARSER, True, tagger=False)
+        self._check(self.LISTS_FOR_THE_PARSER, False, tagger=True)
+
+    def test_pairs_and_other_commas_are_not_lists(self) -> None:
+        self._check(self.NO_LISTS, True, tagger=False)
+        self._check(self.NO_LISTS, True, tagger=True)
+
+    def test_the_parser_keeps_an_item_with_a_modifier_and_an_apposition(self) -> None:
+        self._check(self.NO_LISTS_FOR_THE_PARSER, False, tagger=False)
+        self._check(self.NO_LISTS_FOR_THE_PARSER, True, tagger=True)
 
 
 class DefinitionCutTests(unittest.TestCase):
