@@ -821,13 +821,15 @@ class PipelineTests(unittest.TestCase):
         extracts: dict[str, str],
         selected: list[str] | None = None,
         revid=lambda intro_only: 77 if intro_only else 88,
+        seed_title: str = "Jazz",
+        lang: str = "en",
     ):
         tmp_dir = Path("tests") / "tmp_outputs" / tmp_name
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir, ignore_errors=True)
         tmp_dir.mkdir(parents=True, exist_ok=True)
         (tmp_dir / "selected_candidates.json").write_text(
-            json.dumps({"seed_title": "Jazz", "lang": "en", "selected_k": 0, "selected_titles": selected or []}),
+            json.dumps({"seed_title": seed_title, "lang": lang, "selected_k": 0, "selected_titles": selected or []}),
             encoding="utf-8",
         )
         (tmp_dir / "terms.csv").write_text(
@@ -845,8 +847,8 @@ class PipelineTests(unittest.TestCase):
             patch("src.pipeline.WikiClient.fetch_lead_wikitext", side_effect=AssertionError("lead revision is another response")),
         ):
             result = run_clue_extraction_stage(
-                seed_title="Jazz",
-                lang="en",
+                seed_title=seed_title,
+                lang=lang,
                 diagnostics_path=tmp_dir / "diagnostics_clues.json",
                 terms_path=tmp_dir / "terms.csv",
                 clues_path=tmp_dir / "clues.csv",
@@ -1034,6 +1036,29 @@ class PipelineTests(unittest.TestCase):
             next(row["clue_style"] for row in result.clues if row["answer"] == "Ana Vale"), "fill_in_blank"
         )
 
+    def test_clue_stage_defines_from_the_second_sentence_only_when_nothing_else_clues_the_answer(self) -> None:
+        follow_up = "She was one of the most influential figures in the development of quantum optics."
+
+        def run(name: str, first: str):
+            with patch("src.pipeline.is_generic_definition", side_effect=lambda clue, *args, **kwargs: clue.startswith("A noted")):
+                result, _ = self._run_clues_for(name, ["Ana Vale,ANAVALE,Ana Vale,article_title"], {"Ana Vale": f"{first} {follow_up}"})
+            return [(row["clue_style"], row["sentence_offset"], row["clue"]) for row in result.clues]
+
+        # The first sentence defines nothing (generic) and is too short for a fill-in: the second one defines.
+        self.assertEqual(
+            run("clue_follow_up", "Ana Vale was a noted physicist."),
+            [("definition", 1, "One of the most influential figures in the development of quantum optics")],
+        )
+        # A valid fill-in comes before the follow-up.
+        self.assertEqual(
+            run("clue_follow_up_fill_in", "Ana Vale was a noted physicist and teacher in Kyoto.")[0][:2], ("fill_in_blank", 0)
+        )
+        # A first sentence that defines wins as before.
+        self.assertEqual(
+            run("clue_first_sentence", "Ana Vale was a pioneer of quantum optics in Kyoto."),
+            [("definition", 0, "A pioneer of quantum optics in Kyoto")],
+        )
+
     def test_clue_stage_prefers_a_complete_sentence_and_skips_two_ended_fragments(self) -> None:
         fragment_then_sentence = (
             "Researchers who studied the matter for many years in several countries finally agreed, "
@@ -1051,7 +1076,7 @@ class PipelineTests(unittest.TestCase):
         # The only window for "debate" would need an ellipsis at both ends.
         self.assertNotIn("Debate", clues)
 
-    def test_clue_stage_clues_a_title_the_seed_merely_names_from_the_seed_and_the_rest_from_their_own_page(self) -> None:
+    def test_clue_stage_defines_a_title_the_seed_merely_names_by_its_own_page_before_the_seeds_sentence(self) -> None:
         extracts = {
             "Olive": "An olive is a subspecies of subtropical evergreen tree in the family Oleaceae.",
             "Jazz": "Jazz drummers often sit beside an olive tree outside the clubs.",
@@ -1059,8 +1084,28 @@ class PipelineTests(unittest.TestCase):
         named, _ = self._run_clues_for("clue_named", ["Olive,OLIVE,Olive|Jazz,article_title,False"], extracts)
         on_topic, _ = self._run_clues_for("clue_on_topic", ["Olive,OLIVE,Olive|Jazz,article_title,True"], extracts)
 
-        self.assertEqual([(row["clue_style"], row["source_page"]) for row in named.clues], [("fill_in_blank", "Jazz")])
+        # The seed has a clean sentence for "olive", and the page's definition still comes first.
+        self.assertEqual([(row["clue_style"], row["source_page"]) for row in named.clues], [("definition", "Olive")])
         self.assertEqual([(row["clue_style"], row["source_page"]) for row in on_topic.clues], [("definition", "Olive")])
+
+    def test_clue_stage_takes_fill_ins_only_from_an_off_topic_page_that_sends_to_another_article(self) -> None:
+        diary = (
+            "Για το σύστημα χρονολόγησης δείτε: Ημερολόγιο (σύστημα χρονολόγησης)\n"
+            "Το ημερολόγιο είναι μια καταγραφή με διακριτές εγγραφές ταξινομημένες ανά ημερομηνία."
+        )
+        seed = "Οι αστρονόμοι χρησιμοποιούν το Ημερολόγιο για να προβλέπουν τις εκλείψεις κάθε χρόνο."
+
+        def run(name: str, on_topic: str, seed_text: str):
+            rows = [f"Ημερολόγιο,ΗΜΕΡΟΛΟΓΙΟ,Ημερολόγιο|Αστρονομία,article_title,{on_topic},False"]
+            extracts = {"Ημερολόγιο": diary, "Αστρονομία": seed_text}
+            result, _ = self._run_clues_for(name, rows, extracts, seed_title="Αστρονομία", lang="el")
+            return [(row["clue_style"], row["source_page"]) for row in result.clues]
+
+        # The note marks the diary as another sense of the seed's word, as a title in parentheses would: no
+        # definition, the seed's sentence, and no sentence of the diary's own page when the seed has none.
+        self.assertEqual(run("clue_note_off_topic", "False", seed), [("fill_in_blank", "Αστρονομία")])
+        self.assertEqual(run("clue_note_no_seed_sentence", "False", "Οι αστρονόμοι μετρούν τον ουρανό κάθε νύχτα."), [])
+        self.assertEqual(run("clue_note_on_topic", "True", seed), [("definition", "Ημερολόγιο")])
 
     def test_clue_stage_lets_the_blank_stand_for_the_full_name_of_a_person_answered_by_the_surname(self) -> None:
         extracts = {
@@ -1104,12 +1149,12 @@ class PipelineTests(unittest.TestCase):
         with patch("src.pipeline.is_generic_definition", return_value=False):
             result, _ = self._run_clues_for("clue_own_name", rows, extracts)
 
-        # Chicago is the seed's word, so only a seed sentence may clue it, and this seed has none.
+        # Chicago is the seed's word, so only a seed sentence may clue it, and this seed has none. Nor has it one
+        # for Sicily, whose own page may be about another sense: no clue.
         self.assertEqual(
             {row["answer"]: (row["clue_style"], row["source_page"]) for row in result.clues},
             {
                 "Subatomic": ("fill_in_blank", "Jazz"),
-                "Sicily": ("fill_in_blank", "Sicily (theme)"),
                 "Monet": ("definition", "Claude Monet"),
                 "Peter Tait": ("definition", "Peter Guthrie Tait"),
             },
@@ -1359,9 +1404,8 @@ class PipelineTests(unittest.TestCase):
             "School of Paris": 0,
         }
         rows = [f"{i},{title},1,True,0.5,0.0,0.5,True,{n},KEEP,x" for i, (title, n) in enumerate((people | others).items(), 1)]
-        for title in ("Monet (crater)", "Parthian Empire"):  # the crater ranks first; the better-scored of two empires
-            row = list(people | others).index(title)
-            rows[row] = rows[row].replace("0.5,0.0,0.5", "0.9,0.0,0.9")
+        row = list(people | others).index("Monet (crater)")  # the crater ranks first
+        rows[row] = rows[row].replace("0.5,0.0,0.5", "0.9,0.0,0.9")
         intros = {title: f"{title} (born 1900) is a painter." for title in people}
         intros |= {title: f"{title} is on topic." for title in others} | {"Impressionism": "Impressionism was a movement."}
         seed_text = (
@@ -1390,7 +1434,8 @@ class PipelineTests(unittest.TestCase):
                 "Tony Williams": "Tony Williams (drummer)|Impressionism",
                 # No person, but a proper name in the seed, twice in mid-sentence: the seed alone is its source.
                 "Chicago": "Music of Chicago|Impressionism",
-                "Empire": "Parthian Empire|Impressionism",  # the better-scored page that ends in the word
+                # "the Empire" is a class noun: two pages end in it, so neither takes it.
+                "Parthian Empire": "Parthian Empire",
                 "Sasanian Empire": "Sasanian Empire",
                 "Ancient Carthage": "Ancient Carthage",  # the seed has no sentence long enough to clue "Carthage"
                 "I Got Rhythm": "I Got Rhythm",  # "Rhythm" has a capital only where a sentence opens
@@ -1416,6 +1461,28 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(rome, {})
         unnamed = {row["answer"] for row in self.title_pool("Impressionism", rows, intros, cap=30)}  # a seed that names none
         self.assertEqual((("Claude Monet" in unnamed), ("Renoir" in unnamed), ("Chicago" in unnamed)), (True, False, False))
+
+    def test_greek_person_pages_answer_by_the_surname_the_seed_writes_but_other_pages_keep_their_title(self) -> None:
+        intros = {
+            "Γιοχάνες Κέπλερ": "Ο Γιοχάνες Κέπλερ (1571 \u2013 1630) ήταν Γερμανός αστρονόμος.",
+            "Ισαάκ Νεύτων": "Ο Ισαάκ Νεύτων (1643 \u2013 1727) ήταν Άγγλος φυσικός.",
+            "Τύχο Μπράχε": "Ο Τύχο Μπράχε (1546 \u2013 1601) ήταν Δανός αστρονόμος.",
+            "Ίππαρχος ο Ρόδιος": "Ο Ίππαρχος ο Ρόδιος (190 π.Χ. \u2013 120 π.Χ.) ήταν Έλληνας αστρονόμος.",
+            "Κλίμακα Κέλβιν": "Η κλίμακα Κέλβιν είναι κλίμακα θερμοκρασίας.",
+        }
+        seed_text = (
+            "Οι νόμοι του Κέπλερ ισχύουν. Ο Γιοχάνες Κέπλερ τους διατύπωσε. Η μηχανική του Κέπλερ επιβίωσε. "
+            "Οι νόμοι του Νεύτωνα ισχύουν. Ο Ισαάκ Νεύτων τους διατύπωσε. Η μηχανική του Νεύτωνα επιβίωσε. "
+            "Ο Τύχο Μπράχε και ο Μπράχε μέτρησαν. Ο Ίππαρχος ο Ρόδιος και ο Ίππαρχος ο Ρόδιος μέτρησαν τον ουρανό. "
+            "Η θερμοκρασία του Κέλβιν και η τιμή του Κέλβιν ανεβαίνουν."
+        )
+        names = _seed_short_names(
+            intros, "Αστρονομία", seed_text, lang="el", has_seed_fill_in=lambda display, normalized: True
+        )
+
+        # Two stand-alone mentions in the title's own form; the full name does not count. "του Νεύτωνα" is another
+        # form, one mention is too few, an epithet is never named alone, and a page that is no person keeps its title.
+        self.assertEqual(names, {"Γιοχάνες Κέπλερ": ("Κέπλερ", "ΚΕΠΛΕΡ", 2, True)})
 
     def test_title_pool_admits_only_the_kept_titles_scoring_found_on_topic(self) -> None:
         rows = [

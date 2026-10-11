@@ -41,6 +41,7 @@ from .clue_builder import (
     clue_pass_validate,
     definition_clue,
     enforce_diversity,
+    follow_up_definition,
     has_verb,
     is_generic_definition,
     lead_subject,
@@ -564,36 +565,41 @@ def _definition_clue_rows(
 
     The second, longer cut is there for generic definitions ("An American physicist"): it may
     reach the relative clause that says who the person was. A definition that stays generic is dropped.
+    When none is left, the second sentence is tried ("He was one of the most influential figures in jazz piano.").
     """
     sentences = split_sentences(payload.get("extract", ""))
-    texts: list[str] = []
-    for max_words in (16, MAX_CLUE_WORDS):
-        clue_text = (
-            definition_clue(sentences[0], answer=answer, max_words=max_words, nlp=nlp, lang=lang) if sentences else None
-        )
-        if (
-            clue_text
-            and clue_text not in texts
-            and clue_pass_validate(clue_text, answer, min_words=3, nlp=nlp, lang=lang)
-            and not is_generic_definition(clue_text, lead_counts, pool_size, nlp, seed_title=seed_title)
-        ):
-            texts.append(clue_text)
-    return [
-        _build_clue_row(
-            answer=answer,
-            normalized_answer=normalized_answer,
-            answer_key_value=answer_key_value,
-            clue_text=clue_text,
-            clue_class="source_backed",
-            source_method=term_source_method,
-            source_page=payload.get("title", title) or title,
-            revid=payload.get("revid"),
-            sentence_offset=0,
-            lang=lang,
-            clue_style="definition",
-        )
-        for clue_text in texts
-    ]
+    rows: list[dict] = []
+    # The second sentence is the last resort of an answer whose first one gave no definition.
+    for offset, cut in enumerate((definition_clue, follow_up_definition)):
+        if rows or offset >= len(sentences):
+            break
+        texts: list[str] = []
+        for max_words in (16, MAX_CLUE_WORDS):
+            clue_text = cut(sentences[offset], answer=answer, max_words=max_words, nlp=nlp, lang=lang)
+            if (
+                clue_text
+                and clue_text not in texts
+                and clue_pass_validate(clue_text, answer, min_words=3, nlp=nlp, lang=lang)
+                and not is_generic_definition(clue_text, lead_counts, pool_size, nlp, seed_title=seed_title)
+            ):
+                texts.append(clue_text)
+        rows = [
+            _build_clue_row(
+                answer=answer,
+                normalized_answer=normalized_answer,
+                answer_key_value=answer_key_value,
+                clue_text=clue_text,
+                clue_class="source_backed",
+                source_method=term_source_method,
+                source_page=payload.get("title", title) or title,
+                revid=payload.get("revid"),
+                sentence_offset=offset,
+                lang=lang,
+                clue_style="definition",
+            )
+            for clue_text in texts
+        ]
+    return rows
 
 
 def run_seed_ingestion_stage(
@@ -1208,6 +1214,10 @@ def run_k_selection_stage(
 
 _MAX_ANSWER_POOL = 200
 
+# A Greek page opens with a line that sends the reader to another article for the other meaning:
+# "Για το σύστημα χρονολόγησης δείτε: Ημερολόγιο (σύστημα χρονολόγησης)".
+_SEE_OTHER_ARTICLE = re.compile(r"Για [^\n]* δείτε")
+
 
 # A page about a person opens with life dates or "born" in a parenthesis: "(1840 – 1926)", "(born 1946)",
 # "(138–78 BC)".
@@ -1225,12 +1235,13 @@ def _seed_short_names(
 
     A person by the surname: "Monet" for "Claude Monet" when the seed names it alone at least twice. Of several
     people with one surname, the one whose full name the seed uses more often than all the others' together
-    takes it; with no such person ("Williams") nobody does.
+    takes it; with no such person ("Williams") nobody does. Only a Greek person is named this way, and only by
+    the title's own form: the seed writes other pages in an ending of its own.
 
     Any other page by a word the seed uses as a proper name, capitalised in mid-sentence and alone at least twice:
     "Chicago" for "Music of Chicago", not "Rhythm" for "I Got Rhythm". The seed's sentence is its only clue, so
-    `has_seed_fill_in` must find one. Of the pages that end in the word the best-scored answers with it; `intros`
-    lists the best first. A surname, another page's own title and a word of the seed title are not free.
+    `has_seed_fill_in` must find one. A word that ends two such pages is a class noun ("Empire") and nobody's
+    name. A surname, another page's own title and a word of the seed title are not free.
     """
     people: dict[str, list[tuple[str, tuple[str, str]]]] = {}
     others: dict[str, list[tuple[str, tuple[str, str]]]] = {}
@@ -1247,13 +1258,15 @@ def _seed_short_names(
                 mentions = _name_mentions(pair[0], seed_text, part_of=(phrases[title],))
                 if mentions >= 2:
                     names[title] = (*pair, mentions, True)
+    if lang != "en":  # a Greek page that is no person keeps its title: the seed writes its inflected form
+        return names
     taken = set(people) | {pair[1] for title in intros if (pair := title_to_answer(title, lang=lang))}
     for normalized, pages in others.items():
         title, pair = pages[0]
-        if normalized in taken or _shared_words(pair[0]) & _shared_words(seed_title):
+        if len(pages) > 1 or normalized in taken or _shared_words(pair[0]) & _shared_words(seed_title):
             continue
-        phrases = tuple(_TITLE_DISAMBIGUATOR.sub("", page).strip() for page, _ in pages)
-        mentions = _name_mentions(pair[0], seed_text, part_of=phrases, mid_sentence=True)
+        phrase = _TITLE_DISAMBIGUATOR.sub("", title).strip()
+        mentions = _name_mentions(pair[0], seed_text, part_of=(phrase,), mid_sentence=True)
         if mentions >= 2 and has_seed_fill_in(*pair):
             names[title] = (*pair, mentions, False)
     return names
@@ -1313,33 +1326,31 @@ def _build_title_answer_rows(
         return page[0] == seed_title, page[1] + 0.1 * min(page[3], 10) + (0.5 if page[2] else 0.0)
 
     pages.sort(key=evidence, reverse=True)
-    short_names: dict[str, tuple[str, str, int, bool]] = {}
-    if lang == "en":  # Greek names inflect: the seed rarely writes the title's own form
-        seed_payload = _fetch_extract_with_revid(client, seed_title, full=True)
+    seed_payload = _fetch_extract_with_revid(client, seed_title, full=True)
 
-        def has_seed_fill_in(display: str, normalized: str) -> bool:
-            fills = _collect_source_backed_clue_candidates(
-                answer=display,
-                normalized_answer=normalized,
-                source_titles=[seed_title],
-                source_payloads={seed_title: seed_payload},
-                seed_title=seed_title,
-                term_source_method="article_title",
-                lang=lang,
-                min_words=6,
-                max_words=12,
-                nlp=nlp,
-                allow_fragments=False,
-            )
-            return any(nlp is None or has_verb(row["clue"], nlp) for row in fills)
-
-        short_names = _seed_short_names(
-            {page[4]: page[5] for page in pages},
-            seed_title,
-            seed_payload["extract"],
+    def has_seed_fill_in(display: str, normalized: str) -> bool:
+        fills = _collect_source_backed_clue_candidates(
+            answer=display,
+            normalized_answer=normalized,
+            source_titles=[seed_title],
+            source_payloads={seed_title: seed_payload},
+            seed_title=seed_title,
+            term_source_method="article_title",
             lang=lang,
-            has_seed_fill_in=has_seed_fill_in,
+            min_words=6,
+            max_words=12,
+            nlp=nlp,
+            allow_fragments=False,
         )
+        return any(nlp is None or has_verb(row["clue"], nlp) for row in fills)
+
+    short_names = _seed_short_names(
+        {page[4]: page[5] for page in pages},
+        seed_title,
+        seed_payload["extract"],
+        lang=lang,
+        has_seed_fill_in=has_seed_fill_in,
+    )
     for page in pages:
         if page[4] in short_names:
             page[3] = short_names[page[4]][2]  # the mentions of the answer itself
@@ -2238,6 +2249,15 @@ def run_clue_extraction_stage(
         own_title = _TITLE_DISAMBIGUATOR.sub("", page).strip()
         last_word = bool(page) and (title_short_name(page, lang=lang) or ("",))[0] == answer
         person = term["page_is_person"] == "True"
+        # A disambiguated page, or one that sends to another article for its other meaning, whose intro is off topic
+        # ("Sicily (theme)") may be another sense of the seed's word: no definition, and its own text clues nothing.
+        other_sense = (
+            bool(page)
+            and bool(_TITLE_DISAMBIGUATOR.search(page) or _SEE_OTHER_ARTICLE.match(source_cache[page].get("extract", "")))
+            and term["intro_on_topic"] == "False"
+        )
+        if other_sense:
+            source_titles = source_titles[1:]
         # The seed's name for a page that is no person ("Chicago" for "Music of Chicago"): only the seed clues it.
         seed_only = last_word and not person
         if seed_only:
@@ -2259,9 +2279,7 @@ def run_clue_extraction_stage(
         if page:
             # A page defines its own name only: its title, or any name of the person it is about ("Monet", "Peter
             # Tait" for "Peter Guthrie Tait"). Another page's redirect ("Subatomic" for "Subatomic particle") is
-            # another word, and a disambiguated page whose intro is off topic ("Sicily (theme)") may be another
-            # sense of the seed's word: both take fill-ins only.
-            other_sense = bool(_TITLE_DISAMBIGUATOR.search(page)) and term["intro_on_topic"] == "False"
+            # another word, and takes fill-ins only.
             definitions = []
             if (answer == own_title or person) and not other_sense:
                 definitions = _definition_clue_rows(
@@ -2277,14 +2295,12 @@ def run_clue_extraction_stage(
                     pool_size=len(leads),
                     seed_title=seed_title,
                 )
-            if term["intro_on_topic"] == "False":
-                # In the pool only because the seed names it: the seed's sentence ties it to the theme better
-                # than a definition of its own page.
-                seed_fills = [row for row in candidates if row["source_page"] == seed_title]
-                seed_fills = [row for row in seed_fills if _clue_candidate_rank(row, seed_title)[0]]
-                candidates = seed_fills + definitions + candidates
-            else:
-                candidates = definitions + candidates
+            # A follow-up (the second sentence) is for an answer nothing else clues: it comes after the fill-ins.
+            candidates = (
+                [row for row in definitions if row["sentence_offset"] == 0]
+                + candidates
+                + [row for row in definitions if row["sentence_offset"] == 1]
+            )
 
         for row in candidates:
             sentence = (row["source_page"], row["sentence_offset"])

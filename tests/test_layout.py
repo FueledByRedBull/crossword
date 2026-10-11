@@ -160,6 +160,21 @@ class BoardTests(unittest.TestCase):
         self.assertEqual(board.fit("TOE", layout_module._ORIGIN + 2, False), 1)
         self.assertIsNone(board.fit("TOES", layout_module._ORIGIN + 2, False))
 
+    def test_remove_never_leaves_letters_touching_side_by_side(self) -> None:
+        origin, row = layout_module._ORIGIN, layout_module._ROW
+        board = _Board(15)
+        board.place("BELL", origin, True)
+        board.place("PHASE", origin + 1 - 4 * row, False)  # ends on BELL's E
+        board.place("LIGHT", origin + 2, False)  # starts on BELL's L, one column over
+
+        def problems() -> list[str]:
+            layout = layout_module._to_layout(board.placed, 15)
+            return validate_layout(layout.grid, layout.placements)
+
+        self.assertEqual(problems(), [])
+        board.remove("BELL")
+        self.assertEqual([p for p in problems() if "non-word" in p], [])
+
     def test_components_split_when_a_bridge_word_goes(self) -> None:
         board = _Board(15)
         board.place("CAT", layout_module._ORIGIN, True)

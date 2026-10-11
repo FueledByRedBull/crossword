@@ -304,19 +304,33 @@ class _Board:
             pos += step
         self._rebound()
 
-    def remove(self, word: str) -> None:
-        pos, across = self.placed.pop(word)
-        step = 1 if across else _ROW
-        mine, theirs = self.owner[across], self.owner[not across]
-        for _ in word:
-            del mine[pos]
-            if pos in theirs:
-                self.crossings -= 1
-            else:
-                del self.letters[pos]
-            pos += step
+    def remove(self, word: str) -> dict[str, tuple[int, bool]]:
+        """Take `word` off, and with it any word its crossings would leave touching a neighbour.
+
+        Two crossing words that sit side by side are only legal while the word across their
+        ends is there. Return every word taken off, with where it stood.
+        """
+        gone: dict[str, tuple[int, bool]] = {}
+        doomed = [word]
+        for name in doomed:  # the loop also visits words appended meanwhile
+            pos, across = gone[name] = self.placed.pop(name)
+            step = 1 if across else _ROW
+            mine, theirs = self.owner[across], self.owner[not across]
+            kept = []
+            for _ in name:
+                del mine[pos]
+                if pos in theirs:
+                    self.crossings -= 1
+                    kept.append(pos)
+                else:
+                    del self.letters[pos]
+                pos += step
+            for pos in kept:
+                if pos - step in self.letters and theirs[pos] not in doomed:
+                    doomed.append(theirs[pos])
         if self.placed:
             self._rebound()
+        return gone
 
     def _rebound(self) -> None:
         spans = []
@@ -411,12 +425,12 @@ def _search(
         dropped = {}
         ruined = rng.randint(1, min(_RUIN_MAX, len(board.placed) - 1))
         for word in rng.sample(list(board.placed), ruined):
-            dropped[word] = board.placed[word]
-            board.remove(word)
+            if word in board.placed:  # an earlier removal may have taken it along
+                dropped.update(board.remove(word))
         groups = sorted(board.components(), key=len, reverse=True)
         for word in (word for group in groups[1:] for word in group):  # cut off from the main group
-            dropped[word] = board.placed[word]
-            board.remove(word)
+            if word in board.placed:
+                dropped.update(board.remove(word))
         added = _refill(board, words, scores, rng, limit)
         trial = board.value(scores)
         if trial >= value + temperature * math.log(1 - rng.random()):

@@ -173,7 +173,7 @@ class _Words(NamedTuple):
     gerund_endings: tuple[str, ...]
     determiners: frozenset[str]
     finite_verbs: frozenset[str]
-    # Find a second predicate ("... and is considered ...") with the tagger instead of `finite_verbs`.
+    # The tagger finds a second predicate ("... and is considered ...") too; where this is set it replaces `finite_verbs`.
     tagged_second_predicate: bool
     conjunctions: frozenset[str]
     and_word: str
@@ -184,6 +184,9 @@ class _Words(NamedTuple):
     # ("this pump") with the tags of the word after them that make them determiners, whether they may also follow
     # their noun ("η μέθοδος αυτή"), and phrases that point outside (matched against the folded clue).
     personal: frozenset[str]
+    # The subject is left out when it was named before: a clause that opens on a finite verb with no subject of its
+    # own, or a possessive clitic ("της") with no noun before it, leans on the previous sentence. Tagger only.
+    pro_drop: bool
     pointing: frozenset[str]
     pointing_tags: frozenset[str]
     pointing_follows_noun: bool
@@ -211,7 +214,7 @@ _EN = _Words(
     credited=re.compile(
         r",? (?:and|who) (?:is|was) (?:(?:also|\w+ly) )?(?=(?:considered|regarded|known|credited|recogni[sz]ed|remembered)\b)"
     ),
-    not_a_noun_phrase=re.compile(r"(?:also|\w+ly|\w{3,}ed)\b"),
+    not_a_noun_phrase=re.compile(r"(?:also|best|known|born|\w+ly|\w{3,}ed)\b"),
     adjunct_prepositions=_words(_EN_ADJUNCT),
     prepositions=_words(f"{_EN_ADJUNCT} of to on"),
     demonstratives=_words("this that these those"),
@@ -231,17 +234,21 @@ _EN = _Words(
     gerund_endings=(),
     determiners=_words("the a an this these its their his her some any each every all"),
     finite_verbs=_words("was is were are had has became also"),
-    tagged_second_predicate=False,  # the tagger also cuts "builds and organises", which `finite_verbs` keeps whole
+    tagged_second_predicate=False,
     conjunctions=_words("and or"),
     and_word="and",
     between=_words("between among"),
     tails=_words("including such especially particularly notably mainly mostly while whereas because although"),
     personal=_words("he she they it him them"),
+    pro_drop=False,
     pointing=_words("this these those"),
     pointing_tags=frozenset({"NOUN", "PROPN"}),
     pointing_follows_noun=False,
     genitive_endings=(),
-    outside=re.compile(r"\b(?:the (?:former|latter|following)|(?:doing|did|does) so|likewise)\b"),
+    outside=re.compile(
+        r"\b(?:the (?:former|latter|following)|(?:doing|did|does) so|likewise|aforementioned|above-mentioned|see (?:above|below)"
+        r"|as (?:noted|mentioned|discussed|described|stated|explained|shown|seen) (?:above|below|earlier|previously|before))\b"
+    ),
     articles=frozenset(),
     coordinators=frozenset({"and", "or"}),
     stem_trim=0,
@@ -296,13 +303,15 @@ _EL = _Words(
     and_word="και",
     between=_words("μεταξύ"),
     tails=_words("συμπεριλαμβανομένων ιδίως ειδικά ειδικότερα όπως δηλαδή ενώ επειδή καθώς αφού αν εάν"),
-    personal=frozenset(),  # pro-drop: the subject pronoun is rarely written
+    personal=frozenset(),  # the subject pronoun is rarely written
+    pro_drop=True,
     pointing=_words(_EL_DEMONSTRATIVE),
     pointing_tags=frozenset({"DET"}),  # "αυτή η μέθοδος": the article comes first
     pointing_follows_noun=True,
     genitive_endings=("ου", "ης", "ων"),
     outside=re.compile(
-        r"\b(?:ακολουθ(?:ος|η|ο|οι|ες|α|ου|ης|ων|ους|ον)|παρακατω|(?:ο|η|το) πρωτ\w+\b.*\b(?:ο|η|το) δευτερ\w+)\b"
+        r"\b(?:ακολουθ(?:ος|η|ο|οι|ες|α|ου|ης|ων|ους|ον)|παρακατω|ανωτερω|προαναφερθ\w+|οπως (?:αναφερθηκε|ειδαμε)"
+        r"|(?:ο|η|το) πρωτ\w+\b.*\b(?:ο|η|το) δευτερ\w+)\b"
     ),
     articles=_words(_EL_ARTICLE),
     coordinators=frozenset({"και", "κι", "ή"}),
@@ -366,21 +375,55 @@ def _reaches_its_verb(kept: list[str], relative: int, nlp) -> bool:
     return any(token.pos_ in {"VERB", "AUX"} and token.idx >= start for token in nlp(" ".join(kept)))
 
 
+# Prepositions that take a time ("... Mark Antony during the final years"), where "in", "with" or "at" may belong to a
+# noun or to the verb ("played a key role in ...", "merged X with ..."). The parser's "prep" label is English.
+_TIME_ADJUNCTS = frozenset({"during", "after", "before", "since", "until", "throughout"})
+
+
+def _ends_its_clause(kept: list[str], relatives: list[int], doc, nlp) -> bool:
+    """True when each relative clause of `kept` has its verb and the cut falls after a noun, before a time adjunct of that verb.
+
+    "A general who formed the Second Triumvirate alongside Octavian and Mark Antony [during ...]" is whole. `doc` is the
+    tagged, parsed predicate.
+    """
+    offset = len(" ".join(kept)) + 1
+    cut = next((token for token in doc if token.idx == offset), None)
+    last = [token for token in doc if token.idx < offset and not token.is_punct]
+    return (
+        cut is not None
+        and cut.dep_ == "prep"
+        and cut.lower_ in _TIME_ADJUNCTS
+        and cut.head.pos_ in {"VERB", "AUX"}
+        and bool(last)
+        and last[-1].pos_ in {"NOUN", "PROPN"}
+        and all(_reaches_its_verb(kept, pos, nlp) for pos in relatives)
+    )
+
+
 def _clean_prefix(words: list[str], limit: int, lex: _Words, nlp=None) -> list[str] | None:
     """Longest prefix of at most `limit` words that stops at a clean boundary, or None."""
+
+    doc = nlp(" ".join(words)) if nlp is not None else None
 
     def prefix(count: int, at_comma: bool, safe: bool) -> list[str] | None:
         kept = words[:count]
         commas = [i for i, word in enumerate(kept[:-1]) if word[-1] in ",;:"]
-        # An orphan after the last comma ("..., all", "..., a state") is dropped; "..., and X" closes a list.
+        # An orphan after the last comma ("..., all", "..., a state") is dropped; "..., and X" closes a list, unless
+        # it is the only comma and the cut took the complement of X ("a painter, and expert [in the rendering of ...]").
         if (
             not at_comma
             and commas
             and len(kept) - commas[-1] - 1 <= 2
-            and _fold(kept[commas[-1] + 1]) not in lex.conjunctions
+            and (
+                _fold(kept[commas[-1] + 1]) not in lex.conjunctions
+                or (len(commas) == 1 and len(kept) - commas[-1] == 3 and _fold(words[count]) in lex.adjunct_prepositions)
+            )
         ):
             kept = kept[: commas[-1] + 1]
         if len(kept) < 5 or _fold(kept[-1].strip(",;:")) in lex.weak_end:
+            return None
+        # A name is no place to cut ("member of the Centre [for Quantum Information]").
+        if doc is not None and any(ent.start_char < len(" ".join(kept)) < ent.end_char for ent in doc.ents):
             return None
         # An aside opened after a function word ("a folk instrument that, in its form,") never closes.
         if any(_fold(word.rstrip(",;:")) in lex.weak_end for word in kept[:-1] if word[-1] in ",;:"):
@@ -409,7 +452,7 @@ def _clean_prefix(words: list[str], limit: int, lex: _Words, nlp=None) -> list[s
                 and lowered[pos + 1] not in lex.determiners
                 for pos in relatives
             )
-            if not (at_comma and has_verb):
+            if not (has_verb and (at_comma or doc is not None and _ends_its_clause(kept, relatives, doc, nlp))):
                 return None
         # A relative clause that opens on an aside ("που σε πολύ απλή απόδοση, εκφράζει ...") has its verb after it.
         # Elsewhere the word after the relative is taken for the verb: the tagger misses too many ("που μελετά").
@@ -424,6 +467,8 @@ def _clean_prefix(words: list[str], limit: int, lex: _Words, nlp=None) -> list[s
     for i in range(1, limit):
         word = words[i]
         if word[-1] in ",;:":
+            if _fold(word.strip(",;:")) in lex.conjunctions:  # "... jazz piano [and, according to one source, ...]"
+                cuts.setdefault(i, (True, False))
             closes_list = _fold(words[i - 1]) in lex.conjunctions and words[i - 2][-1] == ","
             place = words[i - 1][-1] == "," and words[i - 1][0].isupper() and word[0].isupper()
             inside_list = (
@@ -442,6 +487,17 @@ def _clean_prefix(words: list[str], limit: int, lex: _Words, nlp=None) -> list[s
             )
         elif _fold(word).endswith(lex.gerund_endings):
             cuts[i] = (True, False)
+        elif _fold(word) in lex.relatives:
+            # The first relative clause may start the cut-off part ("... the circle of painters in Paris [who ...]"), as in
+            # the last resort below, unless a participle or a comma before it has a say ("hypotheses proposing [that ...]").
+            before = _fold(words[i - 1])
+            if (
+                (i >= 6 or _fold(word) in lex.person_relatives)
+                and words[i - 1][-1] not in ",;:"
+                and not before.endswith(lex.participle_endings)
+                and before not in lex.participles
+            ):
+                cuts[i] = (False, False)
     for count in sorted(cuts, reverse=True):
         if (kept := prefix(count, *cuts[count])) is not None:
             return kept
@@ -477,9 +533,14 @@ def _subject_tail(subject: str, answer: str, lex: _Words) -> str | None:
 
 
 def _is_noun_phrase(clue: str, nlp) -> bool:
-    """A noun phrase neither starts with a verb or adverb ("Fought in 53 BC ...") nor ends in a function word or adverb."""
+    """A noun phrase neither starts with a verb or adverb ("Fought in 53 BC ...") nor ends in a function word or adverb.
+
+    Nor does it open on an adjective that wants a complement ("Popular in the 1940s", "Distinct from previous bebop").
+    """
     tokens = [token for token in nlp(clue) if not token.is_punct]
-    return bool(tokens) and tokens[0].pos_ not in _BAD_START and tokens[-1].pos_ not in _BAD_END
+    if not tokens or tokens[0].pos_ in _BAD_START or tokens[-1].pos_ in _BAD_END:
+        return False
+    return not (len(tokens) > 1 and tokens[0].pos_ == "ADJ" and tokens[1].pos_ in {"ADP", "SCONJ"})
 
 
 def _is_finite_verb(token) -> bool:
@@ -490,11 +551,15 @@ def _starts_second_predicate(words: list[str], i: int, lex: _Words, doc) -> bool
     """True when the "and" at `words[i]` is followed by a verb of its own ("a mathematician and was one of ...").
 
     With a tagged `doc` any finite verb counts, but not the last of a list of verbs ("describes, analyses and predicts").
+    Where `finite_verbs` stays in use, the tagger adds only verbs outside a relative clause, which they go on with
+    ("that has mass and occupies space").
     """
     if _fold(words[i]) != lex.and_word:
         return False
-    if doc is None:
-        return _fold(words[i + 1]) in lex.finite_verbs
+    if _fold(words[i + 1]) in lex.finite_verbs and (doc is None or not lex.tagged_second_predicate):
+        return True
+    if doc is None or (not lex.tagged_second_predicate and any(_fold(word) in lex.relatives for word in words[:i])):
+        return False
 
     def finite(index: int) -> bool:
         offset = len(" ".join(words[:index])) + (index > 0)
@@ -526,8 +591,14 @@ def definition_clue(
             return None
     predicate = " ".join(lead[copula + 1 :]).rstrip(".")
     words = (lex.credited.sub(", ", predicate) if lex.credited else predicate).split()
+    # What follows a colon explains the definition ("... in Physics twice: first in 1956").
+    colon = next((i for i, word in enumerate(words) if word.endswith(":")), None)
+    if colon is not None:
+        words = words[: colon + 1]
+        if _fold(words[-1].rstrip(":")) in lex.weak_end:
+            return None
     # A second predicate ("a mathematician and was one of ...") does not belong to the definition.
-    doc = nlp(" ".join(words)) if nlp is not None and lex.tagged_second_predicate else None
+    doc = nlp(" ".join(words)) if nlp is not None else None
     for i in range(3, len(words) - 1):
         if _starts_second_predicate(words, i, lex, doc):
             words = words[:i]
@@ -558,6 +629,36 @@ def definition_clue(
     return None if nlp is not None and not _is_noun_phrase(clue, nlp) else clue
 
 
+def follow_up_definition(
+    sentence: str, answer: str, *, max_words: int = 16, nlp=None, lang: str = "en"
+) -> str | None:
+    """Cut a definition from a later sentence of the intro: "He was one of the most influential figures in jazz piano."
+
+    For an answer whose first sentence defines nothing. The sentence has to be about the answer and say what it is:
+    its subject is a personal pronoun, the answer's name or surname, or (in Greek, which drops the subject) nothing,
+    and the first verb is a copula. "He played with Miles Davis and was a member of ..." and "Hancock's mother was ..."
+    are refused. The cut, the word limit and the checks are those of `definition_clue`.
+    """
+    lex = _WORDS[lang]
+    words = strip_parentheticals(sentence).split()
+    copula = next((i for i, word in enumerate(words) if _fold(word) in lex.copulas), None)
+    if copula is None:
+        return None
+    subject = [word for word in words[:copula] if _fold(word) not in lex.articles]
+    parts = {_fold(part) for part in answer.split()}
+    # The name ends in the answer's last word and has no common word of its own: "Hancock's mother", "the album by Hancock".
+    named = (
+        bool(subject)
+        and _subject_tail(" ".join(subject), answer, lex) == ""
+        and all(word[0].isupper() or _fold(word) in parts for word in subject)
+    )
+    if not (named or (len(subject) == 1 and _fold(subject[0]) in lex.personal) or (not subject and lex.pro_drop)):
+        return None
+    # `definition_clue` wants the answer's name before the copula, as in a first sentence.
+    lead = " ".join([answer.split()[-1], *words[copula:]])
+    return definition_clue(lead, max_words=max_words, answer=answer, nlp=nlp, lang=lang)
+
+
 # A word is rare when at most this share of the pool's lead sentences (and never fewer than two) contain it.
 _RARE_LEAD_SHARE = 1 / 30
 _WORD = re.compile(r"\w+")
@@ -577,9 +678,13 @@ _MEANING_MARKERS = {
     "encompassing", "that", "which",
 }
 # "Any of many different quantities", "One of several ...": the class is not named. "One of the earliest ..." is.
+# So is "A wide range of physical processes", with nothing but a bare plural after the "of": what follows
+# "A large group of Germanic peoples first reported by Julius Caesar" pins the group down.
 _VAGUE_OPENER = re.compile(
     r"(?:any|various|several|many|some|numerous|multiple)\b"
-    r"|one of (?:the )?(?:several|many|various|numerous|multiple|some|a number of|a few)\b",
+    r"|one of (?:the )?(?:several|many|various|numerous|multiple|some|a number of|a few)\b"
+    r"|(?:an?|the) (?:wide|broad|large|great|vast|whole|diverse) "
+    r"(?:range|variety|number|array|class|set|group|family|collection) of (?-i:[a-z-]+(?: [a-z-]+)?)$",
     re.IGNORECASE,
 )
 
@@ -752,20 +857,28 @@ def _outside_reference(clue: str, nlp, lang: str) -> str | None:
     """Name the rule when a fill-in leans on an earlier sentence in the middle, else None.
 
     A personal pronoun with no noun, name or blank before it ("In 1870 he introduced ..."), "this pump" or "της
-    εμφάνισης αυτής" when no pump or εμφάνιση came before, "the former", "doing so". With `nlp` the nouns are the
-    tagged ones; without it every word that is not a stopword or a number counts as one, so "Because of this, it ..."
-    is not caught.
+    εμφάνισης αυτής" when no pump or εμφάνιση came before, "the former", "doing so", "as noted above". Greek, which
+    drops its subject, also leans back with a finite verb that opens the clue without a subject ("Εφαρμόζεται στην
+    ____") and with a possessive "της" that has no noun before it. With `nlp` the nouns are the tagged ones; without
+    it every word that is not a stopword or a number counts as one, so "Because of this, it ..." is not caught, and
+    neither are the two Greek cases.
     """
     lex = _WORDS[lang]
     if lex.outside.search(" ".join(_fold(word) for word in clue.split())):
         return "phrase"
     blanks = {i for m in re.finditer(re.escape(BLANK), clue) for i in range(*m.span())}
+    clitics: set[int] = set()
     if nlp is not None:
-        items = [
-            (token.text, token.idx in blanks or token.pos_ in {"NOUN", "PROPN"}, token.pos_)
-            for token in nlp(clue)
-            if not (token.idx in blanks and token.idx - 1 in blanks)  # the tokenizer splits a blank into its underscores
-        ]
+        # The tokenizer splits a blank into its underscores.
+        tokens = [token for token in nlp(clue) if not (token.idx in blanks and token.idx - 1 in blanks)]
+        items = [(token.text, token.idx in blanks or token.pos_ in {"NOUN", "PROPN"}, token.pos_) for token in tokens]
+        if lex.pro_drop:
+            first = tokens[0]  # "Μπορούμε" (we can) names its subject: only a third person has it in an earlier sentence
+            if _is_finite_verb(first) and first.morph.get("Person") == ["3"] and not any(
+                child.dep_.startswith(("nsubj", "csubj")) for child in first.children
+            ):
+                return "verb without subject"
+            clitics = {i for i, token in enumerate(tokens) if token.pos_ == "PRON" and "Yes" in token.morph.get("Poss")}
     else:
         ignored = get_stopwords(lang) | {word.upper() for word in _BACK_REFERENCES}
         items = []
@@ -776,7 +889,7 @@ def _outside_reference(clue: str, nlp, lang: str) -> str | None:
             items.append((word, noun, "DET" if article else "NOUN" if noun else ""))
     cores = [_fold(text.strip(_PUNCTUATION)) for text, _, _ in items] + ["", ""]
     for i, word in enumerate(cores[:-2]):
-        if word in lex.personal and not any(noun for _, noun, _ in items[:i]):
+        if (word in lex.personal or i in clitics) and not any(noun for _, noun, _ in items[:i]):
             return "pronoun"
         # "αυτό που ...", "αυτός ο οποίος ..." (the one that) point at nothing.
         if word not in lex.pointing or cores[i + 2 if cores[i + 1] in lex.articles else i + 1] in lex.relatives:

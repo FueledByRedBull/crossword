@@ -10,6 +10,7 @@ from src.clue_builder import (
     clue_pass_validate,
     definition_clue,
     enforce_diversity,
+    follow_up_definition,
     has_morphological_leakage,
     has_verb,
     is_generic_definition,
@@ -631,8 +632,20 @@ class GenericDefinitionTests(unittest.TestCase):
         self.assertFalse(self._generic("jazz", clue, nlp))
 
     def test_a_vague_quantifier_opens_a_generic_definition(self) -> None:
-        for clue in ("Any of many different quantities", "One of several unrelated wave phenomena", "Various small birds"):
+        for clue in (
+            "Any of many different quantities",
+            "One of several unrelated wave phenomena",
+            "Various small birds",
+            "A wide range of physical processes",
+            "A large group of musicians",
+        ):
             self.assertTrue(self._generic("quantum", clue), clue)
+        # What follows the group pins it down.
+        for clue in (
+            "A group of young French artists active in Paris from 1888 until 1900",
+            "A large group of Germanic peoples first reported by Julius Caesar in the 1st century BC",
+        ):
+            self.assertFalse(self._generic("impressionism", clue), clue)
         for clue in (
             "One of the earliest foundational tunes of Afro-Cuban jazz",
             "One of the world's earliest sewage systems",
@@ -765,8 +778,16 @@ class FillInReferenceTests(unittest.TestCase):
         "Writing a ____ does not provide the complete information necessary to describe this state-change process.",
         "The team said it did so and the ____ rose.",
         "____ elements can be represented likewise, ...",
+        "As noted above, jazz has incorporated from its inception aspects of African-American sacred music including ____ and hymns.",
+        "Each ____ is, as described below, a measure of the disorder in a closed system.",
+        "The ____ of the gas can be found as mentioned earlier from its pressure and volume.",
+        "For the proof see below, where the ____ is defined for an ideal gas.",
+        "The aforementioned ____ is a measure of the disorder in a closed system.",
+        "The above-mentioned ____ is a measure of the disorder in a closed system.",
     )
     KEPT = (
+        "The balloon rose above the ____ and drifted slowly away from the village.",
+        "Divers who went below the ____ found a cave that nobody had explored before.",
         "Segments of the ____ are often described as walls; they have respective defined 'permeabilities'.",
         "Heraclius, son of the exarch of ____, set sail for the city and assumed the throne.",
         "The wolf was the sacred animal of ____, with the she-wolf nursing the two founders as children.",
@@ -809,6 +830,10 @@ class FillInReferenceTests(unittest.TestCase):
             "Υπολογίζονται τα ακόλουθα μεγέθη: η ____ και η πίεση.",
             "Οι παρακάτω τύποι δίνουν την ____ του συστήματος.",
             "Ο πρώτος νόμος αφορά την ενέργεια, ο δεύτερος την ____.",
+            "Όπως αναφέρθηκε, η ____ μεταφέρεται από το ένα σώμα στο άλλο.",
+            "Η προαναφερθείσα ____ μεταφέρεται από το ένα σώμα στο άλλο.",
+            "Η ____ μεταφέρεται, όπως είδαμε, από το ένα σώμα στο άλλο.",
+            "Η μεταφορά της ____ δίνεται από τον τύπο που αναφέρεται ανωτέρω.",
         ):
             with self.subTest(clue=clue):
                 self.assertFalse(self._passes(clue, lang="el"))
@@ -820,6 +845,30 @@ class FillInReferenceTests(unittest.TestCase):
             with self.subTest(clue=clue):
                 self.assertTrue(self._passes(clue, lang="el"))
 
+    def test_a_greek_verb_without_a_subject_or_a_possessive_without_a_noun_points_outside(self) -> None:
+        nlp = _load_nlp("el_core_news_sm")
+        if nlp is None:
+            self.skipTest("Greek spaCy model not available")
+        rejected = (
+            "Εφαρμόζεται στην κοσμολογία και την ____, συμπεριλαμβανομένης της αστρονομίας.",
+            "Μέσα από τους νόμους εισάγονται δύο κεντρικές της έννοιες, η ____ και η εντροπία.",
+        )
+        kept = (
+            "Η ____ και οι εφαρμογές της εξελίσσονται σήμερα, με ηγέτη τις Η.Π.Α., ...",  # της refers to the blank
+            "Ο μοναδικός φυσικός δορυφόρος της Γης είναι η ____.",  # της is an article
+            "Το 594 π.Χ. ο Σόλων ο Αθηναίος καθιέρωσε το ____ ως μέτρηση του χρόνου.",
+            "Η ____ ήταν ο πρώτος κλάδος της φυσικής.",
+            "Ο Ήλιος είναι ο κοντινότερος ____ στη Γη.",
+            "Γενικά, η ____ γεννήθηκε με την εμφάνιση του «διανοούμενου ανθρώπου» στον ημέτερο πλανήτη.",
+            "Μπορούμε, όμως, να προσεγγίσουμε το ____ εντελώς οριακά, ...",  # "we" is not in the previous sentence
+        )
+        for clue in rejected:
+            with self.subTest(clue=clue):
+                self.assertFalse(self._passes(clue, nlp, lang="el"))
+                self.assertTrue(self._passes(clue, lang="el"))  # without a tagger they are not caught
+        for clue in kept:
+            with self.subTest(clue=clue):
+                self.assertTrue(self._passes(clue, nlp, lang="el"))
 
     def test_a_greek_demonstrative_points_outside_before_or_after_its_noun(self) -> None:
         rejected = (
@@ -894,7 +943,7 @@ class FillInListTests(unittest.TestCase):
             "en",
         ),
         ("Sicily", "The annexation of Sicily and Tunisia in North Africa provided a continuous supply of grains.", "en"),
-        ("Ενέργεια", "Μέσα από τους νόμους εισάγονται δύο κεντρικές της έννοιες, η ενέργεια και η εντροπία.", "el"),
+        ("Ενέργεια", "Μέσα από τους νόμους εισάγονται δύο κεντρικές έννοιες, η ενέργεια και η εντροπία.", "el"),
         ("Φιλοσοφία", "Τέλος η Αστρονομία σχετίζεται στενά με τη Φιλοσοφία και τη Μεταφυσική.", "el"),
         # A comma after the blank that opens no list.
         (
@@ -1048,6 +1097,192 @@ class DefinitionCutTests(unittest.TestCase):
             definition_clue(roman_law, answer="Roman law", max_words=18),
             "The legal system of ancient Rome, including the legal developments spanning over a thousand years of jurisprudence",
         )
+
+    def test_the_cut_runs_up_to_the_relative_clause_when_that_is_the_longest_clean_end(self) -> None:
+        morisot = (
+            "Berthe Marie Pauline Morisot was a French painter, printmaker and a member of the circle of painters "
+            "in Paris who became known as the Impressionists."
+        )
+        self.assertEqual(
+            definition_clue(morisot, answer="Berthe Morisot"),
+            "A French painter, printmaker and a member of the circle of painters in Paris",
+        )
+        # The clause is no part of the definition after a comma, which has its cut, or a participle that wants it.
+        spirituals = (
+            "Spirituals is a genre of Christian music that is associated with African Americans, which merged varied "
+            "African cultural influences with the experiences of being held in bondage in slavery."
+        )
+        self.assertEqual(
+            definition_clue(spirituals, answer="Spirituals"), "A genre of Christian music that is associated with African Americans"
+        )
+        mind = (
+            "Quantum mind is a large group of theoretical hypotheses in physics proposing that local physical laws "
+            "and interactions from classical mechanics alone cannot explain consciousness."
+        )
+        self.assertEqual(definition_clue(mind, answer="Quantum mind"), "A large group of theoretical hypotheses")
+
+    def test_and_followed_by_a_comma_opens_an_aside_that_is_cut_off(self) -> None:
+        hines = (
+            "Hines was one of the most influential figures in the development of jazz piano and, according to one "
+            "source, one of a small number of pianists whose playing shaped the history of jazz."
+        )
+        self.assertEqual(
+            definition_clue(hines, answer="Earl Hines"), "One of the most influential figures in the development of jazz piano"
+        )
+
+    def test_a_predicate_that_opens_on_an_adjective_with_its_complement_is_not_a_noun_phrase(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        lead = "Jump blues was popular in the 1940s and was a precursor of rhythm and blues."
+        self.assertEqual(definition_clue(lead), "Popular in the 1940s")
+        self.assertIsNone(definition_clue(lead, nlp=nlp))
+
+    def test_a_definition_stops_at_a_colon(self) -> None:
+        density = (
+            "A density matrix is a generalization of the state vectors or wavefunctions: while those can only "
+            "represent pure states, density matrices can also represent mixed states."
+        )
+        self.assertEqual(definition_clue(density, answer="Density matrix"), "A generalization of the state vectors or wavefunctions")
+        # What is left before the colon must still end cleanly.
+        self.assertIsNone(definition_clue("Heat is a form of energy such as: electrical, thermal and chemical energy.", answer="Heat"))
+
+    def test_a_cut_never_falls_inside_a_name(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        kent = (
+            "Adrian Kent is a professor at the University of Cambridge, member of the Centre for Quantum Information "
+            "and Foundations, and a fellow of the Institute."
+        )
+        self.assertEqual(definition_clue(kent, answer="Adrian Kent", nlp=nlp), "A professor at the University of Cambridge")
+        # "Honorius at Mediolanum" is a person and a place: the cut may fall between them.
+        claudian = (
+            "Claudius Claudianus, known in English as Claudian, was a Latin poet associated with the court of the Roman "
+            "emperor Honorius at Mediolanum, and particularly with the general Stilicho."
+        )
+        self.assertEqual(
+            definition_clue(claudian, answer="Claudian", nlp=nlp), "A Latin poet associated with the court of the Roman emperor Honorius"
+        )
+        # A date is not cut in two either.
+        blue = "Kind of Blue is a studio album by American jazz musician Miles Davis, released on August 17, 1959, by Columbia Records."
+        self.assertEqual(definition_clue(blue, answer="Kind of Blue", nlp=nlp), "A studio album by American jazz musician Miles Davis")
+
+    def test_the_tagger_finds_a_second_predicate_after_a_noun_phrase_but_not_inside_a_relative_clause(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        monet = "Jean Monet was the subject of several paintings by his father and married his step-sister, Blanche Hoschedé."
+        self.assertEqual(definition_clue(monet, answer="Jean Monet", nlp=nlp), "The subject of several paintings by his father")
+        # Without a tagger only the listed verbs ("was", "is", "also") start one.
+        self.assertEqual(
+            definition_clue(monet, answer="Jean Monet"),
+            "The subject of several paintings by his father and married his step-sister, Blanche Hoschedé",
+        )
+        matter = "Matter is anything that has mass and occupies space by having volume."
+        self.assertEqual(definition_clue(matter, answer="Matter", nlp=nlp), "Anything that has mass and occupies space by having volume")
+
+    def test_a_comma_and_one_word_that_lost_its_complement_is_dropped(self) -> None:
+        boudin = "Eugène Louis Boudin was a marine painter, and expert in the rendering of all that goes upon the sea and along its shores."
+        spin = (
+            "Spin is an intrinsic form of angular momentum carried by elementary particles, and thus by composite "
+            "particles such as hadrons, atomic nuclei, and atoms."
+        )
+        for nlp in (None, _load_nlp()):
+            self.assertIsNone(definition_clue(boudin, answer="Eugène Boudin", nlp=nlp))
+            self.assertEqual(
+                definition_clue(spin, answer="Spin", nlp=nlp), "An intrinsic form of angular momentum carried by elementary particles"
+            )
+
+    def test_a_relative_clause_with_its_object_may_end_before_a_time_adjunct(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        lepidus = (
+            "Marcus Aemilius Lepidus was a Roman general and statesman who formed the Second Triumvirate alongside "
+            "Octavian and Mark Antony during the final years of the Roman Republic."
+        )
+        self.assertEqual(
+            definition_clue(lepidus, answer="Lepidus", nlp=nlp),
+            "A Roman general and statesman who formed the Second Triumvirate alongside Octavian and Mark Antony",
+        )
+        self.assertEqual(definition_clue(lepidus, answer="Lepidus"), "A Roman general and statesman")
+        # "in" may belong to the noun ("a role in ..."): the clause is not whole before it.
+        gell_mann = (
+            "Murray Gell-Mann was an American theoretical physicist who played a preeminent role in the development "
+            "of the theory of elementary particles."
+        )
+        self.assertEqual(definition_clue(gell_mann, answer="Murray Gell-Mann", nlp=nlp), "An American theoretical physicist")
+
+
+class FollowUpDefinitionTests(unittest.TestCase):
+    PIANO = (
+        "He was one of the most influential figures in the development of jazz piano and, according to one "
+        "source, one of a small number of pianists whose playing shaped the history of jazz."
+    )
+
+    def test_a_pronoun_or_the_name_before_a_copula_gives_the_definition(self) -> None:
+        pianist = "An American pianist, keyboardist, bandleader and composer"
+        for sentence, answer, expected in (
+            (self.PIANO, "Earl Hines", "One of the most influential figures in the development of jazz piano"),
+            ("Hancock was an American pianist, keyboardist, bandleader and composer.", "Herbie Hancock", pianist),
+            ("Herbie Hancock was an American pianist, keyboardist, bandleader and composer.", "Herbie Hancock", pianist),
+            ("They were an American rock band formed in Los Angeles in 1965.", "The Doors", "An American rock band formed in Los Angeles in 1965"),
+            ("It is a genre of popular music that emerged in the 1970s.", "Hip-hop", "A genre of popular music that emerged in the 1970s"),
+            ("The electron is an elementary particle contained in matter.", "Electron", "An elementary particle contained in matter"),
+        ):
+            with self.subTest(sentence=sentence):
+                self.assertEqual(follow_up_definition(sentence, answer), expected)
+
+    def test_it_cuts_like_definition_clue(self) -> None:
+        self.assertEqual(follow_up_definition(self.PIANO, "Earl Hines", max_words=8), "One of the most influential figures")
+        self.assertEqual(
+            follow_up_definition(self.PIANO, "Earl Hines", max_words=18),
+            "One of the most influential figures in the development of jazz piano",
+        )
+
+    def test_another_subject_or_a_verb_before_the_copula_is_refused(self) -> None:
+        for sentence in (
+            "He played with Miles Davis and was one of the most influential figures in jazz.",
+            "Hancock's mother was a teacher of the piano at the local school.",
+            "The album by Hancock was a landmark of the jazz fusion movement.",
+            "Hancock played the piano in many bands.",
+            "Miles Davis was an American jazz trumpeter, bandleader and composer.",
+        ):
+            with self.subTest(sentence=sentence):
+                self.assertIsNone(follow_up_definition(sentence, "Herbie Hancock"))
+
+    def test_a_predicate_that_says_what_the_answer_is_known_for_is_refused(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        for sentence in (
+            "He was best known for his work with Miles Davis and the Headhunters.",
+            "She was known as the queen of soul and gospel music in the United States.",
+            "He was born in Chicago, Illinois, to a family of professional musicians.",
+        ):
+            for model in (None, nlp):
+                with self.subTest(sentence=sentence, tagger=model is not None):
+                    self.assertIsNone(follow_up_definition(sentence, "Herbie Hancock", nlp=model))
+        # An adjective with its complement says little more.
+        popular = "It was popular in the 1940s and was a precursor of rhythm and blues."
+        self.assertEqual(follow_up_definition(popular, "Jump blues"), "Popular in the 1940s")
+        self.assertIsNone(follow_up_definition(popular, "Jump blues", nlp=nlp))
+
+    def test_a_greek_bare_copula_or_the_name_opens_the_follow_up(self) -> None:
+        nlp = _load_nlp("el_core_news_sm")
+        for sentence, answer, expected in (
+            ("Ήταν Σκωτσέζος μηχανικός και φυσικός.", "Ουίλιαμ Ράνκιν", "Σκωτσέζος μηχανικός και φυσικός"),
+            ("Υπήρξε ένας από τους πρωτοπόρους της θερμοδυναμικής.", "Ουίλιαμ Ράνκιν", "Ένας από τους πρωτοπόρους της θερμοδυναμικής"),
+            ("Ο Ράνκιν ήταν Σκωτσέζος μηχανικός και φυσικός.", "Ουίλιαμ Ράνκιν", "Σκωτσέζος μηχανικός και φυσικός"),
+            ("Η φασματοσκοπία είναι κλάδος της φυσικής και ιδιαίτερα της οπτικής.", "Φασματοσκοπία", "Κλάδος της φυσικής και ιδιαίτερα της οπτικής"),
+        ):
+            for model in (None, nlp):
+                with self.subTest(sentence=sentence, tagger=model is not None):
+                    self.assertEqual(follow_up_definition(sentence, answer, nlp=model, lang="el"), expected)
+        self.assertIsNone(follow_up_definition("Ο Ράνκιν μελέτησε τη θερμοδυναμική και ήταν καθηγητής.", "Ουίλιαμ Ράνκιν", lang="el"))
+        # English does not drop its subject.
+        self.assertIsNone(follow_up_definition("Was an American pianist and bandleader.", "Herbie Hancock"))
 
 
 GREEK_LEADS = {

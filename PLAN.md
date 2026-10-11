@@ -90,7 +90,7 @@ A seed is graded when it has `word_count > 0` and a known `puzzle_status`; Gates
    - Add candidates until crossword-aware marginal utility plateaus.
 5. `Term Extraction + Filtering`:
    - Take answers primarily from the titles of the most relevant linked articles, then from extracted noun phrases/entities, and apply quality filters.
-   - Answer a page by the last word of its title when the seed article uses that word on its own as a name at least twice (`MONET` for "Claude Monet", `CARTHAGE` for "Ancient Carthage"; English only).
+   - Answer a page by the last word of its title when the seed article uses that word on its own as a name at least twice (`MONET` for "Claude Monet", `CARTHAGE` for "Ancient Carthage"; in Greek only a person's surname in the title's own form). A word that ends two or more non-person titles ("Empire") is nobody's name.
 6. `Clue Generation`:
    - Definition clue from the article's first sentence; fill-in-the-blank as fallback.
    - Four-pass extract/mask-trim/validate/diversity pipeline.
@@ -261,7 +261,7 @@ Additional notes:
 
 #### Pass 1: Extract
 
-1. Definition: the first sentence of the answer's own article with the subject removed, cut only at a clean boundary. A page defines only its own name: its title, or a name of the person it is about. A redirect's name, a disambiguated title whose intro is off topic, and a short name of a page that is not about a person take fill-ins only.
+1. Definition: the first sentence of the answer's own article with the subject removed, cut only at a clean boundary. A page defines only its own name: its title, or a name of the person it is about. A redirect's name and a short name of a page that is not about a person take fill-ins only. A page that may be another sense of the seed's word (a disambiguated title, or an intro that opens by sending the reader to another article, with an off-topic intro) gets no definition and its own text clues nothing. When the first sentence gives no usable definition, the second is cut the same way if its subject is a pronoun or the answer's name ("He was one of ..."); it is used only when no fill-in exists.
 2. Fill-in-the-blank: sentences that contain the answer, taken only from the seed article, the answer's own page, or a selected article whose intro is on topic. A short name of a page that is not about a person takes them from the seed alone; for a person's surname the blank may stand for the full name.
 
 #### Pass 2: Mask + Trim
@@ -272,13 +272,13 @@ Additional notes:
 #### Pass 3: Validate
 
 1. Reject clues containing the answer or a morphological cousin of it (lemma/stem check).
-2. Reject a fill-in that points outside itself: an opening back-reference word, a pronoun with nothing before it to refer to, a demonstrative with a noun not named earlier, "the former", "the following", "doing so"; and a cut fill-in that lost its finite verb. Reject a fill-in whose blank is one part of a longer proper name, or one item of a list of three or more.
+2. Reject a fill-in that points outside itself: an opening back-reference word, a pronoun with nothing before it to refer to, a demonstrative with a noun not named earlier, "the former", "the following", "doing so", "as noted above"; in Greek a verb that opens the sentence without a subject and a possessive with no noun before it; and a cut fill-in that lost its finite verb. Reject a fill-in whose blank is one part of a longer proper name, or one item of a list of three or more.
 3. Reject a generic definition: no word that is rare among the pool's lead sentences; the answer's nationality with fewer than two such words; a kind-of-word head noun without its meaning; a vague quantifier opener.
 4. Reject clues below the minimum word count (3 for a definition, 6 for a fill-in) as too vague.
 
 #### Pass 4: Order and Diversity
 
-1. The definition comes first; an answer whose own intro is off topic takes a clean seed sentence before it; among fill-ins the seed's sentences win.
+1. The definition comes first; among fill-ins the seed's sentences win; a definition cut from the second sentence comes last.
 2. Bucket fill-in clues by their first 3 tokens and keep at most 2 per bucket across the puzzle.
 3. No clue text and no source sentence is used twice.
 
