@@ -199,7 +199,7 @@ If `J(K)` plateaus but the vocabulary readiness gate is not satisfied, apply the
 
 1. Loosen `min_df` to `1` (from adaptive default).
 2. Promote up to 3 `BORDERLINE` candidates into the selected set.
-3. Enable 2-hop expansion if not already active.
+3. Widen from the selected articles: score the pages linked from at most 6 selected articles whose intro is on topic (an even sample of each one's links, at most 100 new pages), let the best 6 join the selected articles, and let all of them be answers.
 4. Reduce minimum answer length from `4` to `3`.
 5. If all four steps fail: emit `puzzle_status: insufficient_vocabulary` and halt gracefully.
 
@@ -260,28 +260,26 @@ Additional notes:
 
 #### Pass 1: Extract
 
-1. Pull sentence containing candidate answer term.
-2. Keep top sentence candidates per answer.
+1. Definition: the first sentence of the answer's own article with the subject removed, cut only at a clean boundary.
+2. Fill-in-the-blank: sentences that contain the answer, taken only from the seed article, the answer's own page, or a selected article whose intro is on topic.
 
 #### Pass 2: Mask + Trim
 
-1. Mask answer surface form in clue text.
-2. Trim to a single clause where possible.
-3. Target concise clues (ideal <=12 words).
+1. Mask the answer's surface form in the clue text.
+2. Keep a whole sentence, or its start cut once at a clause boundary; at most 18 words.
 
 #### Pass 3: Validate
 
-1. Reject clues containing morphological cousins of answer (lemma/stem check).
-2. Reject clues where masked slot is grammatical subject when this makes clue trivial.
-3. Reject clues below 6 words as too vague.
-4. Down-rank awkward or self-referential constructions.
+1. Reject clues containing the answer or a morphological cousin of it (lemma/stem check).
+2. Reject a fill-in that points outside itself: an opening back-reference word, a pronoun with nothing before it to refer to, a demonstrative with a noun not named earlier, "the former", "the following", "doing so"; and a cut fill-in that lost its finite verb.
+3. Reject a generic definition: no word that is rare among the pool's lead sentences; the answer's nationality with fewer than two such words; a kind-of-word head noun without its meaning; a vague quantifier opener.
+4. Reject clues below the minimum word count (3 for a definition, 6 for a fill-in) as too vague.
 
-#### Pass 4: Diversity Deduplication
+#### Pass 4: Order and Diversity
 
-1. Bucket all puzzle clues by their first 3 tokens.
-2. Enforce at most 2 clues per bucket across the full puzzle.
-3. Additionally bucket by structural pattern: definitional clues (starts with "The", contains "of") capped at 3 per puzzle.
-4. For clues that fail diversity checks, re-run extraction against the next-best candidate sentence.
+1. The definition comes first; an answer whose own intro is off topic takes a clean seed sentence before it; among fill-ins the seed's sentences win.
+2. Bucket fill-in clues by their first 3 tokens and keep at most 2 per bucket across the puzzle.
+3. No clue text and no source sentence is used twice.
 
 #### Outputs
 
@@ -299,8 +297,8 @@ Implemented in `src/layout.py`. Words are placed on a `size` x `size` grid so th
 
 #### Search
 
-1. Start from one of a few high-scoring long answers and greedily add the placement with the most crossings (bounding-box growth and answer score break ties).
-2. Repeat for `layout_restarts` restarts with a different start word and noise; keep the layout with the most words, then most crossings. `layout_candidates` caps how many clued answers are offered to the layout.
+1. Start from the highest-scoring answer and fill greedily: each step takes the legal placement with the best gain per newly used cell (one per word, a bonus per crossing, a bonus for a high answer score).
+2. Improve by simulated annealing over ruin-and-recreate steps: drop one to three random words and whatever they leave disconnected, refill, and keep the result unless it is worse than the current layout by more than a random allowance that cools to zero. `layout_restarts` scales the number of steps (25 each); the best layout seen wins. `layout_candidates` caps how many clued answers are offered to the layout.
 
 #### Outputs
 
@@ -461,7 +459,7 @@ Entry record: `number`, `answer`, `display_answer`, `enumeration`, `clue`, `clue
 
 ### Phase 5: Free-Form Layout
 
-1. Implement greedy crossing-based placement with restarts.
+1. Implement crossing-based placement: a greedy fill improved by ruin-and-recreate annealing.
 2. Implement layout validity checks and metrics.
 3. Implement text rendering (`render`).
 
@@ -579,7 +577,7 @@ python cli.py generate \
 6. Risk: attribution gaps discovered late.
    - Mitigation: capture revid/span metadata at extraction time and enforce output validation.
 7. Risk: `J(K)` plateaus before sufficient vocabulary is available.
-   - Mitigation: four-step rescue ladder (loosen min_df -> promote borderline -> 2-hop -> shorten min length) before failing gracefully.
+   - Mitigation: four-step rescue ladder (loosen min_df -> promote borderline -> widen from selected articles -> shorten min length) before failing gracefully.
 8. Risk: Greek accent variants break layout intersection matching.
    - Mitigation: strip diacritics at normalization time for the grid; retain accented form only in display and clue text.
 9. Risk: overfitting selection/weights to a single STEM seed.

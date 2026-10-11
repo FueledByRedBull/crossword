@@ -1,3 +1,4 @@
+import copy
 import os
 import random
 import subprocess
@@ -9,6 +10,7 @@ from unittest import mock
 from src import layout as layout_module
 from src.layout import (
     Placement,
+    _Board,
     build_layout,
     number_placements,
     validate_layout,
@@ -22,6 +24,24 @@ WORDS = [
     "CONDUCTION", "MOLECULE", "ATOM", "PARTICLE", "SYSTEM", "EQUILIBRIUM", "THEORY",
     "HEATER", "STEAM", "ICE", "WATER", "OXYGEN", "NITROGEN", "ARGON", "NEON", "RADON",
     "ENTHALPY", "GIBBS", "FREE", "BOLTZMANN", "CLAUSIUS", "RANKINE", "OTTO", "DIESEL",
+]
+
+# The 50 candidates of a real "Thermodynamics" puzzle (score = centrality), most central first. Many
+# are long multi-word titles, which is what makes dense layouts hard.
+THERMODYNAMICS = [
+    ("THERMODYNAMICS", 3.5), ("ENTROPY", 2.97), ("INTERNALENERGY", 2.86), ("HEAT", 2.81),
+    ("ENGINE", 2.78), ("TEMPERATURE", 2.78), ("VOLUME", 2.69), ("STATE", 2.68), ("BOUNDARY", 2.48),
+    ("RUDOLFCLAUSIUS", 2.29), ("ENGINEERING", 2.27), ("MATTER", 2.22), ("ABSOLUTEZERO", 2.2),
+    ("PRESSURE", 2.19), ("PHYSICS", 2.07), ("WILLARDGIBBS", 2.03), ("MECHANICS", 2.02),
+    ("SCIENCE", 1.98), ("CARNOTCYCLE", 1.95), ("LUDWIGBOLTZMANN", 1.92), ("POWER", 1.91),
+    ("ISOLATEDSYSTEM", 1.89), ("MERLERANDALL", 1.85), ("ENTHALPY", 1.85), ("JULIUSVONMAYER", 1.82),
+    ("GILBERTNLEWIS", 1.81), ("PERPETUALMOTION", 1.8), ("PHASE", 1.8), ("ASTROPHYSICS", 1.78),
+    ("MAXWELLSDEMON", 1.76), ("MICROSCOPIC", 1.75), ("JOULEEXPANSION", 1.75),
+    ("BROWNIANRATCHET", 1.75), ("PIERREDUHEM", 1.74), ("EXERGY", 1.73), ("WALTHERNERNST", 1.71),
+    ("PETERTAIT", 1.68), ("COMPRESSIBILITY", 1.66), ("FRANCOISMASSIEU", 1.65),
+    ("SYNERGETICS", 1.64), ("AXIOM", 1.64), ("EMILECLAPEYRON", 1.64), ("PSYCHROMETRICS", 1.64),
+    ("NUCLEATION", 1.61), ("VACUUM", 1.54), ("IDEALGAS", 1.53), ("CHEMISTRY", 1.5),
+    ("PISTON", 1.46), ("RADIATION", 1.42), ("THERMOMETER", 1.34),
 ]
 
 
@@ -72,20 +92,34 @@ class BuildLayoutTests(unittest.TestCase):
             outputs.append(result.stdout)
         self.assertEqual(outputs[0], outputs[1])
 
-    def test_polish_improves_a_single_greedy_growth(self) -> None:
-        candidates = [(w, 1.0 - i / 100) for i, w in enumerate(WORDS)]
+    def test_real_sized_list_is_deterministic(self) -> None:
+        self.assertEqual(
+            build_layout(THERMODYNAMICS, restarts=8), build_layout(THERMODYNAMICS, restarts=8)
+        )
 
-        def shape(layout):
-            m = layout.metrics
-            return m["word_count"], m["words_with_two_plus_crossings"], m["crossing_count"]
+    def test_real_sized_list_is_valid_and_denser_than_the_old_search(self) -> None:
+        layout = build_layout(THERMODYNAMICS)
+        self.assertEqual(validate_layout(layout.grid, layout.placements), [])
+        metrics = layout.metrics
+        # The greedy-and-polish search this replaced placed 18 words with 21 crossings on this list.
+        self.assertGreaterEqual(metrics["word_count"], 19)
+        self.assertGreaterEqual(metrics["crossing_count"], 21)
+        placed = {p.answer for p in layout.placements}
+        top_ten = [answer for answer, _ in sorted(THERMODYNAMICS, key=lambda c: -c[1])[:10]]
+        self.assertGreaterEqual(sum(answer in placed for answer in top_ten), 6)
 
+    def test_search_improves_on_its_first_greedy_fill(self) -> None:
         for seed in range(3):
             with self.subTest(seed=seed):
-                with mock.patch.object(layout_module, "_POLISH_ROUNDS", 0):
-                    plain = build_layout(candidates, size=11, random_seed=seed, restarts=1)
-                polished = build_layout(candidates, size=11, random_seed=seed, restarts=1)
-                self.assertEqual(validate_layout(polished.grid, polished.placements), [])
-                self.assertGreater(shape(polished), shape(plain))
+                with mock.patch.object(layout_module, "_STEPS_PER_RESTART", 0):
+                    plain = build_layout(THERMODYNAMICS, random_seed=seed)
+                searched = build_layout(THERMODYNAMICS, random_seed=seed, restarts=24)
+                self.assertGreater(searched.metrics["word_count"], plain.metrics["word_count"])
+
+    def test_search_work_is_a_fixed_number_of_steps(self) -> None:
+        with mock.patch.object(layout_module, "_refill", wraps=layout_module._refill) as refill:
+            build_layout(THERMODYNAMICS, restarts=2)
+        self.assertEqual(refill.call_count, 1 + 2 * layout_module._STEPS_PER_RESTART)
 
     def test_bad_candidates_are_ignored(self) -> None:
         layout = build_layout(
@@ -105,6 +139,35 @@ class BuildLayoutTests(unittest.TestCase):
         single = build_layout([("CAT", 1.0)], size=5)
         self.assertEqual([p.answer for p in single.placements], ["CAT"])
         self.assertTrue(validate_layout(single.grid, single.placements))
+
+
+class BoardTests(unittest.TestCase):
+    def test_remove_undoes_place(self) -> None:
+        board = _Board(15)
+        board.place("CAT", layout_module._ORIGIN, True)
+        board.place("CAR", layout_module._ORIGIN, False)
+        before = copy.deepcopy(vars(board))
+        board.place("TOE", layout_module._ORIGIN + 2, False)
+        self.assertEqual(board.crossings, 2)
+        board.remove("TOE")
+        self.assertEqual(vars(board), before)
+
+    def test_fit_refuses_words_running_alongside_or_past_the_span(self) -> None:
+        board = _Board(3)
+        board.place("CAT", layout_module._ORIGIN, True)
+        board.place("CAR", layout_module._ORIGIN, False)
+        self.assertIsNone(board.fit("ARE", layout_module._ORIGIN + 1, False))
+        self.assertEqual(board.fit("TOE", layout_module._ORIGIN + 2, False), 1)
+        self.assertIsNone(board.fit("TOES", layout_module._ORIGIN + 2, False))
+
+    def test_components_split_when_a_bridge_word_goes(self) -> None:
+        board = _Board(15)
+        board.place("CAT", layout_module._ORIGIN, True)
+        board.place("TOE", layout_module._ORIGIN + 2, False)
+        board.place("EAR", layout_module._ORIGIN + 2 * layout_module._ROW, True)
+        self.assertEqual(len(board.components()), 1)
+        board.remove("TOE")
+        self.assertEqual(sorted(sorted(group) for group in board.components()), [["CAT"], ["EAR"]])
 
 
 class ValidateLayoutTests(unittest.TestCase):

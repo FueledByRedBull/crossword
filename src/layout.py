@@ -1,32 +1,44 @@
 from __future__ import annotations
 
+import itertools
+import math
 import random
 from collections import Counter
 from dataclasses import dataclass
-from typing import Sequence
+from heapq import heappop, heappush
+from typing import Iterable, Sequence
 
 EMPTY = "#"
 ACROSS = "across"
 DOWN = "down"
 
 _BLANKS = (EMPTY, ".")
-_ACROSS_BIT = 1
-_DOWN_BIT = 2
 _MIN_WORD_LEN = 3
-_START_WORDS = 4
 
-# Placement value = crossings dominate; bounding-box growth and candidate score break ties.
-_CROSSING_WEIGHT = 3.0
-_GROWTH_WEIGHT = 0.04
-_SCORE_WEIGHT = 1.0
-_NOISE_WEIGHT = 0.3
+# A cell is the int row * _ROW + col, so its neighbours are +-1 and +-_ROW. The row is so wide that
+# a column cannot wrap into the next row however far the board drifts while the search moves it.
+_ROW_BITS = 32
+_ROW = 1 << _ROW_BITS
+_COL_MASK = _ROW - 1
+_ORIGIN = (_ROW // 2) * (_ROW + 1)
 
-# Polish: the best _POLISH_TOP grown boards each get _POLISH_ROUNDS remove-and-refill tries.
-# That cost is fixed per call (each try rescans every unused candidate), whatever `restarts` is.
-_POLISH_TOP = 4
-_POLISH_ROUNDS = 120
-_POLISH_REMOVE = 3
-_POLISH_NOISE = 1.0
+# Search value of a layout: 1 per word, a bonus per crossing, and a bonus per answer score squared.
+# Scores are scaled to 0..1, so only the top answers earn much: one outweighs a word or two.
+_CROSSING_VALUE = 1.5
+_SCORE_VALUE = 3.0
+
+# Simulated annealing over ruin-and-recreate steps: each step drops 1.._RUIN_MAX random words,
+# refills greedily, and keeps the result unless it is worse than the current board by more than a
+# random allowance that cools linearly from _START_TEMPERATURE to zero. A step takes about 2 ms and
+# ten times the default step count gains only a fraction of a word, so `restarts` scales the length
+# of this one run instead of starting independent ones.
+_STEPS_PER_RESTART = 25
+_RUIN_MAX = 3
+_START_TEMPERATURE = 3.0
+
+# Refill takes the legal placement with the best value per newly used cell (square-rooted, so long
+# answers are not ruled out), raised by a random factor of up to 1 + _PICK_NOISE so refills differ.
+_PICK_NOISE = 1.0
 
 
 @dataclass(frozen=True)
@@ -211,199 +223,231 @@ def layout_metrics(
 
 
 class _Board:
-    """Sparse, unbounded-coordinate layout under construction.
+    """Sparse board with unbounded coordinates, built from and cut back by whole words.
 
     Invariant: the board is always a valid layout, so a move only needs local checks.
     """
 
     def __init__(self, span: int) -> None:
         self.span = span
-        self.letters: dict[tuple[int, int], str] = {}
-        self.mask: dict[tuple[int, int], int] = {}
-        self.by_letter: dict[str, list[tuple[int, int]]] = {}
-        self.placements: list[Placement] = []
+        self.letters: dict[int, str] = {}
+        self.owner: dict[bool, dict[int, str]] = {True: {}, False: {}}  # keyed by across
+        self.placed: dict[str, tuple[int, bool]] = {}  # answer -> (start cell, across)
+        self.crossings = 0
         self.bounds = (0, 0, 0, 0)  # min_row, max_row, min_col, max_col
 
-    @property
-    def area(self) -> int:
-        min_r, max_r, min_c, max_c = self.bounds
-        return (max_r - min_r + 1) * (max_c - min_c + 1) if self.letters else 0
+    def cells(self, word: str) -> list[int]:
+        pos, across = self.placed[word]
+        step = 1 if across else _ROW
+        return [pos + step * i for i in range(len(word))]
 
-    def moves(self, word: str) -> dict[tuple[int, int, bool], None]:
-        """Starts that cross an existing word; a dict keeps order deterministic and unique."""
-        found: dict[tuple[int, int, bool], None] = {}
-        for i, ch in enumerate(word):
-            for r, c in self.by_letter.get(ch, ()):
-                mask = self.mask[(r, c)]
-                if mask == _ACROSS_BIT:
-                    found[(r - i, c, False)] = None
-                elif mask == _DOWN_BIT:
-                    found[(r, c - i, True)] = None
-        return found
-
-    def fit(self, word: str, r: int, c: int, across: bool) -> tuple[int, int] | None:
-        """Return (crossings, resulting bounding-box area) or None if the move is illegal."""
-        dr, dc = (0, 1) if across else (1, 0)
+    def fit(self, word: str, pos: int, across: bool) -> int | None:
+        """Return the crossings `word` would make from `pos`, or None if the move is illegal."""
         n = len(word)
-        if (r - dr, c - dc) in self.letters or (r + dr * n, c + dc * n) in self.letters:
+        lo_r, hi_r, lo_c, hi_c = self.bounds
+        reach = self.span - 1
+        r, c = pos >> _ROW_BITS, pos & _COL_MASK
+        if across:
+            step, side = 1, _ROW
+            if r < hi_r - reach or r > lo_r + reach or c < hi_c - reach or c + n - 1 > lo_c + reach:
+                return None
+        else:
+            step, side = _ROW, 1
+            if c < hi_c - reach or c > lo_c + reach or r < hi_r - reach or r + n - 1 > lo_r + reach:
+                return None
+        letters, mine = self.letters, self.owner[across]
+        if pos - step in letters or pos + step * n in letters:
             return None
-        min_r, max_r, min_c, max_c = self.bounds
-        min_r, max_r = min(min_r, r), max(max_r, r + dr * (n - 1))
-        min_c, max_c = min(min_c, c), max(max_c, c + dc * (n - 1))
-        if max_r - min_r >= self.span or max_c - min_c >= self.span:
-            return None
-        own = _ACROSS_BIT if across else _DOWN_BIT
         crossings = 0
-        for i, ch in enumerate(word):
-            pos = (r + dr * i, c + dc * i)
-            have = self.letters.get(pos)
+        for ch in word:
+            have = letters.get(pos)
             if have is None:
-                if (pos[0] + dc, pos[1] + dr) in self.letters or (pos[0] - dc, pos[1] - dr) in self.letters:
+                if pos + side in letters or pos - side in letters:
                     return None
-            elif have != ch or self.mask[pos] & own:
+            elif have != ch or pos in mine:
                 return None
             else:
                 crossings += 1
-        if not crossings:
-            return None
-        return crossings, (max_r - min_r + 1) * (max_c - min_c + 1)
+            pos += step
+        return crossings or None
 
-    def place(self, word: str, r: int, c: int, across: bool) -> None:
-        dr, dc = (0, 1) if across else (1, 0)
-        own = _ACROSS_BIT if across else _DOWN_BIT
+    def anchors(self, cells: Iterable[int]) -> dict[str, dict[int, bool]]:
+        """Single-owner cells by letter; the value says whether a crossing word runs across."""
+        down = self.owner[False]
+        found: dict[str, dict[int, bool]] = {}
+        for pos in cells:
+            if (pos in self.owner[True]) != (pos in down):
+                found.setdefault(self.letters[pos], {})[pos] = pos in down
+        return found
+
+    def moves(self, word: str, anchors: dict[str, dict[int, bool]]) -> list[tuple[int, int, bool]]:
+        """Legal (crossings, start cell, across) placements of `word` through the given anchors."""
+        found = []
         for i, ch in enumerate(word):
-            pos = (r + dr * i, c + dc * i)
-            if pos not in self.letters:
+            for anchor, across in anchors.get(ch, {}).items():
+                pos = anchor - i if across else anchor - i * _ROW
+                crossings = self.fit(word, pos, across)
+                if crossings:
+                    found.append((crossings, pos, across))
+        return found
+
+    def place(self, word: str, pos: int, across: bool) -> None:
+        step = 1 if across else _ROW
+        mine = self.owner[across]
+        self.placed[word] = (pos, across)
+        for ch in word:
+            if pos in self.letters:
+                self.crossings += 1
+            else:
                 self.letters[pos] = ch
-                self.by_letter.setdefault(ch, []).append(pos)
-            self.mask[pos] = self.mask.get(pos, 0) | own
-        end_r, end_c = r + dr * (len(word) - 1), c + dc * (len(word) - 1)
-        if self.placements:
-            min_r, max_r, min_c, max_c = self.bounds
-            self.bounds = (min(min_r, r), max(max_r, end_r), min(min_c, c), max(max_c, end_c))
-        else:
-            self.bounds = (r, end_r, c, end_c)
-        self.placements.append(Placement(word, r, c, ACROSS if across else DOWN))
+            mine[pos] = word
+            pos += step
+        self._rebound()
+
+    def remove(self, word: str) -> None:
+        pos, across = self.placed.pop(word)
+        step = 1 if across else _ROW
+        mine, theirs = self.owner[across], self.owner[not across]
+        for _ in word:
+            del mine[pos]
+            if pos in theirs:
+                self.crossings -= 1
+            else:
+                del self.letters[pos]
+            pos += step
+        if self.placed:
+            self._rebound()
+
+    def _rebound(self) -> None:
+        spans = []
+        for word, (pos, across) in self.placed.items():
+            r, c = pos >> _ROW_BITS, pos & _COL_MASK
+            end = len(word) - 1
+            spans.append((r, r if across else r + end, c, c + end if across else c))
+        lo_r, hi_r, lo_c, hi_c = zip(*spans)
+        self.bounds = (min(lo_r), max(hi_r), min(lo_c), max(hi_c))
+
+    def components(self) -> list[list[str]]:
+        """Groups of words joined by crossings."""
+        seen: set[str] = set()
+        groups = []
+        for first in self.placed:
+            if first in seen:
+                continue
+            seen.add(first)
+            group = [first]
+            for word in group:  # the loop also visits words appended meanwhile
+                theirs = self.owner[not self.placed[word][1]]
+                for cell in self.cells(word):
+                    other = theirs.get(cell)
+                    if other is not None and other not in seen:
+                        seen.add(other)
+                        group.append(other)
+            groups.append(group)
+        return groups
+
+    def value(self, scores: dict[str, float]) -> float:
+        return (
+            len(self.placed)
+            + _CROSSING_VALUE * self.crossings
+            + _SCORE_VALUE * sum(scores[word] for word in self.placed)
+        )
 
 
-def _extend(
-    board: _Board,
-    remaining: list[tuple[str, float]],
-    limit: int,
-    rng: random.Random,
-    noise: float,
-) -> None:
-    while remaining and len(board.placements) < limit:
-        base_area = board.area
-        best_value = None
-        best_move = None
-        for idx, (word, score) in enumerate(remaining):
-            for r, c, across in board.moves(word):
-                fitted = board.fit(word, r, c, across)
-                if fitted is None:
-                    continue
-                crossings, area = fitted
-                value = (
-                    _CROSSING_WEIGHT * crossings
-                    - _GROWTH_WEIGHT * (area - base_area)
-                    + _SCORE_WEIGHT * score
-                    + noise * rng.random()
-                )
-                if best_value is None or value > best_value:
-                    best_value, best_move = value, (idx, r, c, across)
-        if best_move is None:
-            break
-        idx, r, c, across = best_move
-        board.place(remaining.pop(idx)[0], r, c, across)
+def _refill(
+    board: _Board, words: Sequence[str], scores: dict[str, float], rng: random.Random, limit: int
+) -> list[str]:
+    """Place unused words best-first until none fits; return them in placement order.
 
+    One scan finds every legal move; after that a placement only adds the moves that cross its own
+    new letters, and stale moves are re-checked when they come off the heap.
+    """
+    heap: list[tuple[float, int, str, int, bool]] = []
+    ticket = itertools.count()  # unique, so equal gains never compare words
+    placed = board.placed
+    unused = [word for word in words if word not in placed]
 
-def _grow(
-    start: str,
-    words: Sequence[tuple[str, float]],
-    size: int,
-    limit: int,
-    rng: random.Random,
-    noise: float,
-) -> _Board:
-    board = _Board(size)
-    board.place(start, 0, 0, True)
-    _extend(board, [(w, s) for w, s in words if w != start], limit, rng, noise)
-    return board
+    def offer(word: str, anchors: dict[str, dict[int, bool]]) -> None:
+        for crossings, pos, across in board.moves(word, anchors):
+            gain = 1 + _CROSSING_VALUE * crossings + _SCORE_VALUE * scores[word]
+            gain /= math.sqrt(max(len(word) - crossings, 1))
+            gain *= 1 + _PICK_NOISE * rng.random()
+            heappush(heap, (-gain, next(ticket), word, pos, across))
 
-
-def _connected(placements: Sequence[Placement]) -> bool:
-    owners: dict[tuple[int, int], list[int]] = {}
-    for idx, p in enumerate(placements):
-        for cell in _cells(p):
-            owners.setdefault(cell, []).append(idx)
-    links: dict[int, set[int]] = {idx: set() for idx in range(len(placements))}
-    for shared in owners.values():
-        for idx in shared:
-            links[idx].update(shared)
-    seen = {0}
-    stack = [0]
-    while stack:
-        stack.extend(links[stack.pop()] - seen)
-        seen.update(stack)
-    return len(seen) == len(placements)
-
-
-def _key(board: _Board, size: int, scores: dict[str, float]) -> tuple:
-    layout = _to_layout(board, size)
-    m = layout.metrics
-    return (
-        m["word_count"],
-        m["words_with_two_plus_crossings"],
-        m["crossing_count"],
-        sum(scores[p.answer] for p in layout.placements),
-        m["density"],
-    )
-
-
-def _polish(
-    board: _Board,
-    words: Sequence[tuple[str, float]],
-    size: int,
-    limit: int,
-    rng: random.Random,
-    scores: dict[str, float],
-) -> tuple[tuple, _Board]:
-    """Drop a few words (weakly crossed ones most often), refill from the rest, keep if no worse."""
-    best, best_key = board, _key(board, size, scores)
-    for _ in range(_POLISH_ROUNDS):
-        crossings = [
-            sum(best.mask[cell] == _ACROSS_BIT | _DOWN_BIT for cell in _cells(p))
-            for p in best.placements
-        ]
-        order = sorted(range(len(crossings)), key=lambda i: rng.random() * crossings[i] ** 2)
-        gone = set(order[: rng.randint(1, _POLISH_REMOVE)])
-        kept = [p for i, p in enumerate(best.placements) if i not in gone]
-        if len(kept) < 2 or not _connected(kept):
+    everywhere = board.anchors(board.letters)
+    for word in unused:
+        offer(word, everywhere)
+    added = []
+    while heap and len(placed) < limit:
+        _, _, word, pos, across = heappop(heap)
+        if word in placed or board.fit(word, pos, across) is None:
             continue
-        trial = _Board(size)
-        for p in kept:
-            trial.place(p.answer, p.row, p.col, p.direction == ACROSS)
-        used = {p.answer for p in kept}
-        _extend(trial, [(w, s) for w, s in words if w not in used], limit, rng, _POLISH_NOISE)
-        key = _key(trial, size, scores)
-        if key >= best_key:
-            best, best_key = trial, key
-    return best_key, best
+        board.place(word, pos, across)
+        added.append(word)
+        fresh = board.anchors(board.cells(word))
+        for other in unused:
+            if other not in placed:
+                offer(other, fresh)
+    return added
 
 
-def _to_layout(board: _Board, size: int) -> Layout:
-    min_r, max_r, min_c, max_c = board.bounds
-    row_off = (size - (max_r - min_r + 1)) // 2 - min_r
-    col_off = (size - (max_c - min_c + 1)) // 2 - min_c
-    if not board.letters:
-        row_off = col_off = 0
-    grid = [[EMPTY] * size for _ in range(size)]
-    for (r, c), ch in board.letters.items():
-        grid[r + row_off][c + col_off] = ch
-    placements = [
-        Placement(p.answer, p.row + row_off, p.col + col_off, p.direction)
-        for p in board.placements
+def _search(
+    words: Sequence[str],
+    scores: dict[str, float],
+    size: int,
+    rng: random.Random,
+    steps: int,
+    limit: int,
+) -> dict[str, tuple[int, bool]]:
+    board = _Board(size)
+    board.place(words[0], _ORIGIN, True)
+    _refill(board, words, scores, rng, limit)
+    value = board.value(scores)
+    best_value, best = value, dict(board.placed)
+    for step in range(steps):
+        if len(board.placed) < 2:
+            break
+        temperature = _START_TEMPERATURE * (1 - step / steps)
+        dropped = {}
+        ruined = rng.randint(1, min(_RUIN_MAX, len(board.placed) - 1))
+        for word in rng.sample(list(board.placed), ruined):
+            dropped[word] = board.placed[word]
+            board.remove(word)
+        groups = sorted(board.components(), key=len, reverse=True)
+        for word in (word for group in groups[1:] for word in group):  # cut off from the main group
+            dropped[word] = board.placed[word]
+            board.remove(word)
+        added = _refill(board, words, scores, rng, limit)
+        trial = board.value(scores)
+        if trial >= value + temperature * math.log(1 - rng.random()):
+            value = trial
+            if value > best_value:
+                best_value, best = value, dict(board.placed)
+        else:
+            for word in reversed(added):
+                board.remove(word)
+            for word, (pos, across) in dropped.items():
+                board.place(word, pos, across)
+    return best
+
+
+def _to_layout(placed: dict[str, tuple[int, bool]], size: int) -> Layout:
+    raw = [
+        Placement(word, pos >> _ROW_BITS, pos & _COL_MASK, ACROSS if across else DOWN)
+        for word, (pos, across) in placed.items()
     ]
+    cells = [cell for p in raw for cell in _cells(p)]
+    row_off = col_off = 0
+    if cells:
+        min_r, max_r = min(r for r, _ in cells), max(r for r, _ in cells)
+        min_c, max_c = min(c for _, c in cells), max(c for _, c in cells)
+        row_off = (size - (max_r - min_r + 1)) // 2 - min_r
+        col_off = (size - (max_c - min_c + 1)) // 2 - min_c
+    grid = [[EMPTY] * size for _ in range(size)]
+    placements = [Placement(p.answer, p.row + row_off, p.col + col_off, p.direction) for p in raw]
+    for p in placements:
+        for (r, c), ch in zip(_cells(p), p.answer):
+            grid[r][c] = ch
     return Layout(grid, placements, layout_metrics(grid, placements))
 
 
@@ -421,22 +465,12 @@ def build_layout(
             best_score[answer] = max(score, best_score.get(answer, score))
     ordered = sorted(best_score.items(), key=lambda item: (-item[1], item[0]))
     if not ordered:
-        return _to_layout(_Board(size), size)
+        return _to_layout({}, size)
 
     low, high = ordered[-1][1], ordered[0][1]
     spread = high - low
-    scaled = [(w, (s - low) / spread if spread else 1.0) for w, s in ordered]
-    starts = sorted(scaled, key=lambda item: (-item[1] * len(item[0]), item[0]))[:_START_WORDS]
+    scores = {w: ((s - low) / spread if spread else 1.0) ** 2 for w, s in ordered}
     limit = max_words if max_words is not None else len(ordered)
+    steps = max(restarts, 1) * _STEPS_PER_RESTART
     rng = random.Random(random_seed)
-
-    grown = []
-    for attempt in range(max(restarts, 1)):
-        start = starts[attempt % len(starts)][0]
-        board = _grow(start, scaled, size, limit, rng, noise=_NOISE_WEIGHT if attempt else 0.0)
-        grown.append((_key(board, size, best_score), -attempt, board))
-    grown.sort(key=lambda item: item[:2], reverse=True)
-    polished = [
-        _polish(board, scaled, size, limit, rng, best_score) for _, _, board in grown[:_POLISH_TOP]
-    ]
-    return _to_layout(max(polished, key=lambda item: item[0])[1], size)
+    return _to_layout(_search([w for w, _ in ordered], scores, size, rng, steps, limit), size)

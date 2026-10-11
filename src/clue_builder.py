@@ -173,11 +173,24 @@ class _Words(NamedTuple):
     gerund_endings: tuple[str, ...]
     determiners: frozenset[str]
     finite_verbs: frozenset[str]
+    # Find a second predicate ("... and is considered ...") with the tagger instead of `finite_verbs`.
+    tagged_second_predicate: bool
     conjunctions: frozenset[str]
     and_word: str
     between: frozenset[str]
     # A comma segment that opens with one of these ("including ...") is an optional tail.
     tails: frozenset[str]
+    # Fill-in checks. Pronouns that need an antecedent in the clue, determiners that point at an earlier sentence
+    # ("this pump") with the tags of the word after them that make them determiners, whether they may also follow
+    # their noun ("η μέθοδος αυτή"), and phrases that point outside (matched against the folded clue).
+    personal: frozenset[str]
+    pointing: frozenset[str]
+    pointing_tags: frozenset[str]
+    pointing_follows_noun: bool
+    # A determiner and its article are both in the genitive or neither is: "αυτήν του φωτός" is "that of light".
+    genitive_endings: tuple[str, ...]
+    outside: re.Pattern[str]
+    articles: frozenset[str]
     # How an answer's last word occurs in the subject: its last `stem_trim` letters may differ, then `endings`.
     stem_trim: int
     endings: str
@@ -216,10 +229,18 @@ _EN = _Words(
     gerund_endings=(),
     determiners=_words("the a an this these its their his her some any each every all"),
     finite_verbs=_words("was is were are had has became also"),
+    tagged_second_predicate=False,  # the tagger also cuts "builds and organises", which `finite_verbs` keeps whole
     conjunctions=_words("and or"),
     and_word="and",
     between=_words("between among"),
     tails=_words("including such especially particularly notably mainly mostly while whereas because although"),
+    personal=_words("he she they it him them"),
+    pointing=_words("this these those"),
+    pointing_tags=frozenset({"NOUN", "PROPN"}),
+    pointing_follows_noun=False,
+    genitive_endings=(),
+    outside=re.compile(r"\b(?:the (?:former|latter|following)|(?:doing|did|does) so|likewise)\b"),
+    articles=frozenset(),
     stem_trim=0,
     endings=r"(?:e?s)?",
 )
@@ -231,7 +252,10 @@ _EL_CONTRACTED = "στο στη στην στον στους στις στα"
 _EL_ADJUNCT = (
     f"σε από με για προς κατά μετά μεταξύ χωρίς μέχρι έως εντός εκτός κοντά γύρω παρά υπό επί {_EL_CONTRACTED}"
 )
-_EL_DEMONSTRATIVE = "αυτός αυτή αυτό αυτοί αυτές αυτά εκείνος εκείνη εκείνο"
+_EL_DEMONSTRATIVE = (
+    "αυτός αυτή αυτό αυτοί αυτές αυτά αυτού αυτής αυτών αυτόν αυτήν αυτούς"
+    " εκείνος εκείνη εκείνο εκείνοι εκείνες εκείνα εκείνου εκείνης εκείνων"
+)
 _EL_RELATIVE = "που οποίος οποία οποίο οποίοι οποίες οποίου οποίας οποίων οποίον οποίους όπου όταν"
 _EL = _Words(
     copulas=_words(
@@ -264,10 +288,20 @@ _EL = _Words(
         " όλος όλη όλο όλοι όλες όλα"
     ),
     finite_verbs=_words("είναι ήταν έχει έχουν είχε έγινε υπήρξε αποτελεί αποτελούν θεωρείται ονομάζεται"),
+    tagged_second_predicate=True,
     conjunctions=_words("και"),
     and_word="και",
     between=_words("μεταξύ"),
     tails=_words("συμπεριλαμβανομένων ιδίως ειδικά ειδικότερα όπως δηλαδή ενώ επειδή καθώς αφού αν εάν"),
+    personal=frozenset(),  # pro-drop: the subject pronoun is rarely written
+    pointing=_words(_EL_DEMONSTRATIVE),
+    pointing_tags=frozenset({"DET"}),  # "αυτή η μέθοδος": the article comes first
+    pointing_follows_noun=True,
+    genitive_endings=("ου", "ης", "ων"),
+    outside=re.compile(
+        r"\b(?:ακολουθ(?:ος|η|ο|οι|ες|α|ου|ης|ων|ους|ον)|παρακατω|(?:ο|η|το) πρωτ\w+\b.*\b(?:ο|η|το) δευτερ\w+)\b"
+    ),
+    articles=_words(_EL_ARTICLE),
     stem_trim=2,
     endings=r"\w{0,3}",
 )
@@ -283,9 +317,49 @@ def _ends_in_nationality(kept: list[str], nlp) -> bool:
 
 
 def _masculine_accusative(words: list[str], nlp) -> bool:
-    """True when the first noun or adjective is tagged masculine accusative ("ιδιαίτερο κλάδο")."""
-    head = next((token for token in nlp(" ".join(words)) if token.pos_ in {"NOUN", "ADJ", "PROPN"}), None)
-    return head is not None and head.morph.get("Case") == ["Acc"] and head.morph.get("Gender") == ["Masc"]
+    """True when one of the first three nouns or adjectives is tagged masculine accusative ("ιδιαίτερο κλάδο").
+
+    The tagger often gets the first word wrong ("ιδιαίτερο" came out as a neuter nominative), but not all three.
+    """
+    heads = [token for token in nlp(" ".join(words)) if token.pos_ in {"NOUN", "ADJ", "PROPN"}][:3]
+    return any(head.morph.get("Case") == ["Acc"] and head.morph.get("Gender") == ["Masc"] for head in heads)
+
+
+def _opens_list_item(following: list[str], lex: _Words) -> bool:
+    """True when the words after a comma open another item of a list: an article, or "and" and an article.
+
+    Not an article that begins a relative clause ("..., η οποία"). The article test is lexical on purpose: the Greek
+    tagger confuses the cases of a noun and the one after it.
+    """
+    folded = [_fold(word) for word in following] + ["", ""]
+    if folded[0] in lex.conjunctions:
+        folded = folded[1:]
+    return folded[0] in lex.articles and folded[1] not in lex.relatives
+
+
+def _opens_tail(words: list[str], i: int, lex: _Words) -> bool:
+    """True when the comma at `words[i]` is followed by "and" and a preposition, and goes on to something else.
+
+    "... of Rhineland-Palatinate, and with around 223,000 inhabitants" does. A comma after another one closes a list
+    ("from the past, through the present, and into the future"), a preposition used before continues one ("in his
+    native country, and in his later years").
+    """
+    following = [_fold(word) for word in words[i + 1 : i + 3]]
+    return (
+        len(following) == 2
+        and following[0] == lex.and_word
+        and following[1] in lex.adjunct_prepositions
+        and not any(word[-1] in ",;:" or _fold(word) == following[1] for word in words[:i])
+    )
+
+
+def _reaches_its_verb(kept: list[str], relative: int, nlp) -> bool:
+    """True when the tagger finds a verb after the relative word at `kept[relative]`.
+
+    "Όρος της Φυσικής, που σε πολύ απλή απόδοση," has none: the cut fell inside the clause.
+    """
+    start = len(" ".join(kept[: relative + 1]))
+    return any(token.pos_ in {"VERB", "AUX"} and token.idx >= start for token in nlp(" ".join(kept)))
 
 
 def _clean_prefix(words: list[str], limit: int, lex: _Words, nlp=None) -> list[str] | None:
@@ -318,6 +392,9 @@ def _clean_prefix(words: list[str], limit: int, lex: _Words, nlp=None) -> list[s
         opened = [i + 1 for i, word in enumerate(kept[:-1]) if word[-1] in ",;:"]
         if opened and kept[-1][-1] not in ",;:" and lowered[opened[-1]] in lex.tails:
             return None
+        # ", and with around 223,000 inhabitants" is no part of the definition, even when a comma closes it.
+        if opened and _opens_tail(kept, opened[0] - 1, lex):
+            return None
         # Cutting inside a relative clause leaves it unfinished, unless the cut closes a list or a place name,
         # or is a comma after a clause that already has its verb ("that studies X, Y, and Z, including ...").
         relatives = [pos for pos, word in enumerate(lowered) if pos and word in lex.relatives]
@@ -330,6 +407,13 @@ def _clean_prefix(words: list[str], limit: int, lex: _Words, nlp=None) -> list[s
             )
             if not (at_comma and has_verb):
                 return None
+        # A relative clause that opens on an aside ("που σε πολύ απλή απόδοση, εκφράζει ...") has its verb after it.
+        # Elsewhere the word after the relative is taken for the verb: the tagger misses too many ("που μελετά").
+        if nlp is not None and any(
+            pos + 1 < len(lowered) and lowered[pos + 1] in lex.prepositions and not _reaches_its_verb(kept, pos, nlp)
+            for pos in relatives
+        ):
+            return None
         return None if nlp is not None and _ends_in_nationality(kept, nlp) else kept
 
     cuts: dict[int, tuple[bool, bool]] = {}
@@ -341,9 +425,10 @@ def _clean_prefix(words: list[str], limit: int, lex: _Words, nlp=None) -> list[s
             inside_list = (
                 words[i - 1][-1] in ",;:"
                 or any(_fold(later) in lex.conjunctions for later in words[i + 1 : i + 3])
+                or _opens_list_item(words[i + 1 : i + 3], lex)
                 or any(later[-1] in ",;:" for later in words[i + 1 : i + 4])
             )
-            if closes_list or place or not inside_list:
+            if closes_list or place or not inside_list or _opens_tail(words, i, lex):
                 cuts[i + 1] = (True, closes_list or place)
         elif _fold(word) in lex.adjunct_prepositions:
             # Never leave a participle or adjective dangling ("formed by", "based in", "responsible for").
@@ -385,6 +470,29 @@ def _is_noun_phrase(clue: str, nlp) -> bool:
     return bool(tokens) and tokens[0].pos_ not in _BAD_START and tokens[-1].pos_ not in _BAD_END
 
 
+def _is_finite_verb(token) -> bool:
+    return token.pos_ in {"VERB", "AUX"} and "Fin" in token.morph.get("VerbForm")
+
+
+def _starts_second_predicate(words: list[str], i: int, lex: _Words, doc) -> bool:
+    """True when the "and" at `words[i]` is followed by a verb of its own ("a mathematician and was one of ...").
+
+    With a tagged `doc` any finite verb counts, but not the last of a list of verbs ("describes, analyses and predicts").
+    """
+    if _fold(words[i]) != lex.and_word:
+        return False
+    if doc is None:
+        return _fold(words[i + 1]) in lex.finite_verbs
+
+    def finite(index: int) -> bool:
+        offset = len(" ".join(words[:index])) + (index > 0)
+        token = next((token for token in doc if token.idx == offset), None)
+        return token is not None and _is_finite_verb(token)
+
+    # Nor the "και" of "μιας και" (since): cutting there would end the clue on a function word.
+    return finite(i + 1) and not finite(i - 1) and _fold(words[i - 1].strip(",;:")) not in lex.weak_end
+
+
 def definition_clue(
     lead_sentence: str, *, max_words: int = 16, answer: str | None = None, nlp=None, lang: str = "en"
 ) -> str | None:
@@ -407,8 +515,9 @@ def definition_clue(
     predicate = " ".join(lead[copula + 1 :]).rstrip(".")
     words = (lex.credited.sub(", ", predicate) if lex.credited else predicate).split()
     # A second predicate ("a mathematician and was one of ...") does not belong to the definition.
+    doc = nlp(" ".join(words)) if nlp is not None and lex.tagged_second_predicate else None
     for i in range(3, len(words) - 1):
-        if _fold(words[i]) == lex.and_word and _fold(words[i + 1]) in lex.finite_verbs:
+        if _starts_second_predicate(words, i, lex, doc):
             words = words[:i]
             break
     first = _fold(words[0]) if words else ""
@@ -425,6 +534,9 @@ def definition_clue(
     lowered = [_fold(word.strip(",;:")) for word in words]
     # "... of that system": the antecedent is outside the clue.
     if any(a in lex.prepositions and b in lex.demonstratives for a, b in zip(lowered, lowered[1:])):
+        return None
+    # "... the following conditions": the list it promises is not there.
+    if lex.outside.search(" ".join(lowered)):
         return None
     # "the volume of a system is ... its state": the possessor was part of the subject, which the clue drops.
     if tail and tail.split()[0] == "of" and lex.referring & set(lowered):
@@ -444,28 +556,94 @@ def lead_word_counts(leads: list[str]) -> Counter[str]:
     return Counter(word for lead in leads for word in set(_WORD.findall(lead.lower())))
 
 
-def is_generic_definition(clue: str, counts: Counter[str], pool_size: int, nlp=None) -> bool:
-    """True when every word of the clue is common among the pool's lead sentences.
+# A definition that opens on a nationality ("An American jazz drummer") needs this many informative words, any other one.
+_MIN_INFORMATIVE_WORDS = 2
+# Head nouns that name a kind of word, not a kind of thing: generic unless the definition says what the word means.
+_KIND_OF_WORD = {"term", "name", "word", "phrase", "concept", "notion", "idea", "expression", "title", "label", "designation"}
+_MEANING_MARKERS = {
+    "for", "referring", "refers", "describing", "describes", "denoting", "denotes", "meaning", "means", "used", "associated",
+    "encompassing", "that", "which",
+}
+# "Any of many different quantities", "One of several ...": the class is not named. "One of the earliest ..." is.
+_VAGUE_OPENER = re.compile(
+    r"(?:any|various|several|many|some|numerous|multiple)\b"
+    r"|one of (?:the )?(?:several|many|various|numerous|multiple|some|a number of|a few)\b",
+    re.IGNORECASE,
+)
 
-    "A German physicist" or "A genre of dance music" fits dozens of leads, "The capital of Lebanon" fits one.
-    With `nlp`, nationalities (named entities, or capitalised adjectives) do not count as rare: "Brazilian" is
-    rare, but names no one.
-    """
-    nationalities = set()
-    if nlp is not None:
-        nationalities = {
-            w
-            for token in nlp(clue)
-            if token.ent_type_ == "NORP" or (token.i and token.pos_ == "ADJ" and token.text[0].isupper())
-            for w in _WORD.findall(token.text.lower())
-        }
+
+def _is_kind_of_word(word: str) -> bool:
+    return word in _KIND_OF_WORD or word[:-1] in _KIND_OF_WORD
+
+
+def _nationalities(doc) -> list:
+    """Tokens of a tagged clue that name a people: a NORP entity, or a capitalised adjective ("Brazilian")."""
+    return [token for token in doc if token.ent_type_ == "NORP" or (token.i and token.pos_ == "ADJ" and token.text[0].isupper())]
+
+
+def _informative_words(
+    clue: str, counts: Counter[str], pool_size: int, nationalities: set[str], seed_title: str | None
+) -> set[str]:
+    """Words of the clue that tell it apart: rare among the pool's leads, not a seed word, a kind of word or a nationality."""
+    seed_words = [w for w in _WORD.findall((seed_title or "").lower()) if len(w) >= 4]
     limit = max(2, pool_size * _RARE_LEAD_SHARE)
-    return all(counts[word] > limit for word in set(_WORD.findall(clue.lower())) - nationalities)
+    return {
+        word
+        for word in set(_WORD.findall(clue.lower())) - nationalities
+        if any(ch.isdigit() for ch in word)
+        or (counts[word] <= limit and not _is_kind_of_word(word) and not any(shares_root(word, seed) for seed in seed_words))
+    }
+
+
+def _generic_reason(clue: str, counts: Counter[str], pool_size: int, nlp, seed_title: str | None) -> str | None:
+    """Why a definition fits too many answers, or None."""
+    if _VAGUE_OPENER.match(clue):
+        return "vague quantifier"
+    words = _WORD.findall(clue.lower())
+    doc = nlp(clue) if nlp is not None else None
+    if doc is None:
+        kinds = {word for word in words[:4] if _is_kind_of_word(word)}
+    else:  # "word processor": a compound modifier is not the head
+        kinds = {token.lower_ for token in doc if token.i < 4 and token.dep_ != "compound" and _is_kind_of_word(token.lower_)}
+    if kinds and not _MEANING_MARKERS & set(words):
+        return "kind of word"
+    people = _nationalities(doc) if doc is not None else []
+    # The answer's own nationality comes before any preposition; "A canvas by the French painter Claude Monet" has another's.
+    own = any(not any(before.pos_ == "ADP" for before in doc[: token.i]) for token in people)
+    nationalities = {word for token in people for word in _WORD.findall(token.lower_)}
+    informative = _informative_words(clue, counts, pool_size, nationalities, seed_title)
+    if len(informative) < (_MIN_INFORMATIVE_WORDS if own else 1):
+        return "too few informative words"
+    return None
+
+
+def is_generic_definition(clue: str, counts: Counter[str], pool_size: int, nlp=None, *, seed_title: str | None = None) -> bool:
+    """True when the definition fits too many answers of the pool.
+
+    "A German physicist" or "A genre of dance music" use words common among the pool's lead sentences, "The capital of
+    Lebanon" does not. A clue needs one informative word: rare among the leads, not a word of the seed title, not a
+    kind of word, not a nationality (with `nlp`: "Brazilian" is rare, but names no one). Numbers always inform. A clue
+    that gives the answer's own nationality needs `_MIN_INFORMATIVE_WORDS`: "An American jazz drummer" names a crowd,
+    so one rare word does not tell its members apart, while "A brass instrument" does not need a second one. A head
+    noun that names a word ("A term coined in the 1980s") or a vague quantifier ("Any of many different quantities")
+    is generic as well.
+    """
+    return _generic_reason(clue, counts, pool_size, nlp, seed_title) is not None
 
 
 def has_verb(clue: str, nlp) -> bool:
-    """False for titles, citations and list entries, which make poor fill-ins."""
-    return any(token.pos_ in {"VERB", "AUX"} for token in nlp(clue))
+    """False for titles, citations and list entries, and for a clause cut before its main verb: poor fill-ins.
+
+    A clue cut at a clause boundary needs a finite verb, modals included ("Apart from informing the public about ____
+    history, ..." has none), or a verb with a subject of its own, because the tagger takes many a past tense for a
+    participle. A whole sentence needs any verb: the stricter test would also reject the sentences where the tagger
+    made that mistake and the parser found no subject ("____ evolved from historical ideas about the vacuum.").
+    """
+    # The tokenizer splits a blank into its underscores, and the tagger may call one of them a verb.
+    verbs = [token for token in nlp(clue) if token.pos_ in {"VERB", "AUX"} and "_" not in token.text]
+    if not clue.endswith("..."):
+        return bool(verbs)
+    return any(_is_finite_verb(token) or any(child.dep_ == "nsubj" for child in token.children) for token in verbs)
 
 
 def lemmatize_text(text: str, nlp) -> set[str]:
@@ -544,6 +722,9 @@ def _blank_is_part_of_a_name(sentence: str) -> bool:
     return any(m.start() > 0 or m.group().startswith(BLANK) for m in _PART_OF_A_NAME.finditer(sentence.strip()))
 
 
+_PUNCTUATION = ",;:.!?\"'()«»“”"
+
+
 # A fill-in that opens on a word whose referent is in the previous sentence ("It is the cause of the ____.")
 # stands on nothing. Folded: no case, no accents.
 _BACK_REFERENCES = {
@@ -553,6 +734,54 @@ _BACK_REFERENCES = {
     "αυτος", "αυτη", "αυτο", "αυτοι", "αυτες", "αυτα", "αυτου", "αυτης", "αυτων", "εκεινος", "εκεινη", "εκεινο",
     "και", "αλλα", "ομως", "ωστοσο", "ετσι", "επισης", "επομενως", "τοτε", "επιπλεον", "ουτε",
 }
+
+
+def _outside_reference(clue: str, nlp, lang: str) -> str | None:
+    """Name the rule when a fill-in leans on an earlier sentence in the middle, else None.
+
+    A personal pronoun with no noun, name or blank before it ("In 1870 he introduced ..."), "this pump" or "της
+    εμφάνισης αυτής" when no pump or εμφάνιση came before, "the former", "doing so". With `nlp` the nouns are the
+    tagged ones; without it every word that is not a stopword or a number counts as one, so "Because of this, it ..."
+    is not caught.
+    """
+    lex = _WORDS[lang]
+    if lex.outside.search(" ".join(_fold(word) for word in clue.split())):
+        return "phrase"
+    blanks = {i for m in re.finditer(re.escape(BLANK), clue) for i in range(*m.span())}
+    if nlp is not None:
+        items = [
+            (token.text, token.idx in blanks or token.pos_ in {"NOUN", "PROPN"}, token.pos_)
+            for token in nlp(clue)
+            if not (token.idx in blanks and token.idx - 1 in blanks)  # the tokenizer splits a blank into its underscores
+        ]
+    else:
+        ignored = get_stopwords(lang) | {word.upper() for word in _BACK_REFERENCES}
+        items = []
+        for word in clue.split():
+            core = _fold(word.strip(_PUNCTUATION))
+            article = core in lex.articles
+            noun = BLANK in word or (core.replace("-", "").isalpha() and core.upper() not in ignored and not article)
+            items.append((word, noun, "DET" if article else "NOUN" if noun else ""))
+    cores = [_fold(text.strip(_PUNCTUATION)) for text, _, _ in items] + ["", ""]
+    for i, word in enumerate(cores[:-2]):
+        if word in lex.personal and not any(noun for _, noun, _ in items[:i]):
+            return "pronoun"
+        # "αυτό που ...", "αυτός ο οποίος ..." (the one that) point at nothing.
+        if word not in lex.pointing or cores[i + 2 if cores[i + 1] in lex.articles else i + 1] in lex.relatives:
+            continue
+        # The noun a demonstrative goes with comes after it ("this pump", "αυτή τη μέθοδο") or, in Greek, right
+        # before it ("της εμφάνισης αυτής").
+        if i + 1 < len(items) and items[i + 1][2] in lex.pointing_tags:
+            if word.endswith(lex.genitive_endings) != cores[i + 1].endswith(lex.genitive_endings):
+                continue  # a pronoun with its referent in the clause, not a determiner
+            at = next((k for k in range(i + 1, len(items)) if items[k][1]), None)
+        elif lex.pointing_follows_noun and i and items[i - 1][1] and items[i - 1][0][-1] not in _PUNCTUATION:
+            at = i - 1
+        else:
+            continue
+        if at is not None and not any(cores[at] == seen or shares_root(cores[at], seen) for seen in cores[: min(at, i)]):
+            return "demonstrative"
+    return None
 
 
 def clue_pass_validate(
@@ -577,7 +806,9 @@ def clue_pass_validate(
         return False
     if has_morphological_leakage(clue, answer, nlp, lang=lang):
         return False
-    if require_blank and _fold(clue.split()[0].strip("\"'(«“")) in _BACK_REFERENCES:
+    if require_blank and _fold(clue.split()[0].strip(_PUNCTUATION)) in _BACK_REFERENCES:
+        return False
+    if require_blank and _outside_reference(clue, nlp, lang):
         return False
     if original_sentence and is_answer_subject(original_sentence, answer, nlp):
         return False

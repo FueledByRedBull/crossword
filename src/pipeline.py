@@ -348,11 +348,16 @@ def _prefetch(errors: list[str], prefetch, titles: list[str], **kwargs) -> None:
         errors.append(f"prefetch_failed:{exc}")
 
 
-def _uses_seed_word(text: str, seed_title: str, *, lang: str) -> bool:
-    # A shared stem, not shared letters: thermodynamic/thermodynamics, but not thermostat or Romania/Rome.
+def _uses_seed_word(text: str, seed_title: str, *, lang: str, lexicon: dict[str, float], derived: bool = False) -> bool:
     seed_words = [word for word in tokenize(seed_title, lang=lang) if len(word) >= 4]
+    scores = [lexicon_score_for_token(word, lexicon) for word in seed_words]
+    if len(set(scores)) > 1:  # the rarest word names the topic: "Rome", not "ancient", in "Ancient Rome"
+        seed_words = [seed_words[scores.index(min(scores))]]
+    # A shared stem, not shared letters: thermodynamic/thermodynamics, but not thermostat or Romania/Rome.
+    # `derived` also takes a short stem with at most two more letters: roman/rome.
     return any(
-        len(os.path.commonprefix([word, seed])) >= max(4, len(seed) - 1)
+        len(os.path.commonprefix([word, seed])) >= max(3 if derived else 4, len(seed) - 1)
+        and (not derived or len(word) <= len(seed) + 2)
         for word in set(tokenize(text, lang=lang))
         for seed in seed_words
     )
@@ -519,6 +524,7 @@ def _definition_clue_rows(
     nlp: object | None,
     lead_counts: Counter[str],
     pool_size: int,
+    seed_title: str,
 ) -> list[dict]:
     """Clue an article-title answer with its own article's lead sentence, subject removed.
 
@@ -535,7 +541,7 @@ def _definition_clue_rows(
             clue_text
             and clue_text not in texts
             and clue_pass_validate(clue_text, answer, min_words=3, nlp=nlp, lang=lang)
-            and not is_generic_definition(clue_text, lead_counts, pool_size, nlp)
+            and not is_generic_definition(clue_text, lead_counts, pool_size, nlp, seed_title=seed_title)
         ):
             texts.append(clue_text)
     return [
@@ -731,6 +737,7 @@ def run_candidate_scoring_stage(
     max_two_hop_parents: int | None = None,
     max_two_hop_links: int | None = None,
     max_candidates: int | None = None,
+    extra_titles: list[str] | None = None,
     keep_threshold: float = 0.2,
     borderline_threshold: float = 0.1,
     weights: dict[str, float] | None = None,
@@ -755,6 +762,8 @@ def run_candidate_scoring_stage(
     )
 
     candidates = seed_result.diagnostics.get("candidates", [])
+    if candidates:  # two-hop pages: the seed does not link them, so no back-link
+        candidates = candidates + [{"title": t, "depth": 2, "links_back_to_seed": False} for t in extra_titles or []]
     if not candidates:
         diagnostics = {
             "stage": "candidate_scoring",
@@ -796,6 +805,7 @@ def run_candidate_scoring_stage(
     nlp, backend_used, backend_errors, _, _ = _resolve_nlp_backend(lang=lang, nlp_backend="auto")
     errors.extend(backend_errors)
 
+    lexicon = load_lexicon_scores(lexicon_path)
     texts = [seed_extract]
     titles = [seed_title]
     term_answer_inventories: list[set[str]] = []
@@ -815,7 +825,12 @@ def run_candidate_scoring_stage(
             errors.append(f"lead_wikitext_failed:{title}:{exc}")
         titles.append(title)
         texts.append(extract)
-        intro_on_topic.append(_uses_seed_word(extract, seed_title, lang=lang))
+        # A derived form ("Roman") counts only where the page is defined; later on it is a passing mention.
+        first_sentence = (split_sentences(extract) or [""])[0]
+        intro_on_topic.append(
+            _uses_seed_word(extract, seed_title, lang=lang, lexicon=lexicon)
+            or _uses_seed_word(first_sentence, seed_title, lang=lang, lexicon=lexicon, derived=True)
+        )
         seed_mentions.append(_seed_mentions(title, seed_text, lang=lang))
         term_answer_inventories.append(
             _extract_answer_inventory(
@@ -842,7 +857,6 @@ def run_candidate_scoring_stage(
     backlink_bonus = [1.0 if c.get("links_back_to_seed") else 0.0 for c in candidates]
 
     lexicon_weight = max(0.0, min(1.0, lexicon_weight))
-    lexicon = load_lexicon_scores(lexicon_path)
     title_lexicon_scores: list[float] = []
     for title in titles[1:]:
         title_tokens = tokenize(title, lang=lang)
@@ -864,9 +878,10 @@ def run_candidate_scoring_stage(
         d=weights["d"],
     )
 
-    # A linked page is on topic when its intro uses a seed word or the seed article names it twice.
-    on_topic = [intro or mentions >= 2 for intro, mentions in zip(intro_on_topic, seed_mentions)]
-    ranked.sort(key=lambda row: not on_topic[int(row["index"])])  # stable: MMR order within each group
+    # A linked page is on topic when its intro uses a seed word or the seed article names it twice. Pages whose
+    # intro does is first, then pages the seed merely names, then the rest; MMR order within each group (stable).
+    group = [0 if intro else 1 if mentions >= 2 else 2 for intro, mentions in zip(intro_on_topic, seed_mentions)]
+    ranked.sort(key=lambda row: group[int(row["index"])])
 
     ranked_indices = [int(row["index"]) for row in ranked]
     scored_rows: list[dict] = []
@@ -875,7 +890,7 @@ def run_candidate_scoring_stage(
         rel = rel_scores[idx]
         depth = candidates[idx].get("depth", 1)
         links_back = bool(candidates[idx].get("links_back_to_seed"))
-        if not on_topic[idx]:
+        if group[idx] == 2:
             status = "CUT"
             reason = "cut_off_topic"
         elif rel >= keep_threshold:
@@ -1172,18 +1187,20 @@ def _build_title_answer_rows(
     if not Path(scores_path).exists():
         return []
     with Path(scores_path).open("r", encoding="utf-8", newline="") as handle:
-        scored = [
+        all_rows = [
             (
                 (row.get("title") or "").strip(),
                 _safe_float(row.get("rel_score")),
                 (row.get("intro_on_topic") or "").strip().lower() == "true",
                 _safe_int(row.get("seed_mentions")),
+                (row.get("status") or "").strip().upper() in {"KEEP", "BORDERLINE"},
             )
             for row in csv.DictReader(handle)
-            if (row.get("status") or "").strip().upper() in {"KEEP", "BORDERLINE"}
         ]
+    scored = [item[:4] for item in all_rows if item[4]]
+    on_topic_intros = {title for title, _, intro_on_topic, _, _ in all_rows if intro_on_topic}
     best_rel = max((item[1] for item in scored), default=0.0)
-    # The cap keeps the titles with the most evidence, in the order the answers are scored by (minus the seed-word penalty).
+    # The cap keeps the titles with the most evidence, in the order the answers are scored by (minus the penalty).
     scored.sort(key=lambda item: item[1] + 0.1 * min(item[3], 10) + (0.5 if item[2] else 0.0), reverse=True)
 
     rows: list[dict] = []
@@ -1212,7 +1229,12 @@ def _build_title_answer_rows(
         seen.add(normalized)
         seen_intros.add(intro)
         pattern = answer_pattern(display)
-        mentioning = [other for other, text in extracts.items() if other != page_title and pattern.search(text)]
+        # A selected article the seed merely names is no source for other answers' fill-ins.
+        mentioning = [
+            other
+            for other, text in extracts.items()
+            if other != page_title and other in on_topic_intros and pattern.search(text)
+        ]
         source_titles = [page_title, *([seed_title] if seed_mentions and title != seed_title else []), *mentioning]
         lexicon_score = lexicon_score_for_token(normalized, lexicon)
         # Relevance alone is noisy: reward pages that talk about the seed or that it names often, and push
@@ -1220,7 +1242,7 @@ def _build_title_answer_rows(
         score = 1.0 + rel_score + 0.1 * min(seed_mentions, 10)
         if intro_on_topic:
             score += 0.5
-        if title != seed_title and _uses_seed_word(display, seed_title, lang=lang):
+        if title != seed_title and _uses_seed_word(display, seed_title, lang=lang, lexicon=lexicon):
             score -= 1.0
         rows.append(
             {
@@ -1245,6 +1267,7 @@ def _build_title_answer_rows(
                 "lexicon_score": round(lexicon_score, 4),
                 "shape_penalty": round(shape_penalty(normalized), 4),
                 "answer_score": round(score, 4),
+                "intro_on_topic": intro_on_topic,
             }
         )
     return rows
@@ -1569,6 +1592,7 @@ def run_term_extraction_stage(
                 "lexicon_score",
                 "shape_penalty",
                 "answer_score",
+                "intro_on_topic",
             ]
         )
         for row in filtered_terms:
@@ -1595,6 +1619,7 @@ def run_term_extraction_stage(
                     row["lexicon_score"],
                     row["shape_penalty"],
                     row["answer_score"],
+                    row.get("intro_on_topic", ""),
                 ]
             )
 
@@ -1689,6 +1714,28 @@ def run_vocab_gate_stage(
     return VocabGateStageResult(diagnostics_path=final_diagnostics, diagnostics=diagnostics)
 
 
+# Widening for a thin seed: link lists of at most 6 selected articles (one request each), at most 100 new pages
+# (five intro batches of 20), 6 of them selected.
+_RESCUE_PARENTS = 6
+_RESCUE_NEW_PAGES = 100
+_RESCUE_SELECTED = 6
+
+
+def _linked_titles(client: WikiClient, parents: list[str], known: set[str], errors: list[str]) -> list[str]:
+    """New pages the parents link to, an even sample of each parent's links so that none dominates."""
+    payloads, failures = client.fetch_links_concurrent(parents, max_links=500)
+    errors.extend(f"two_hop_links_failed:{title}:{exc}" for title, exc in failures.items())
+    quota = _RESCUE_NEW_PAGES // max(1, len(parents))
+    found: dict[str, None] = {}
+    for parent in parents:
+        links = [link["title"] for link in payloads[parent]["links"]]
+        fresh = [title for title in links if title not in known and title not in found]
+        if len(fresh) > quota:
+            fresh = [fresh[i * len(fresh) // quota] for i in range(quota)]
+        found.update(dict.fromkeys(fresh))
+    return list(found)
+
+
 def run_rescue_ladder(
     *,
     seed_title: str,
@@ -1710,6 +1757,7 @@ def run_rescue_ladder(
     wikidata_cache_dir: str | Path = "data/cache/wikidata",
     lexicon_path: str | Path | None = "data/lexicon/combined_wordfreq.txt",
     lexicon_weight: float = 0.15,
+    scoring_args: dict | None = None,
 ) -> dict:
     errors: list[str] = []
     steps = []
@@ -1854,41 +1902,41 @@ def run_rescue_ladder(
         final_diagnostics = write_json(diagnostics_path, diagnostics)
         return {"passed": True, "diagnostics": diagnostics, "diagnostics_path": final_diagnostics}
 
-    # Two-hop expansion: re-run seed ingestion with two-hop enabled and retry terms.
-    steps.append({"action": "enable_two_hop", "value": True})
-    two_hop_result = run_seed_ingestion_stage(
-        seed_title=seed_title,
-        lang=lang,
-        cache_dir=cache_dir,
-        diagnostics_path=Path(diagnostics_path).with_name("diagnostics_rescue_two_hop.json"),
-        expansion="one_hop_plus_bounded_two_hop",
-        include_backlinks=False,
-        max_two_hop_parents=5,
-        max_two_hop_links=20,
-        max_candidates=100,
-    )
-    extra_titles = [
-        c["title"]
-        for c in two_hop_result.diagnostics.get("candidates", [])
-        if c.get("depth") == 2 and c["title"] not in selected_titles
-    ]
-    if extra_titles:
-        expanded_titles = selected_titles + extra_titles[:10]
-        _write_selected(Path(selected_override_path), expanded_titles)
-        gate = _run_gate(min_df_value=1, min_len_value=min_len, selected=selected_override_path)
-        if gate.passed:
-            diagnostics = {
-                "stage": "rescue_ladder",
-                "lang": lang,
-                "seed_title": seed_title,
-                "passed": True,
-                "reason": "enable_two_hop",
-                "steps": steps,
-                "gate": gate.__dict__,
-                "errors": errors,
-            }
-            final_diagnostics = write_json(diagnostics_path, diagnostics)
-            return {"passed": True, "diagnostics": diagnostics, "diagnostics_path": final_diagnostics}
+    # Two-hop: the pages the on-topic selected articles link to are scored like the seed's own links. The best
+    # join the selected articles and all of them can be answers. Without the scoring arguments nothing can be scored.
+    if scoring_args is not None:
+        scores = _read_csv_rows(candidate_scores_path)
+        on_topic_intros = {row["title"] for row in scores if row.get("intro_on_topic") == "True"}
+        parents = [title for title in selected_titles if title in on_topic_intros][:_RESCUE_PARENTS]
+        client = WikiClient(DiskCache(cache_dir), api_base=f"https://{lang}.wikipedia.org/w/api.php")
+        extra_titles = _linked_titles(client, parents, {row["title"] for row in scores} | {seed_title}, errors)
+        steps.append({"action": "widen_from_selected", "value": len(extra_titles)})
+        if extra_titles:
+            widened = run_candidate_scoring_stage(
+                **scoring_args,
+                extra_titles=extra_titles,
+                diagnostics_path=Path(diagnostics_path).with_name("diagnostics_scores_rescue.json"),
+                scores_path=Path(selected_override_path).with_name("candidate_scores_rescue.csv"),
+            )
+            candidate_scores_path = widened.scores_path
+            selected_titles = selected_titles + [
+                row["title"] for row in widened.scores if row["depth"] == 2 and row["status"] != "CUT"
+            ][:_RESCUE_SELECTED]
+            selected_path = _write_selected(Path(selected_override_path), selected_titles)
+            gate = _run_gate(min_df_value=1, min_len_value=min_len)
+            if gate.passed:
+                diagnostics = {
+                    "stage": "rescue_ladder",
+                    "lang": lang,
+                    "seed_title": seed_title,
+                    "passed": True,
+                    "reason": "widen_from_selected",
+                    "steps": steps,
+                    "gate": gate.__dict__,
+                    "errors": errors,
+                }
+                final_diagnostics = write_json(diagnostics_path, diagnostics)
+                return {"passed": True, "diagnostics": diagnostics, "diagnostics_path": final_diagnostics}
 
     steps.append({"action": "shorten_min_len", "value": 3})
     gate = _run_gate(min_df_value=1, min_len_value=3)
@@ -1983,6 +2031,7 @@ def run_clue_extraction_stage(
                     "normalized_answer": row.get("normalized_answer", ""),
                     "source_titles": row.get("source_titles", ""),
                     "source_method": row.get("source_method", ""),
+                    "intro_on_topic": row.get("intro_on_topic", ""),
                 }
             )
 
@@ -2057,8 +2106,16 @@ def run_clue_extraction_stage(
                 nlp=nlp,
                 lead_counts=lead_counts,
                 pool_size=len(leads),
+                seed_title=seed_title,
             )
-            candidates = definitions + candidates
+            if term["intro_on_topic"] == "False":
+                # In the pool only because the seed names it: the seed's sentence ties it to the theme better
+                # than a definition of its own page.
+                seed_fills = [row for row in candidates if row["source_page"] == seed_title]
+                seed_fills = [row for row in seed_fills if _clue_candidate_rank(row, seed_title)[0]]
+                candidates = seed_fills + definitions + candidates
+            else:
+                candidates = definitions + candidates
 
         for row in candidates:
             sentence = (row["source_page"], row["sentence_offset"])
@@ -2437,24 +2494,27 @@ def run_generate_pipeline(
     clues_path = output_dir / "clues.csv"
     selected_rescue_path = output_dir / "selected_candidates_rescue.json"
 
+    scoring_args = {
+        "seed_title": seed_title,
+        "lang": lang,
+        "cache_dir": cache_dir,
+        "include_backlinks": include_backlinks,
+        "max_links": max_links,
+        "max_backlinks": max_backlinks,
+        "expansion": expansion,
+        "max_two_hop_parents": max_two_hop_parents,
+        "max_two_hop_links": max_two_hop_links,
+        "max_candidates": max_candidates,
+        "keep_threshold": keep_threshold,
+        "borderline_threshold": borderline_threshold,
+        "weights": candidate_weights,
+        "lexicon_path": lexicon_path,
+        "lexicon_weight": candidate_lexicon_weight,
+    }
     scoring = run_candidate_scoring_stage(
-        seed_title=seed_title,
-        lang=lang,
-        cache_dir=cache_dir,
+        **scoring_args,
         diagnostics_path=output_dir / "diagnostics_scores.json",
         scores_path=scores_path,
-        include_backlinks=include_backlinks,
-        max_links=max_links,
-        max_backlinks=max_backlinks,
-        expansion=expansion,
-        max_two_hop_parents=max_two_hop_parents,
-        max_two_hop_links=max_two_hop_links,
-        max_candidates=max_candidates,
-        keep_threshold=keep_threshold,
-        borderline_threshold=borderline_threshold,
-        weights=candidate_weights,
-        lexicon_path=lexicon_path,
-        lexicon_weight=candidate_lexicon_weight,
     )
 
     selection = run_k_selection_stage(
@@ -2555,6 +2615,7 @@ def run_generate_pipeline(
             wikidata_cache_dir=wikidata_cache_dir,
             lexicon_path=lexicon_path,
             lexicon_weight=term_lexicon_weight,
+            scoring_args=scoring_args,
         )
         if selected_rescue_path.exists():
             selected_for_package = selected_rescue_path

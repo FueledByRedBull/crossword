@@ -1,6 +1,8 @@
 import unittest
 from collections import Counter
+from unittest.mock import patch
 
+from src import clue_builder
 from src.clue_builder import (
     clue_pass_extract,
     clue_pass_extract_with_offset,
@@ -161,6 +163,34 @@ class TrimClauseTests(unittest.TestCase):
         for title in ("Infinite Potential: the Life and Times of ____.", "____ on the cosmological constant problem."):
             self.assertFalse(has_verb(title, nlp), title)
         self.assertTrue(has_verb("Most fermions decay by a ____ over time.", nlp))
+
+    def test_a_clause_cut_before_its_main_verb_has_no_verb(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        for fragment in (
+            "Apart from informing the public about ____ history, ...",
+            "The centerpiece of that analysis, now known as a ____, ...",
+            "Regarding the ____ revival of the 1940s, ...",
+        ):
+            self.assertFalse(has_verb(fragment, nlp), fragment)
+        for clue in (
+            "If the ____ can be measured, ...",  # a modal is finite
+            "A rapid succession of rhythm and ____ hits followed, ...",  # tagged a participle, but it has its subject
+            # A whole sentence is not held to it: the tagger calls "evolved" and "painted" participles.
+            "____ evolved from historical ideas about the vacuum.",
+            "During the 1860s, Monet and ____ sometimes painted on canvases prepared with the traditional red-brown or grey ground.",
+        ):
+            self.assertTrue(has_verb(clue, nlp), clue)
+
+    def test_a_greek_clause_cut_before_its_main_verb_has_no_verb(self) -> None:
+        nlp = _load_nlp("el_core_news_sm")
+        if nlp is None:
+            self.skipTest("Greek spaCy model not available")
+        # The tagger calls one underscore of this blank a finite verb.
+        self.assertFalse(has_verb("Στην Αστρονομία γενικά ____ ή απλανής, ...", nlp))
+        self.assertFalse(has_verb("Χρησιμοποιώντας την ____ ως βάση, ...", nlp))
+        self.assertTrue(has_verb("Το μέγεθος που δείχνει, πόσο ισχυρό είναι το ____, ...", nlp))
 
     def test_a_window_that_opens_mid_sentence_is_never_clean(self) -> None:
         # "... which was centered in the region of ____." reads as a fragment even though a comma precedes it.
@@ -497,27 +527,30 @@ class DefinitionCapAndEdgesTests(unittest.TestCase):
 
 class GenericDefinitionTests(unittest.TestCase):
     # Lead-sentence document frequencies measured on the offline runs of the four test seeds.
-    COMMON = {"a": 101, "an": 47, "the": 140, "of": 120, "and": 118, "that": 60, "is": 100, "in": 90}
+    COMMON = {"a": 101, "an": 47, "the": 140, "of": 120, "and": 118, "that": 60, "is": 100, "in": 90, "from": 30, "to": 100}
     POOLS = {
         "quantum": (150, {
             "physicist": 43, "theoretical": 31, "british": 6, "american": 19, "brazilian": 1, "particle": 17,
             "quantum": 62, "elementary": 5, "electromagnetic": 6, "field": 13, "form": 6, "angular": 2,
             "intrinsic": 1, "momentum": 4,
         }),
-        "thermo": (82, {"german": 4, "physicist": 12, "mathematician": 4}),
+        "thermo": (82, {"german": 4, "physicist": 12, "mathematician": 4, "process": 9}),
         "jazz": (150, {
             "music": 74, "genre": 38, "musical": 18, "form": 15, "style": 22, "dance": 15, "electronic": 6,
-            "subculture": 2,
+            "subculture": 2, "american": 68, "jazz": 99, "drummer": 4, "composer": 37, "brass": 3, "instrument": 6,
+        }),
+        "impressionism": (150, {
+            "french": 62, "impressionist": 50, "painter": 57, "claude": 20, "monet": 20, "canvas": 9, "by": 30,
         }),
         "rome": (105, {
             "god": 3, "war": 5, "capital": 7, "largest": 4, "city": 13, "lebanon": 1, "gallic": 2,
-            "chieftain": 1, "senones": 1, "ancient": 21, "tribe": 2, "europe": 6,
+            "chieftain": 1, "senones": 1, "ancient": 21, "tribe": 2, "europe": 6, "roman": 40, "emperor": 25,
         }),
     }
 
-    def _generic(self, pool: str, clue: str, nlp=None) -> bool:
+    def _generic(self, pool: str, clue: str, nlp=None, seed_title: str | None = None) -> bool:
         size, counts = self.POOLS[pool]
-        return is_generic_definition(clue, Counter({**self.COMMON, **counts}), size, nlp)
+        return is_generic_definition(clue, Counter({**self.COMMON, **counts}), size, nlp, seed_title=seed_title)
 
     def test_definitions_that_fit_many_answers_are_generic(self) -> None:
         for pool, clue in (
@@ -533,9 +566,22 @@ class GenericDefinitionTests(unittest.TestCase):
         nlp = _load_nlp()
         if nlp is None:
             self.skipTest("spaCy model not available")
-        clue = "An American-Brazilian physicist"
+        clue = "An American-Brazilian polymath and physicist"
         self.assertFalse(self._generic("quantum", clue))
         self.assertTrue(self._generic("quantum", clue, nlp))
+
+    def test_a_nationality_asks_for_a_second_informative_word(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        # "drummer" is rare, but "An American jazz drummer" names a crowd; "brass" alone tells the trumpet apart.
+        self.assertTrue(self._generic("jazz", "An American jazz drummer and composer", nlp))
+        self.assertFalse(self._generic("jazz", "A brass instrument", nlp))
+        # The nationality of someone else, after a preposition, asks for nothing.
+        monet = "An 1881 canvas by the French Impressionist painter Claude Monet"
+        self.assertFalse(self._generic("impressionism", monet, nlp))
+        with patch.object(clue_builder, "_MIN_INFORMATIVE_WORDS", 1):
+            self.assertFalse(self._generic("jazz", "An American jazz drummer and composer", nlp))
 
     def test_definitions_with_a_rare_word_are_kept(self) -> None:
         for pool, clue in (
@@ -552,6 +598,45 @@ class GenericDefinitionTests(unittest.TestCase):
         # that these two fit many answers.
         self.assertFalse(self._generic("jazz", "A genre of dance music and a subculture"))
         self.assertFalse(self._generic("rome", "An ancient tribe in Europe"))
+
+    def test_numbers_and_seed_words(self) -> None:
+        self.assertFalse(self._generic("rome", "Roman emperor from 81 to 96"))
+        self.assertTrue(self._generic("rome", "Roman emperor from the city"))
+        # "thermodynamic" tells nothing in a pool seeded with Thermodynamics.
+        self.assertFalse(self._generic("thermo", "A thermodynamic process"))
+        self.assertTrue(self._generic("thermo", "A thermodynamic process", seed_title="Thermodynamics"))
+
+    def test_a_head_noun_that_names_a_word_is_generic_unless_it_says_what_the_word_means(self) -> None:
+        for clue in (
+            "A term coined in the 1980s",
+            "A jazz term with several possible definitions and usages",
+            "A fundamental concept in the field of thermodynamics and engineering",
+            "The name given to oil painters and others",
+        ):
+            self.assertTrue(self._generic("jazz", clue), clue)
+        for clue in (
+            "An emblematic phrase referring to the government of the Roman Republic",
+            "A scientific concept, most commonly associated with states of disorder, randomness, or uncertainty",
+            "A term encompassing a number of closely related results in physics",
+        ):
+            self.assertFalse(self._generic("jazz", clue), clue)
+
+    def test_a_kind_of_word_that_only_modifies_the_head_is_not_the_head(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        clue = "A word processor developed by Microsoft"
+        self.assertTrue(self._generic("jazz", clue))
+        self.assertFalse(self._generic("jazz", clue, nlp))
+
+    def test_a_vague_quantifier_opens_a_generic_definition(self) -> None:
+        for clue in ("Any of many different quantities", "One of several unrelated wave phenomena", "Various small birds"):
+            self.assertTrue(self._generic("quantum", clue), clue)
+        for clue in (
+            "One of the earliest foundational tunes of Afro-Cuban jazz",
+            "One of the world's earliest sewage systems",
+        ):
+            self.assertFalse(self._generic("jazz", clue), clue)
 
     def test_trailing_sections_are_cut_at_the_first_of_them(self) -> None:
         body = "Weinberg won a prize."
@@ -634,6 +719,9 @@ class FillInOpeningTests(unittest.TestCase):
             "Now pair it with a reversed ____ as shown by the right figure.",
             'He has also used the term "R&B" as a synonym for ____.',
             "And the ____ followed.",
+            "Hence, no real heat engine could realize the ____'s reversibility and was condemned to be less efficient.",
+            "Therefore, even at ____, atoms and molecules retain some vibrational motion.",
+            "However, AllMusic separates it from ____ because of R&B's stronger gospel influences.",
             "Αυτό είναι το ____ του συστήματος.",
             "Και η ____ μεταφέρεται από το ένα σώμα στο άλλο.",
         ):
@@ -661,6 +749,99 @@ class FillInOpeningTests(unittest.TestCase):
         self.assertFalse(clean)
         # The start of a sentence cut once at a clause boundary still is.
         self.assertTrue(clue_pass_mask_trim(sentence.replace("Anatolia", "Pontus"), "Pontus")[1])
+
+
+class FillInReferenceTests(unittest.TestCase):
+    NEEDS_NO_TAGGER = (
+        "In 1870 he introduced the virial theorem, which applied to ____.",
+        "One proposal for doing so is ____ theory, which is popular.",
+        "The formula for this calculation is known as the ____.",
+        "The former is stochastic and discontinuous, writes von Neumann, and the latter ____ and continuous.",
+        "Using this pump, Boyle and Hooke noticed a correlation between pressure, temperature, and ____.",
+        'The following pentatonic lick was played over ____ changes by Joe Henderson on Horace Silver\'s "African Queen".',
+        "For this reason, some philosophers of science have deemed ____ a form of anti-realism.",
+        "Writing a ____ does not provide the complete information necessary to describe this state-change process.",
+        "The team said it did so and the ____ rose.",
+        "____ elements can be represented likewise, ...",
+    )
+    KEPT = (
+        "Segments of the ____ are often described as walls; they have respective defined 'permeabilities'.",
+        "Heraclius, son of the exarch of ____, set sail for the city and assumed the throne.",
+        "The wolf was the sacred animal of ____, with the she-wolf nursing the two founders as children.",
+        "Mithridates VI was the ruler of Pontus, a large kingdom in ____, from 120 to 63 BC.",
+        "____'s 1954 performance of \"Walkin'\" at the first Newport Jazz Festival introduced the style to the jazz world.",
+        "The ____ of the pump was designed so this pump can run, and the pump is old.",
+    )
+
+    @staticmethod
+    def _passes(clue: str, nlp=None, lang: str = "en") -> bool:
+        return clue_pass_validate(clue, "Entropy", min_words=3, nlp=nlp, require_blank=True, lang=lang)
+
+    def test_a_fill_in_that_leans_on_an_earlier_sentence_is_rejected(self) -> None:
+        for nlp in (None, _load_nlp()):
+            for clue in self.NEEDS_NO_TAGGER:
+                with self.subTest(clue=clue, tagger=nlp is not None):
+                    self.assertFalse(self._passes(clue, nlp))
+
+    def test_a_pronoun_with_a_noun_before_it_is_kept(self) -> None:
+        for clue in self.KEPT:
+            with self.subTest(clue=clue):
+                self.assertTrue(self._passes(clue))
+        self.assertTrue(self._passes("Heat flows when it is wanted, and he knows the ____."))
+
+    def test_the_tagger_sees_a_pronoun_after_a_function_word_and_a_noun_before_it(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        for clue in self.KEPT:
+            with self.subTest(clue=clue):
+                self.assertTrue(self._passes(clue, nlp))
+        # Without a tagger "Because" counts as a noun that "it" could refer to.
+        clue = "Because of this, it is often important to distinguish between heterogeneous ____ and homogeneous ____."
+        self.assertTrue(self._passes(clue))
+        self.assertFalse(self._passes(clue, nlp))
+
+    def test_greek_fill_ins_that_lean_on_an_earlier_sentence_are_rejected(self) -> None:
+        for clue in (
+            "Με αυτή τη μέθοδο υπολογίζεται η ____ του αερίου.",
+            "Υπολογίζονται τα ακόλουθα μεγέθη: η ____ και η πίεση.",
+            "Οι παρακάτω τύποι δίνουν την ____ του συστήματος.",
+            "Ο πρώτος νόμος αφορά την ενέργεια, ο δεύτερος την ____.",
+        ):
+            with self.subTest(clue=clue):
+                self.assertFalse(self._passes(clue, lang="el"))
+        for clue in (
+            "Η ____ είναι αυτό που μετράμε στο σύστημα.",
+            "Ο πρώτος νόμος της θερμοδυναμικής αφορά την ____.",
+            "Η ____ μεταφέρεται από το ένα σώμα στο άλλο.",
+        ):
+            with self.subTest(clue=clue):
+                self.assertTrue(self._passes(clue, lang="el"))
+
+
+    def test_a_greek_demonstrative_points_outside_before_or_after_its_noun(self) -> None:
+        rejected = (
+            "Λόγω της εμφάνισης αυτής, ονομάστηκε στα ελληνικά «____ κύκλος» ή και «γάλακτος κύκλος» ή και σκέτο «γάλα».",
+            "Σύμφωνα με την αντίληψη αυτή, η ____, αντιμετωπίζεται ως ψευδεπιστήμη.",
+            "Ιδιαίτεροι κλάδοι αυτής της Επιστήμης είναι: η Πρακτική ____, η Δυναμική ____, ...",
+            # The article came before, the noun did not.
+            "Τη θερμότητα μετρά το θερμιδόμετρο, και με αυτή τη μέθοδο υπολογίζεται η ____.",
+        )
+        kept = (
+            # The noun came before, in another case.
+            "Η εμφάνιση του είναι γαλακτώδης, και λόγω της εμφάνισης αυτής ονομάστηκε ____.",
+            "Η μέθοδος είναι απλή, και με αυτή τη μέθοδο υπολογίζεται η ____.",
+            # "that of light" and "the one who": pronouns that point inside the clue.
+            "Σε περιπτώσεις που η ταχύτητα των αντικειμένων πλησιάζει αυτήν του φωτός, η ____ επεκτείνεται από την Ειδική Σχετικότητα.",
+            "Ο Κέπλερ ήταν αυτός που διατύπωσε τους νόμους της ____.",
+        )
+        for nlp in (None, _load_nlp("el_core_news_sm")):
+            for clue in rejected:
+                with self.subTest(clue=clue, tagger=nlp is not None):
+                    self.assertFalse(self._passes(clue, nlp, lang="el"))
+            for clue in kept:
+                with self.subTest(clue=clue, tagger=nlp is not None):
+                    self.assertTrue(self._passes(clue, nlp, lang="el"))
 
 
 class DefinitionCutTests(unittest.TestCase):
@@ -717,6 +898,27 @@ class DefinitionCutTests(unittest.TestCase):
         )
         diocletian = "Diocletian, nicknamed Jovius, was Roman emperor from 284 until his abdication in 305."
         self.assertEqual(definition_clue(diocletian, answer="Diocletian"), "Roman emperor from 284 until his abdication in 305")
+
+    def test_and_before_a_new_preposition_opens_a_tail(self) -> None:
+        mainz = (
+            "Mainz is the capital and largest city of the German state of Rhineland-Palatinate, and with around "
+            "223,000 inhabitants, it is Germany's 35th-largest city."
+        )
+        self.assertEqual(
+            definition_clue(mainz, answer="Mainz"), "The capital and largest city of the German state of Rhineland-Palatinate"
+        )
+        # A comma after another one closes a list: no cut before its last item.
+        time = (
+            "Time is the continuous progression of existence that occurs in an apparently irreversible succession "
+            "from the past, through the present, and into the future."
+        )
+        self.assertIsNone(definition_clue(time, answer="Time", max_words=18))
+        # A preposition used before continues a list: "in his native country" does not end the definition.
+        weill = (
+            "Kurt Julian Weill was a German-born American composer active from the 1920s in his native country, "
+            "and in his later years in the United States."
+        )
+        self.assertEqual(definition_clue(weill, answer="Kurt Weill"), "A German-born American composer active from the 1920s")
 
     def test_a_tail_the_cut_left_unfinished_is_dropped(self) -> None:
         roman_law = (
@@ -846,6 +1048,91 @@ class GreekDefinitionTests(unittest.TestCase):
         self.assertIsNotNone(definition_clue(kinematics, answer="Κινηματική", lang="el", nlp=nlp))
         neuter = "Η Κβαντική οπτική αποτελεί πεδίο της φυσικής και της μηχανικής των κυμάτων."
         self.assertIsNotNone(definition_clue(neuter, answer="Κβαντική οπτική", lang="el", nlp=nlp))
+
+    def test_a_cut_never_comes_after_the_first_item_of_a_list(self) -> None:
+        photonics = (
+            "Φωτονική ονομάζεται ο κλάδος των επιστημών και της τεχνολογίας που ασχολείται με την δημιουργία, τον "
+            "έλεγχο και την ανίχνευση φωτονίων ιδιαίτερα στην περιοχή του ορατού φωτός."
+        )
+        micro = (
+            "Μικροηλεκτρονική καλείται ο κλάδος της ηλεκτρονικής τεχνολογίας που εφαρμόζει τις θεωρίες, τις "
+            "τεχνικές και τις μεθόδους της ηλεκτρονικής στην κατασκευή μικροσκοπικών συσκευών."
+        )
+        for nlp in (None, _load_nlp("el_core_news_sm")):
+            self.assertEqual(
+                definition_clue(photonics, answer="Φωτονική", lang="el", nlp=nlp), "Ο κλάδος των επιστημών και της τεχνολογίας"
+            )
+            self.assertIsNone(definition_clue(micro, answer="Μικροηλεκτρονική", lang="el", nlp=nlp))
+        # A comma before "η οποία" or a clause opener is not a list.
+        self.assertEqual(self._definition("Εντροπία"), "Η έννοια μέσω της οποίας μετράται η αταξία")
+
+    def test_the_tagger_finds_a_second_predicate_whatever_its_verb(self) -> None:
+        nlp = _load_nlp("el_core_news_sm")
+        if nlp is None:
+            self.skipTest("Greek spaCy model not available")
+        seasons = "Οι εποχές είναι μία από τις μείζονες διαιρέσεις του έτους και βασίζεται γενικά σε ομοιογενή κλιματικά χαρακτηριστικά."
+        self.assertEqual(definition_clue(seasons, answer="Εποχές", lang="el", nlp=nlp), "Μία από τις μείζονες διαιρέσεις του έτους")
+        # The last verb of a list of verbs, and the "και" of "μιας και" (since), do not start a second predicate.
+        geography = (
+            "Η Γεωγραφία είναι η επιστήμη η οποία περιγράφει, αναλύει και προβλέπει την εξέλιξη της Γης στις βασικές "
+            "πτυχές της, τόσο του ανθρωπογενούς, όσο και του φυσικού χώρου."
+        )
+        self.assertNotEqual(definition_clue(geography, answer="Γεωγραφία", lang="el", nlp=nlp), "Η επιστήμη η οποία περιγράφει, αναλύει")
+        astrology = (
+            "Η αστρολογία είναι μια πρακτική με μακραίωνη παράδοση και σήμερα αναγνωρίζεται ως ψευδοεπιστήμη, παραεπιστήμη ή "
+            "απλή προκατάληψη μιας και απέτυχε επανειλημμένα να αποδείξει την αξία της σε αριθμό ελεγχόμενων μελετών."
+        )
+        self.assertEqual(
+            definition_clue(astrology, answer="Αστρολογία", lang="el", nlp=nlp),
+            "Μια πρακτική με μακραίωνη παράδοση και σήμερα αναγνωρίζεται ως ψευδοεπιστήμη",
+        )
+
+    def test_a_cut_inside_a_relative_clause_that_opens_on_an_aside_is_cut_back(self) -> None:
+        nlp = _load_nlp("el_core_news_sm")
+        if nlp is None:
+            self.skipTest("Greek spaCy model not available")
+        rest = ", εκφράζει την ποσότητα της ενέργειας που παράγεται ή καταναλώνεται από ένα σώμα."
+        work = "Το έργο είναι όρος της Φυσικής, που σε πολύ απλή απόδοση" + rest
+        # "που σε πολύ απλή απόδοση," never reaches its verb, and "Όρος της Φυσικής" alone defines nothing.
+        self.assertIsNone(definition_clue(work, answer="Έργο", lang="el", nlp=nlp))
+        longer = "Το έργο είναι ένα από τα βασικά μεγέθη της Φυσικής, που σε πολύ απλή απόδοση" + rest
+        self.assertEqual(
+            definition_clue(longer, answer="Έργο", lang="el", nlp=nlp), "Ένα από τα βασικά μεγέθη της Φυσικής"
+        )
+        # Without a tagger nothing tells an aside from a clause.
+        self.assertEqual(definition_clue(work, answer="Έργο", lang="el"), "Όρος της Φυσικής, που σε πολύ απλή απόδοση")
+        # A clause that reaches its verb stays, also when the tagger does not see the verb ("μελετά").
+        reaches = (
+            "Το έργο είναι όρος της Φυσικής, που σε πολύ απλή απόδοση εκφράζει την ποσότητα της ενέργειας, η οποία "
+            "παράγεται ή καταναλώνεται από ένα σώμα κατά τη διάρκεια μιας μεταβολής."
+        )
+        self.assertEqual(
+            definition_clue(reaches, answer="Έργο", lang="el", nlp=nlp),
+            "Όρος της Φυσικής, που σε πολύ απλή απόδοση εκφράζει την ποσότητα της ενέργειας",
+        )
+        biology = (
+            "Η βιολογία είναι η επιστήμη της φύσης που μελετά τη ζωή και τους ζωντανούς οργανισμούς, δηλαδή τις φυσικές "
+            "δομές, χημικές διεργασίες, μοριακές αλληλεπιδράσεις, φυσιολογικούς μηχανισμούς, την ανάπτυξη και την εξέλιξη."
+        )
+        self.assertEqual(
+            definition_clue(biology, answer="Βιολογία", lang="el", nlp=nlp),
+            "Η επιστήμη της φύσης που μελετά τη ζωή και τους ζωντανούς οργανισμούς",
+        )
+
+    def test_a_definition_that_promises_a_list_is_cut_before_the_promise(self) -> None:
+        planet = (
+            "Πλανήτης, σύμφωνα με τον σύγχρονο ορισμό της Διεθνούς Αστρονομικής Ένωσης, ονομάζεται κάθε ουράνιο σώμα "
+            "που περιφέρεται γύρω από έναν αστέρα ή αστρικό υπόλειμμα και καλύπτει τις ακόλουθες πρόσθετες προϋποθέσεις:"
+        )
+        nlp = _load_nlp("el_core_news_sm")
+        if nlp is not None:
+            self.assertEqual(
+                definition_clue(planet, answer="Πλανήτης", lang="el", nlp=nlp),
+                "Κάθε ουράνιο σώμα που περιφέρεται γύρω από έναν αστέρα ή αστρικό υπόλειμμα",
+            )
+        self.assertIsNone(definition_clue(planet, answer="Πλανήτης", lang="el"))
+        self.assertIsNone(definition_clue("Heat is the energy of the following kinds of motion in bodies.", answer="Heat"))
+        self.assertIsNone(definition_clue("A bra is likewise a vector of the dual space.", answer="Bra"))
 
     def test_no_copula_or_the_wrong_language_means_no_definition(self) -> None:
         self.assertIsNone(definition_clue("Η Μετεωρολογία ανήκει στις θετικές επιστήμες, με κύριο αντικείμενο την έρευνα.", lang="el"))

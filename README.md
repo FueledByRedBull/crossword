@@ -40,10 +40,10 @@ py -3 cli.py export --puzzle outputs\run_thermo\puzzle.json --format ipuz --outp
 
 ## How It Works
 
-1. Score the articles linked from the seed and choose how many to keep (`K`). A linked article is on topic when its intro uses a word of the seed title (matched by stem) or the seed article names it at least twice. Off-topic articles are cut (`cut_off_topic` in `candidate_scores.csv`) and are selected only when no on-topic article is left.
-2. Extract answers primarily from the titles of the on-topic linked articles, then from terms in the selected articles; a vocabulary gate checks there are enough.
-3. Build one clue per answer: a definition clue from the article's first sentence (answer masked), or a fill-in-the-blank clue from article text as fallback, preferring a sentence of the seed article.
-4. Place the clued answers in a free-form layout, where words cross wherever their letters match.
+1. Score the articles linked from the seed and choose how many to keep (`K`). A linked article is on topic when its intro uses a word of the seed title (matched by stem) or the seed article names it at least twice. Where the word-frequency list tells the title's words apart, only the rarest counts ("Rome", not "ancient", in "Ancient Rome"), and a derived form of a short word ("Roman") counts only in the intro's first sentence. Articles whose intro is on topic are selected first, then those the seed merely names. Off-topic articles are cut (`cut_off_topic` in `candidate_scores.csv`) and are selected only when nothing else is left.
+2. Extract answers primarily from the titles of the on-topic linked articles, then from terms in the selected articles; a vocabulary gate checks there are enough. When there are not, a rescue ladder loosens the term filters and then widens the pool with pages linked from the on-topic selected articles (at most 100 new pages from at most 6 articles).
+3. Build one clue per answer: a definition clue from the article's first sentence (answer masked), or a fill-in-the-blank clue as fallback. A fill-in comes only from the seed article, the answer's own page or a selected article whose intro is on topic, preferring the seed. An answer that is in the pool only because the seed names it takes a clean seed sentence before its own page's definition.
+4. Place the clued answers in a free-form layout, where words cross wherever their letters match. The search fills the grid greedily, then keeps removing a few words and refilling (simulated annealing); it is deterministic for a given `--random-seed`.
 5. Package the puzzle with attribution.
 
 ## Layout Rules
@@ -54,14 +54,17 @@ A layout is valid only if:
 - all words form one connected piece;
 - every run of two or more letters in a row or column is exactly one placed word.
 
-`fill_status` is `complete` when the layout is valid and has at least `--min-words` words, otherwise `failed`. Layout quality is reported as `word_count`, `across_count`, `down_count`, `crossing_count`, `mean_crossings_per_word`, `words_with_two_plus_crossings`, `two_plus_crossings_ratio`, `letter_count`, `checked_letter_ratio`, `bbox_rows`, `bbox_cols` and `density`. `--layout-restarts` and `--layout-candidates` bound the search.
+`fill_status` is `complete` when the layout is valid and has at least `--min-words` words, otherwise `failed`. Layout quality is reported as `word_count`, `across_count`, `down_count`, `crossing_count`, `mean_crossings_per_word`, `words_with_two_plus_crossings`, `two_plus_crossings_ratio`, `letter_count`, `checked_letter_ratio`, `bbox_rows`, `bbox_cols` and `density`. `--layout-candidates` caps how many clued answers are offered to the layout and `--layout-restarts` scales the search effort (25 search steps each).
+
+Measured on 2026-10-11 over six real candidate lists and three random seeds, the search places 20.1 words on average with 21.9% of the letters crossed, in 2 to 9 seconds per layout (the earlier greedy search: 18.8 words and 20.8%). What limits density is the supply of short answers, not the grid or the search: a typical list offers 6 to 17 answers of six letters or fewer and the layouts already place about 80 to 90% of them.
 
 ## Clue Quality
 
 - Each entry has `clue_style` of `definition` or `fill_in_blank`; a fill-in-the-blank clue must contain the blank (`____`).
 - A clue must not contain the answer or a morphological cousin of it.
-- A clue has at most 18 words. A definition is cut only at a clean boundary; a fill-in-the-blank clue is a whole sentence, or the start of one cut at a clause boundary (`...` at the end only), and never opens with a word that points at an earlier sentence ("It", "This", "These", "But" ...).
-- A definition every word of which is common among the pool's lead sentences ("An American physicist") is dropped as generic.
+- A clue has at most 18 words. A definition is cut only at a clean boundary; a fill-in-the-blank clue is a whole sentence, or the start of one cut at a clause boundary (`...` at the end only) that still has its finite verb.
+- A fill-in-the-blank clue never opens with a word that points at an earlier sentence ("It", "This", "But", "Hence," ...) and does not lean on one further in: a pronoun with nothing before it to refer to ("In 1870 he introduced ..."), "this pump" when no pump was named, "the former", "the following", "doing so".
+- A definition is dropped as generic when it has no word that is rare among the pool's lead sentences (words of the seed title and nationalities do not count); when it opens on the answer's nationality and has fewer than two such words ("An American jazz drummer"); when its head noun names a kind of word without saying what the word means ("A term coined in the 1980s"); or when it opens on a vague quantifier ("Any of many different quantities").
 - A blank that is one part of a longer proper name is not a clue.
 - Clue text must not repeat across entries.
 - Every used clue carries provenance (article, revision id, sentence offset, `oldid` URL). Clue text and revision id always come from the same API response: the full text for the seed and the selected articles, the intro for every other page. A clue without such a revision id is not used.
@@ -110,7 +113,7 @@ On 2026-10-11 Wikipedia allowed this client about 10 requests a minute, so the f
 py -3 cli.py generate --seed "Αστρονομία" --lang el --output-dir outputs\run_astro
 ```
 
-Greek articles are shorter and link less than English ones, so a thin seed fails the vocabulary gate: on 2026-10-11 `Αστρονομία` gave a complete 19-word puzzle, while `Θερμοδυναμική` stopped at `insufficient_vocabulary` with 9 clued answers. Known gaps: there is no Greek word-frequency list (the lexicon score is 0), a fill-in-the-blank clue only blanks the exact written form of the answer, and el.wikipedia.org rate-limits sooner than en.wikipedia.org, so a first online run waits on HTTP 429 a few times.
+Greek articles are shorter and link less than English ones, so a thin seed fails the vocabulary gate: on 2026-10-11 `Αστρονομία` gave a complete 18-word puzzle, while `Θερμοδυναμική` stopped at `insufficient_vocabulary`. For that seed the rescue ladder scored 82 more pages linked from the selected articles, 13 of them on topic, which raised the clued answers from 9 to 15 against the 30 the gate asks for. With `--gate-min 12 --min-words 8` the same seed gives a valid 12-word puzzle. Known gaps: the checks for a clue that points outside its sentence and for a generic definition are weaker in Greek than in English (no personal-pronoun check, no nationality or kind-of-word rule), there is no Greek word-frequency list (the lexicon score is 0), a fill-in-the-blank clue only blanks the exact written form of the answer, and el.wikipedia.org rate-limits sooner than en.wikipedia.org, so a first online run waits on HTTP 429 a few times.
 
 ## Tuning Weights
 
@@ -139,10 +142,10 @@ The offline integration corpus covers the English cached path:
 Per-seed checks in `tests/test_generate_integration.py`:
 
 - `fill_status == "complete"`, `puzzle_status == "ok"`, and the puzzle passes the validity checker
-- `word_count` at least 16
-- `mean_crossings_per_word` at least 1.9
-- `two_plus_crossings_ratio` at least 0.5
-- `checked_letter_ratio` at least 0.15
+- `word_count` at least 17
+- `mean_crossings_per_word` at least 2.1
+- `two_plus_crossings_ratio` at least 0.6
+- `checked_letter_ratio` at least 0.18
 - definition clues are at least 50% of the entries
 - no clue longer than 18 words, none that starts mid-sentence (`...`)
 - no clue contains its answer, no duplicate clue text, no fill-in-the-blank clue missing its blank

@@ -16,6 +16,8 @@ from src.pipeline import (
     _inventory_min_k_target,
     _definition_clue_rows,
     _layout_candidates,
+    _linked_titles,
+    _uses_seed_word,
     _seed_mentions,
     run_candidate_scoring_stage,
     run_clue_extraction_stage,
@@ -285,15 +287,22 @@ class PipelineTests(unittest.TestCase):
         "Hannibal": "Hannibal was a general.",
     }
 
-    def score_rome(self, tmp: str):
-        candidates = [{"title": title, "depth": 1, "links_back_to_seed": True} for title in list(self.ROME_INTROS)[1:]]
+    def score_rome(
+        self,
+        tmp: str,
+        intros: dict[str, str] | None = None,
+        seed_text: str | None = None,
+        extra_titles: list[str] | None = None,
+    ):
+        intros = intros or self.ROME_INTROS
+        candidates = [{"title": title, "depth": 1, "links_back_to_seed": True} for title in list(intros)[1:]]
         seed_result = SimpleNamespace(diagnostics={"candidates": candidates, "errors": []})
-        seed_text = "Hannibal crossed the Alps. Diocletian split the empire; later Diocletian retired."
+        seed_text = seed_text or "Hannibal crossed the Alps. Diocletian split the empire; later Diocletian retired."
         with (
             patch("src.pipeline.run_seed_ingestion_stage", return_value=seed_result),
             patch(
                 "src.pipeline.WikiClient.fetch_page_extract",
-                side_effect=lambda title, intro_only=True: {"extract": self.ROME_INTROS[title]},
+                side_effect=lambda title, intro_only=True: {"extract": intros[title]},
             ),
             patch(
                 "src.pipeline.WikiClient.fetch_page_extract_with_revid",
@@ -307,6 +316,7 @@ class PipelineTests(unittest.TestCase):
                 diagnostics_path=Path(tmp) / "diagnostics.json",
                 scores_path=Path(tmp) / "scores.csv",
                 lexicon_path=None,
+                extra_titles=extra_titles,
             )
 
     def test_scoring_cuts_off_topic_candidates_and_ranks_on_topic_ones_first(self) -> None:
@@ -335,6 +345,139 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(by_title["Latium"]["intro_on_topic"], True)
         self.assertEqual(by_title["Diocletian"]["seed_mentions"], 2)
+
+    def test_scoring_puts_pages_with_an_on_topic_intro_before_pages_the_seed_merely_names(self) -> None:
+        intros = {
+            "Ancient Rome": "Ancient Rome was a civilization in Italy.",
+            "Named": "A civilization in Italy was a civilization in Italy.",
+            "Intro": "Rome is a city.",
+            "Other": "Hannibal was a general.",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.score_rome(tmp, intros, "Named appears here. Named again.")
+
+        by_title = {row["title"]: row for row in result.scores}
+        self.assertGreater(by_title["Named"]["rel_score"], by_title["Intro"]["rel_score"])  # MMR alone would lead with it
+        self.assertEqual([row["title"] for row in result.scores], ["Intro", "Named", "Other"])
+        self.assertEqual(by_title["Other"]["reason"], "cut_off_topic")
+
+    def test_scoring_scores_extra_titles_as_two_hop_pages_by_the_same_rule(self) -> None:
+        intros = {**self.ROME_INTROS, "Roman law": "Roman law developed over centuries.", "Plankton": "Plankton drifts."}
+        with tempfile.TemporaryDirectory() as tmp:
+            self.score_rome(tmp, intros, extra_titles=["Roman law", "Plankton"])
+            with (Path(tmp) / "scores.csv").open(encoding="utf-8", newline="") as handle:
+                csv_rows = {row["title"]: row for row in csv.DictReader(handle)}
+
+        # Not linked by the seed: depth 2, no back-link; only the intro arm (or the seed naming it) admits it.
+        self.assertEqual((csv_rows["Roman law"]["depth"], csv_rows["Roman law"]["links_back_to_seed"]), ("2", "False"))
+        self.assertEqual(csv_rows["Roman law"]["intro_on_topic"], "True")
+        self.assertEqual(csv_rows["Plankton"]["reason"], "cut_off_topic")
+        self.assertEqual(csv_rows["Hannibal"]["depth"], "1")
+
+    def test_linked_titles_takes_an_even_share_of_each_parents_new_links(self) -> None:
+        client = MagicMock()
+        client.fetch_links_concurrent.return_value = (
+            {
+                "A": {"links": [{"title": t} for t in ("Known", "a1", "a2", "a3", "a4", "a5")]},
+                "B": {"links": [{"title": t} for t in ("a1", "b1")]},
+                "C": {"links": []},
+            },
+            {"C": "boom"},
+        )
+        errors: list[str] = []
+        with patch("src.pipeline._RESCUE_NEW_PAGES", 6):  # a share of two per parent
+            titles = _linked_titles(client, ["A", "B", "C"], {"Known"}, errors)
+
+        self.assertEqual(titles, ["a1", "a3", "b1"])  # even steps through A; B's a1 is A's already
+        self.assertEqual(errors, ["two_hop_links_failed:C:boom"])
+        client.fetch_links_concurrent.assert_called_once_with(["A", "B", "C"], max_links=500)
+
+    def test_rescue_ladder_widens_from_the_on_topic_selected_articles_and_selects_the_best_new_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            (tmp_dir / "selected.json").write_text(
+                json.dumps({"seed_title": "Seed", "lang": "en", "selected_k": 2, "selected_titles": ["On", "Named"]}),
+                encoding="utf-8",
+            )
+            (tmp_dir / "scores.csv").write_text(
+                "\n".join(
+                    [
+                        "rank,title,depth,links_back_to_seed,rel_score,intro_on_topic,seed_mentions,status,reason",
+                        "1,On,1,True,0.5,True,0,KEEP,x",
+                        "2,Named,1,True,0.5,False,2,KEEP,x",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            widened = SimpleNamespace(
+                scores_path=tmp_dir / "candidate_scores_rescue.csv",
+                scores=[
+                    {"title": "Heat", "depth": 2, "status": "KEEP"},
+                    {"title": "On", "depth": 1, "status": "KEEP"},
+                    {"title": "Cold", "depth": 2, "status": "CUT"},
+                ],
+            )
+            gates = [SimpleNamespace(passed=False)] * 3 + [SimpleNamespace(passed=True)]
+            with (
+                patch("src.pipeline.run_term_extraction_stage", return_value=SimpleNamespace(terms=[])) as terms,
+                patch("src.pipeline.evaluate_vocab_gate", side_effect=gates),
+                patch(
+                    "src.pipeline.WikiClient.fetch_links_concurrent",
+                    return_value=({"On": {"links": [{"title": "Heat"}, {"title": "Cold"}, {"title": "On"}]}}, {}),
+                ) as links,
+                patch("src.pipeline.run_candidate_scoring_stage", return_value=widened) as rescore,
+            ):
+                result = run_rescue_ladder(
+                    seed_title="Seed",
+                    selected_path=tmp_dir / "selected.json",
+                    terms_path=tmp_dir / "terms.csv",
+                    diagnostics_path=tmp_dir / "diagnostics_rescue.json",
+                    candidate_scores_path=tmp_dir / "scores.csv",
+                    terms_diagnostics_path=tmp_dir / "diagnostics_terms_rescue.json",
+                    selected_override_path=tmp_dir / "selected_rescue.json",
+                    scoring_args={"seed_title": "Seed"},
+                )
+            selected = json.loads((tmp_dir / "selected_rescue.json").read_text(encoding="utf-8"))["selected_titles"]
+
+        # Only the selected article whose intro is on topic is widened from, and only new pages are scored.
+        links.assert_called_once_with(["On"], max_links=500)
+        self.assertEqual(rescore.call_args.kwargs["extra_titles"], ["Heat", "Cold"])
+        self.assertEqual(result["diagnostics"]["reason"], "widen_from_selected")
+        self.assertEqual(selected, ["On", "Named", "Heat"])  # new pages that scoring did not cut
+        self.assertEqual(terms.call_args.kwargs["scores_path"], widened.scores_path)
+
+    def test_scoring_counts_a_derived_form_of_the_seed_word_only_in_the_first_sentence(self) -> None:
+        intros = {
+            **self.ROME_INTROS,
+            "Plautus": "Plautus was a Roman playwright. He wrote comedies.",
+            "Savoy": "Savoy was a duchy. It was a state of the Holy Roman Empire.",
+            "Lazio": "Lazio is a region of Italy. Its capital is Rome.",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.score_rome(tmp, intros)
+
+        on_topic = {row["title"]: row["intro_on_topic"] for row in result.scores}
+        # "Roman" defines Plautus and is a passing mention in Savoy; "Rome" itself counts anywhere.
+        self.assertEqual((on_topic["Plautus"], on_topic["Savoy"], on_topic["Lazio"]), (True, False, True))
+
+    def test_seed_word_match_takes_derived_forms_on_request_and_the_rarest_word_of_the_seed_title(self) -> None:
+        def uses(text, seed, lexicon=None, derived=False):
+            return _uses_seed_word(text, seed, lang="en", lexicon=lexicon or {}, derived=derived)
+
+        # Thermodynamic matches thermodynamics; Roman is a derived form of Rome, Romania and Romagna are not.
+        self.assertTrue(uses("A thermodynamic cycle.", "Thermodynamics"))
+        self.assertFalse(uses("A thermostat.", "Thermodynamics"))
+        self.assertTrue(uses("All roads lead to Rome.", "Ancient Rome"))
+        self.assertFalse(uses("The Roman army marched.", "Ancient Rome"))
+        self.assertTrue(uses("The Roman army marched.", "Ancient Rome", derived=True))
+        self.assertTrue(uses("Romans built roads.", "Ancient Rome", derived=True))
+        self.assertFalse(uses("Romania is a country.", "Ancient Rome", derived=True))
+        self.assertFalse(uses("Romagna is a region.", "Ancient Rome", derived=True))
+        # Where the lexicon ranks the words, only the rarest one counts; where it cannot, any word does.
+        lexicon = {"ANCIENT": 0.7}
+        self.assertFalse(uses("Homs is an ancient city.", "Ancient Rome", lexicon))
+        self.assertTrue(uses("Homs is an ancient city.", "Ancient Rome"))
+        self.assertTrue(uses("Rome was ancient.", "Ancient Rome", lexicon))
 
     def test_k_selection_takes_on_topic_articles_first_and_falls_back_when_they_run_out(self) -> None:
         picks = {}
@@ -647,7 +790,7 @@ class PipelineTests(unittest.TestCase):
             encoding="utf-8",
         )
         (tmp_dir / "terms.csv").write_text(
-            "\n".join(["answer,normalized_answer,source_titles,source_method", *term_rows]),
+            "\n".join(["answer,normalized_answer,source_titles,source_method,intro_on_topic", *term_rows]),
             encoding="utf-8",
         )
 
@@ -867,6 +1010,17 @@ class PipelineTests(unittest.TestCase):
         # The only window for "debate" would need an ellipsis at both ends.
         self.assertNotIn("Debate", clues)
 
+    def test_clue_stage_clues_a_title_the_seed_merely_names_from_the_seed_and_the_rest_from_their_own_page(self) -> None:
+        extracts = {
+            "Olive": "An olive is a subspecies of subtropical evergreen tree in the family Oleaceae.",
+            "Jazz": "Jazz drummers often sit beside an olive tree outside the clubs.",
+        }
+        named, _ = self._run_clues_for("clue_named", ["Olive,OLIVE,Olive|Jazz,article_title,False"], extracts)
+        on_topic, _ = self._run_clues_for("clue_on_topic", ["Olive,OLIVE,Olive|Jazz,article_title,True"], extracts)
+
+        self.assertEqual([(row["clue_style"], row["source_page"]) for row in named.clues], [("fill_in_blank", "Jazz")])
+        self.assertEqual([(row["clue_style"], row["source_page"]) for row in on_topic.clues], [("definition", "Olive")])
+
     def test_clue_stage_prefers_a_seed_sentence_to_an_equally_clean_one_from_another_page(self) -> None:
         result, _ = self._run_clues_for(
             "clue_seed_sentence",
@@ -1026,6 +1180,7 @@ class PipelineTests(unittest.TestCase):
         intros: dict[str, str],
         cap: int = 10,
         redirects: dict[str, str] | None = None,
+        extracts: dict[str, str] | None = None,
     ) -> list[dict]:
         header = "rank,title,depth,links_back_to_seed,rel_score,red_score,selection_score,intro_on_topic,seed_mentions,status,reason"
         with tempfile.TemporaryDirectory() as tmp:
@@ -1042,7 +1197,7 @@ class PipelineTests(unittest.TestCase):
                 seed_title=seed,
                 scores_path=scores,
                 client=client,
-                extracts={},
+                extracts=extracts or {},
                 lexicon={},
                 lang="en",
                 max_len=15,
@@ -1077,10 +1232,14 @@ class PipelineTests(unittest.TestCase):
                 nlp=None,
                 lead_counts=Counter(),
                 pool_size=1,
+                seed_title="Φυσική",
             )
 
         self.assertIn(expected, [row["clue"] for row in rows("el")])
         self.assertEqual(rows("en"), [])
+        with patch("src.pipeline.is_generic_definition", return_value=False) as generic:
+            rows("el")
+        self.assertEqual(generic.call_args.kwargs["seed_title"], "Φυσική")
 
     def test_title_pool_admits_only_the_kept_titles_scoring_found_on_topic(self) -> None:
         rows = [
@@ -1110,9 +1269,11 @@ class PipelineTests(unittest.TestCase):
             "7,Pompey,1,False,0.4,0.0,0.4,False,12,KEEP,x",
             "8,Latium,1,False,0.4,0.0,0.4,True,0,KEEP,x",
             "9,Rome (city),1,False,0.4,0.0,0.4,True,0,KEEP,x",
+            "10,Roman emperor,1,False,0.4,0.0,0.4,True,0,KEEP,x",
         ]
         intros = {
             "Ancient Rome": "Ancient Rome was a civilization.",
+            "Roman emperor": "The Roman emperor ruled the empire.",
             "Romania": "Romania is a country in Europe.",
             "Romagna": "Romagna is a region of Italy.",
             "Romanticism": "Romanticism was an artistic movement.",
@@ -1126,11 +1287,12 @@ class PipelineTests(unittest.TestCase):
         pool = self.title_pool("Ancient Rome", rows, intros)
         # Pompey is named often but the bonus stops at ten mentions.
         scores = {row["answer"]: row["answer_score"] for row in pool}
-        self.assertEqual(set(scores), {"Ancient Rome", "Pompey", "Latium", "Diocletian", "Rome"})
+        self.assertEqual(set(scores), {"Ancient Rome", "Pompey", "Latium", "Diocletian", "Rome", "Roman emperor"})
         self.assertEqual(scores["Pompey"], 2.4)  # 1 + 0.4 + 0.1 * 10
         self.assertEqual(scores["Diocletian"], 1.6)  # two mentions, no intro mention
         self.assertEqual(scores["Latium"], 1.9)  # the intro mentions Rome: 0.5
         self.assertEqual(scores["Rome"], 0.9)  # on topic, but it repeats a seed word: -1
+        self.assertEqual(scores["Roman emperor"], 1.9)  # a derived form of the seed word is no repeat
 
     def test_title_pool_cap_keeps_the_titles_with_the_most_evidence_not_the_highest_tfidf(self) -> None:
         rows = [
@@ -1147,6 +1309,23 @@ class PipelineTests(unittest.TestCase):
         pool = self.title_pool("Jazz", rows, intros, cap=2)
         # The seed row counts toward the cap; the mention bonus runs to ten, so Bravo beats the higher tf-idf Alpha.
         self.assertEqual([row["answer"] for row in pool], ["Jazz", "Bravo"])
+
+    def test_title_pool_takes_fill_in_sources_only_from_selected_articles_with_an_on_topic_intro(self) -> None:
+        rows = [
+            "1,Bebop,1,True,0.6,0.0,0.6,True,0,KEEP,x",
+            "2,Cool,1,True,0.5,0.0,0.5,True,0,KEEP,x",
+            "3,Harlem,1,True,0.4,0.0,0.4,False,2,KEEP,x",
+        ]
+        intros = {
+            "Jazz": "Jazz is music.",
+            "Bebop": "Bebop is a style of jazz.",
+            "Cool": "Cool is a style of jazz.",
+            "Harlem": "Harlem is a district.",
+        }
+        extracts = {"Cool": "Bebop is fast.", "Harlem": "Bebop was played in Harlem."}
+        pool = self.title_pool("Jazz", rows, intros, extracts=extracts)
+        # Harlem is in the pool because the seed names it; its text says nothing about the theme.
+        self.assertEqual({row["answer"]: row["source_titles"] for row in pool}["Bebop"], "Bebop|Cool")
 
     def test_title_pool_names_a_redirect_after_the_page_it_leads_to(self) -> None:
         rows = [
