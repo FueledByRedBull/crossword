@@ -8,9 +8,11 @@ from src.term_extractor import (
     extract_terms_lead_bold,
     extract_terms_nltk,
     get_stopwords,
+    merge_plural_duplicates,
     merge_terms,
     shape_penalty,
     term_frequency_across_docs,
+    title_to_answer,
 )
 
 
@@ -44,12 +46,19 @@ class TermExtractorTests(unittest.TestCase):
         terms = extract_terms_lead_bold(
             ["Θερμο"], source_title="GreekArticle", lang="el"
         )
-        self.assertEqual(terms[0].normalized_answer, "THERMO")
+        self.assertEqual(terms[0].normalized_answer, "ΘΕΡΜΟ")
 
     def test_greek_frequency(self) -> None:
-        docs = ["Θερμο θερμο", "Θερμο"]
+        docs = ["Θερμο θερμο", "Θερμό"]
         df = term_frequency_across_docs(docs, lang="el")
-        self.assertEqual(df.get("THERMO"), 2)
+        self.assertEqual(df.get("ΘΕΡΜΟ"), 2)
+
+    def test_greek_stopwords_are_greek_capitals(self) -> None:
+        terms = extract_terms_lead_bold(["στην", "ως", "Θερμότητα"], source_title="Θερμότητα", lang="el")
+        merged = merge_terms([terms], min_len=2, max_len=15, stopwords=get_stopwords("el"))
+        self.assertEqual([term.normalized_answer for term in merged], ["ΘΕΡΜΟΤΗΤΑ"])
+        for word in get_stopwords("el"):
+            self.assertRegex(word, "^[Α-Ω]+$")
 
     def test_merge_terms_accumulates_sources(self) -> None:
         terms_one = extract_terms_lead_bold(
@@ -146,6 +155,11 @@ class TermExtractorTests(unittest.TestCase):
 
 
 class ShapePenaltyTests(unittest.TestCase):
+    def test_rare_greek_letters_are_penalized(self) -> None:
+        self.assertGreater(shape_penalty("ΞΨΖΞΨΖΞΨ"), 0.5)
+        self.assertEqual(shape_penalty("ΕΝΤΡΟΠΙΑ"), 0.0)
+        self.assertGreater(crosswordability_score("ΕΝΤΡΟΠΙΑ"), crosswordability_score("ΞΨΖΞΨΖΞΨ"))
+
     def test_rare_letters_penalized(self) -> None:
         """A word whose middle chars are all RARE_LETTERS (Q,X,Z,J) gets a high penalty."""
         # QXZJQXZJQ — middle 7 chars are all rare
@@ -183,6 +197,90 @@ class ShapePenaltyTests(unittest.TestCase):
 
         self.assertGreater(answer_cleanliness_score(clean), answer_cleanliness_score(dirty))
         self.assertGreater(clueability_score(clean, "ENTROPY"), clueability_score(dirty, "ENERGYOF"))
+
+
+class TitleToAnswerTests(unittest.TestCase):
+    def test_strips_disambiguator(self) -> None:
+        self.assertEqual(title_to_answer("Swing (jazz performance style)"), ("Swing", "SWING"))
+
+    def test_keeps_multi_word_title(self) -> None:
+        self.assertEqual(title_to_answer("Miles Davis"), ("Miles Davis", "MILESDAVIS"))
+
+    def test_rejects_digits_and_list_style_titles(self) -> None:
+        self.assertIsNone(title_to_answer("1940s in jazz"))
+        for title in ("List of jazz musicians", "Outline of jazz", "Index of music", "Timeline of jazz", "Glossary of jazz"):
+            self.assertIsNone(title_to_answer(title), title)
+
+    def test_rejects_long_titles(self) -> None:
+        self.assertIsNone(title_to_answer("New Orleans jazz revival movement"))
+        self.assertIsNone(title_to_answer("Thermodynamics", max_len=10))
+        self.assertIsNotNone(title_to_answer("Thermodynamics", max_len=15))
+
+    def test_rejects_titles_with_symbols(self) -> None:
+        self.assertIsNone(title_to_answer("A&C Black"))
+        self.assertIsNone(title_to_answer("Foo: Bar"))
+        self.assertEqual(title_to_answer("Rock 'n' roll"), ("Rock 'n' roll", "ROCKNROLL"))
+        self.assertEqual(title_to_answer("St. Louis"), ("St. Louis", "STLOUIS"))
+
+    def test_folds_accents_into_plain_ascii(self) -> None:
+        self.assertEqual(
+            title_to_answer("Schr\u00f6dinger's cat"), ("Schr\u00f6dinger's cat", "SCHRODINGERSCAT")
+        )
+        self.assertIsNone(title_to_answer("S\u00f8ren Kierkegaard"))
+        terms = extract_terms_lead_bold(["Schr\u00f6dinger"], source_title="Schrodinger", lang="en")
+        self.assertEqual(terms[0].normalized_answer, "SCHRODINGER")
+
+    def test_rejects_generic_single_word_titles(self) -> None:
+        self.assertIsNone(title_to_answer("Time"))
+        self.assertIsNotNone(title_to_answer("Time signature"))
+
+    def test_rejects_too_short_answers(self) -> None:
+        self.assertIsNone(title_to_answer("Go"))
+        self.assertEqual(title_to_answer("Sax"), ("Sax", "SAX"))
+
+
+class GreekAnswerTests(unittest.TestCase):
+    def test_a_greek_answer_is_normalized_to_greek_capitals_without_accents(self) -> None:
+        self.assertEqual(title_to_answer("Θερμότητα", lang="el"), ("Θερμότητα", "ΘΕΡΜΟΤΗΤΑ"))
+        self.assertEqual(title_to_answer("Ήρωνας", lang="el"), ("Ήρωνας", "ΗΡΩΝΑΣ"))  # final sigma
+        self.assertEqual(title_to_answer("Άλμπερτ Αϊνστάιν", lang="el"), ("Άλμπερτ Αϊνστάιν", "ΑΛΜΠΕΡΤΑΙΝΣΤΑΙΝ"))
+        self.assertEqual(title_to_answer("Στατική φυσική (κλάδος)", lang="el"), ("Στατική φυσική", "ΣΤΑΤΙΚΗΦΥΣΙΚΗ"))
+        terms = extract_terms_lead_bold(["ΐσως ηλεκτρισμός"], source_title="x", lang="el")
+        self.assertEqual(terms[0].normalized_answer, "ΙΣΩΣΗΛΕΚΤΡΙΣΜΟΣ")
+
+    def test_a_greek_answer_has_only_greek_letters(self) -> None:
+        for title in ("Μηχανή Carnot", "Wayback Machine", "OCLC", "Digital object identifier"):
+            self.assertIsNone(title_to_answer(title, lang="el"), title)
+        terms = extract_terms_lead_bold(["Carnot", "Μηχανή Carnot", "θερμότητα"], source_title="x", lang="el")
+        self.assertEqual([term.normalized_answer for term in terms], ["ΘΕΡΜΟΤΗΤΑ"])
+        self.assertEqual(extract_terms_lead_bold(["Θερμότητα"], source_title="x", lang="en"), [])
+        self.assertIsNone(title_to_answer("Θερμότητα", lang="en"))
+
+    def test_greek_endings_are_not_taken_for_the_latin_plural(self) -> None:
+        rows = [
+            {"normalized_answer": "ΝΟΜΟΣ", "answer_score": 0.5},
+            {"normalized_answer": "ΝΟΜΟ", "answer_score": 0.4},
+        ]
+        self.assertEqual(len(merge_plural_duplicates(rows)), 2)
+
+
+class MergePluralDuplicatesTests(unittest.TestCase):
+    @staticmethod
+    def _row(key: str, score: float) -> dict:
+        return {"normalized_answer": key, "answer_score": score}
+
+    def test_keeps_better_scored_form(self) -> None:
+        rows = [self._row("STYLE", 0.4), self._row("STYLES", 0.6), self._row("BOX", 0.5), self._row("BOXES", 0.2)]
+        kept = {row["normalized_answer"] for row in merge_plural_duplicates(rows)}
+        self.assertEqual(kept, {"STYLES", "BOX"})
+
+    def test_singular_wins_tie(self) -> None:
+        rows = [self._row("SOUNDS", 0.5), self._row("SOUND", 0.5)]
+        self.assertEqual([row["normalized_answer"] for row in merge_plural_duplicates(rows)], ["SOUND"])
+
+    def test_unrelated_s_endings_survive(self) -> None:
+        rows = [self._row("JAZZ", 0.5), self._row("BLUES", 0.5), self._row("CLASS", 0.5)]
+        self.assertEqual(len(merge_plural_duplicates(rows)), 3)
 
 
 class NltkBackendParityTests(unittest.TestCase):

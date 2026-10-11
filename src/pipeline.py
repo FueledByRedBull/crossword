@@ -1,65 +1,53 @@
 from __future__ import annotations
 
+import os
+import re
+from collections import Counter
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from .cache import DiskCache
-from .artifact_models import (
-    GridArtifact,
-    GridSlotRecord,
-    PuzzleArtifact,
-    SelectedCandidatesArtifact,
-)
+from .artifact_models import GridArtifact, PuzzleArtifact, SelectedCandidatesArtifact
 from .diagnostics import build_seed_stage_diagnostics, write_json
 from .k_selector import select_k
 from .semantic import build_pairwise_matrix, build_tfidf_vectors, cosine_similarity, mmr_rank
 from .term_extractor import (
+    answer_cleanliness_score,
+    clueability_score,
     extract_terms_lead_bold,
     extract_terms_nltk,
     extract_terms_spacy,
     extract_terms_title_tokens,
-    genericness_penalty,
+    GENERIC_GRID_JUNK_EN,
+    _TITLE_DISAMBIGUATOR,
+    merge_plural_duplicates,
     merge_terms,
     shape_penalty,
     crosswordability_score,
     term_frequency_across_docs,
+    title_to_answer,
 )
-from .text_normalize import tokenize
-from .vocab_gate import evaluate_vocab_gate
+from .layout import Placement, build_layout, layout_metrics, number_placements, validate_layout
+from .text_normalize import enumeration, strip_diacritics, tokenize
+from .vocab_gate import VocabGateResult, evaluate_vocab_gate
 from .clue_builder import (
-    clue_pass_extract,
-    clue_pass_extract_with_offset,
+    MAX_CLUE_WORDS,
+    answer_pattern,
     clue_pass_mask_trim,
     clue_pass_validate,
+    definition_clue,
     enforce_diversity,
+    has_verb,
+    is_generic_definition,
+    lead_word_counts,
     split_sentences,
+    strip_trailing_sections,
 )
 from .provenance import build_oldid_url, has_packageable_clue_provenance, validate_clue_provenance
 from .wikidata_client import WikidataClient
-from .crossword_csp import build_slots, render_grid, solve_crossword
-from .csp_heuristics import (
-    build_solver_vocabulary,
-    evaluate_quality_gate,
-    QUALITY_GATE_MAX_FILLER_RATIO,
-    QUALITY_GATE_MIN_CLUED_RATIO,
-    QUALITY_GATE_MIN_FILL_PERCENT,
-    run_template_trial,
-)
-from .lexicon import (
-    load_lexicon_scores,
-    load_word_list,
-    lexicon_score_for_token,
-    lexicon_score_for_tokens,
-)
-from .topology import (
-    auto_block_long_slots,
-    build_grid,
-    get_templates,
-    score_template_from_length_hist,
-    select_best_template,
-)
+from .lexicon import load_lexicon_scores, lexicon_score_for_token, lexicon_score_for_tokens
 from .wiki_client import WikiClient
-from .rust_backend import load_rust_csp
 
 
 @dataclass
@@ -78,7 +66,6 @@ class ScoringStageResult:
     pairwise: list[list[float]]
     ranked_indices: list[int]
     term_scores: list[float]
-    term_length_hists: list[dict[int, int]]
     term_answer_inventories: list[set[str]]
 
 
@@ -115,13 +102,7 @@ class ClueStageResult:
 
 
 @dataclass
-class TopologyStageResult:
-    diagnostics_path: Path
-    diagnostics: dict
-
-
-@dataclass
-class SolveStageResult:
+class LayoutStageResult:
     grid_path: Path
     diagnostics_path: Path
     diagnostics: dict
@@ -133,32 +114,6 @@ class PackagingStageResult:
     attribution_path: Path
     diagnostics_path: Path
     diagnostics: dict
-
-
-def _term_length_histogram(
-    text: str,
-    *,
-    lang: str,
-    min_len: int = 4,
-    max_len: int = 12,
-) -> dict[int, int]:
-    if not text:
-        return {}
-    tokens = set(tokenize(text, lang=lang))
-    hist: dict[int, int] = {}
-    for token in tokens:
-        length = len(token)
-        if length < min_len or length > max_len:
-            continue
-        hist[length] = hist.get(length, 0) + 1
-    return hist
-
-
-def _length_histogram_from_answers(answers: set[str]) -> dict[int, int]:
-    hist: dict[int, int] = {}
-    for answer in answers:
-        hist[len(answer)] = hist.get(len(answer), 0) + 1
-    return hist
 
 
 def _safe_float(value, *, default: float = 0.0) -> float:
@@ -199,19 +154,19 @@ def _infer_clue_class(row: dict) -> str:
     return "template_fallback"
 
 
-def _clue_class_rank(clue_class: str) -> int:
-    if clue_class == "source_backed":
-        return 2
-    if clue_class == "template_fallback":
-        return 1
-    if clue_class == "synthetic_filler":
-        return 0
-    return -1
-
-
 def _is_packageable_clue(clue_row: dict) -> bool:
     text = (clue_row.get("clue") or "").strip()
     return bool(text) and has_packageable_clue_provenance(clue_row)
+
+
+def _clued_answer_count(clue_rows: list[dict], *, lang: str) -> int:
+    """Distinct answers with a clue that can be packaged (a clue without a revid cannot)."""
+    keys = {
+        _answer_key(row.get("answer", ""), row.get("normalized_answer", ""), lang=lang)
+        for row in clue_rows
+        if _is_packageable_clue(row)
+    }
+    return len(keys - {""})
 
 
 def _normalized_token_set(text: str, *, lang: str) -> set[str]:
@@ -236,212 +191,6 @@ def _title_support_score(answer: str, source_titles: set[str], *, lang: str) -> 
         if best >= 1.0:
             break
     return min(1.0, best)
-
-
-def _support_sentence_count(row: dict) -> int:
-    return _safe_int(row.get("support_sentence_count"), default=0)
-
-
-def _title_support_value(row: dict) -> float:
-    return _safe_float(row.get("title_support_score"), default=0.0)
-
-
-def _is_supported_term(row: dict) -> bool:
-    support_keys = {
-        "lead_bold_signal",
-        "title_support_score",
-        "source_title_count",
-        "support_sentence_count",
-    }
-    if not any(key in row for key in support_keys):
-        return True
-    return bool(
-        row.get("lead_bold_signal")
-        or _title_support_value(row) > 0.0
-        or _safe_int(row.get("source_title_count"), default=0) >= 2
-        or _support_sentence_count(row) > 0
-    )
-
-
-def _unique_term_inventory_by_length(terms: list[dict]) -> dict[int, int]:
-    by_length: dict[int, set[str]] = {}
-    for term in terms:
-        normalized = (term.get("normalized_answer") or "").strip().upper()
-        if not normalized:
-            continue
-        by_length.setdefault(len(normalized), set()).add(normalized)
-    return {length: len(values) for length, values in by_length.items()}
-
-
-def _supported_term_inventory_by_length(terms: list[dict]) -> dict[int, int]:
-    by_length: dict[int, set[str]] = {}
-    for term in terms:
-        if not _is_supported_term(term):
-            continue
-        normalized = (term.get("normalized_answer") or "").strip().upper()
-        if not normalized:
-            continue
-        by_length.setdefault(len(normalized), set()).add(normalized)
-    return {length: len(values) for length, values in by_length.items()}
-
-
-def _supported_inventory_targets(size: int) -> dict[int, int]:
-    if size >= 15:
-        return {4: 12, 5: 12}
-    return {}
-
-
-def _should_expand_selection_inventory(
-    *,
-    size: int,
-    terms: list[dict],
-    solve_diagnostics: dict,
-    preferred_fill_target: float = 0.85,
-) -> bool:
-    if size < 15:
-        return False
-    fill_percent = _safe_float(solve_diagnostics.get("fill_percent"), default=0.0)
-    if fill_percent >= preferred_fill_target and solve_diagnostics.get("fill_status") != "failed":
-        return False
-    inventory = _supported_term_inventory_by_length(terms)
-    targets = _supported_inventory_targets(size)
-    return any(inventory.get(length, 0) < target for length, target in targets.items())
-
-
-def _quality_rescue_target_count(
-    *,
-    size: int,
-    current_selected_count: int,
-    terms: list[dict],
-) -> int:
-    base_target = max(current_selected_count, 12 if size >= 15 else current_selected_count)
-    if size < 15:
-        return base_target
-
-    inventory = _supported_term_inventory_by_length(terms)
-    targets = _supported_inventory_targets(size)
-    shortage_extra = min(
-        4,
-        max(
-            *(max(0, target - inventory.get(length, 0)) for length, target in targets.items()),
-            0,
-        ),
-    )
-    if current_selected_count >= 12 and shortage_extra > 0:
-        return min(16, base_target + shortage_extra)
-    return base_target
-
-
-def _should_relax_min_df_for_quality_rescue(
-    *,
-    size: int,
-    min_df: int,
-    terms: list[dict],
-    solve_diagnostics: dict,
-    preferred_fill_target: float,
-) -> bool:
-    if min_df <= 1:
-        return False
-    if size < 15:
-        return False
-    fill_percent = _safe_float(solve_diagnostics.get("fill_percent"), default=0.0)
-    unfilled_short_slot_count = _safe_int(
-        solve_diagnostics.get("unfilled_short_slot_count"),
-        default=0,
-    )
-    if fill_percent >= preferred_fill_target and unfilled_short_slot_count <= 2:
-        return False
-    inventory = _supported_term_inventory_by_length(terms)
-    targets = _supported_inventory_targets(size)
-    return any(inventory.get(length, 0) < target for length, target in targets.items())
-
-
-def _should_retry_solve_budget(
-    *,
-    solve_diagnostics: dict,
-    preferred_fill_target: float,
-) -> bool:
-    fill_percent = _safe_float(solve_diagnostics.get("fill_percent"), default=0.0)
-    unfilled_short_slot_count = _safe_int(
-        solve_diagnostics.get("unfilled_short_slot_count"),
-        default=0,
-    )
-    return fill_percent < preferred_fill_target or unfilled_short_slot_count > 2
-
-
-def _load_selected_titles(path: str | Path) -> list[str]:
-    import json
-
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    return list(payload.get("selected_titles", []))
-
-
-def _write_selected_titles(
-    *,
-    path: str | Path,
-    seed_title: str,
-    lang: str,
-    titles: list[str],
-) -> Path:
-    payload = {
-        "seed_title": seed_title,
-        "lang": lang,
-        "selected_k": len(titles),
-        "selected_titles": titles,
-    }
-    return write_json(path, payload)
-
-
-def _expand_selected_titles_from_scores(
-    *,
-    selected_titles: list[str],
-    candidate_scores_path: str | Path,
-    target_count: int,
-) -> list[str]:
-    import csv
-
-    expanded = list(selected_titles)
-    if len(expanded) >= target_count or not Path(candidate_scores_path).exists():
-        return expanded
-
-    with Path(candidate_scores_path).open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            title = (row.get("title") or "").strip()
-            if not title or title in expanded:
-                continue
-            expanded.append(title)
-            if len(expanded) >= target_count:
-                break
-    return expanded
-
-
-def _solve_result_rank(diagnostics: dict) -> tuple[int, float, int, float, float, float]:
-    status = diagnostics.get("fill_status")
-    if status == "complete":
-        status_rank = 2
-    elif status == "partial":
-        status_rank = 1
-    else:
-        status_rank = 0
-    fill_percent = _safe_float(diagnostics.get("fill_percent"), default=0.0)
-    source_backed_ratio = _safe_float(
-        diagnostics.get("source_backed_entry_ratio"),
-        default=0.0,
-    )
-    long_slot_theme_ratio = _safe_float(
-        diagnostics.get("long_slot_theme_ratio"),
-        default=0.0,
-    )
-    unfilled_short_slot_count = _safe_int(
-        diagnostics.get("unfilled_short_slot_count"),
-        default=0,
-    )
-    filler_ratio = _safe_float(
-        (diagnostics.get("filler") or {}).get("used_ratio"),
-        default=1.0,
-    )
-    return (status_rank, fill_percent, -unfilled_short_slot_count, source_backed_ratio, long_slot_theme_ratio, -filler_ratio)
 
 
 def _inventory_min_k_target(
@@ -567,6 +316,7 @@ def _extract_answer_inventory(
     term_lists.append(extract_terms_title_tokens(title, source_title=title, lang=lang))
     merged = merge_terms(
         term_lists,
+        lang=lang,
         min_len=min_len,
         max_len=max_len,
         min_alpha_ratio=min_alpha_ratio,
@@ -575,30 +325,55 @@ def _extract_answer_inventory(
     return {term.normalized_answer for term in merged if term.normalized_answer}
 
 
-def _fetch_best_extract_with_revid(client: WikiClient, title: str) -> dict:
-    try:
-        full_payload = client.fetch_page_extract_with_revid(title, intro_only=False)
-    except Exception:
-        full_payload = {"title": title, "page_id": None, "extract": "", "revid": None}
-    if full_payload.get("extract") and full_payload.get("revid"):
-        return full_payload
-    try:
-        intro_payload = client.fetch_page_extract_with_revid(title, intro_only=True)
-    except Exception:
-        intro_payload = {"title": title, "page_id": None, "extract": "", "revid": None}
-    lead_revid = None
-    if not full_payload.get("revid") and not intro_payload.get("revid"):
+def _fetch_extract_with_revid(client: WikiClient, title: str, *, full: bool) -> dict:
+    """Extract and revision id from one response: the full article if `full` and available, else the intro.
+
+    Nothing is paired across responses: a revision id is only the one the text arrived with.
+    """
+    for intro_only in (False, True) if full else (True,):
         try:
-            lead_payload = client.fetch_lead_wikitext(title)
+            payload = client.fetch_page_extract_with_revid(title, intro_only=intro_only)
         except Exception:
-            lead_payload = {"title": title, "page_id": None, "revid": None, "wikitext": ""}
-        lead_revid = lead_payload.get("revid")
-    return {
-        "title": full_payload.get("title") or intro_payload.get("title") or title,
-        "page_id": full_payload.get("page_id") or intro_payload.get("page_id"),
-        "extract": full_payload.get("extract") or intro_payload.get("extract") or "",
-        "revid": full_payload.get("revid") or intro_payload.get("revid") or lead_revid,
-    }
+            continue
+        if payload.get("extract") and payload.get("revid"):
+            return {**payload, "extract": strip_trailing_sections(payload["extract"])}
+    return {"title": title, "page_id": None, "extract": "", "revid": None}
+
+
+def _prefetch(errors: list[str], prefetch, titles: list[str], **kwargs) -> None:
+    """Batch-fill the cache; the single-title getters still work if this fails."""
+    try:
+        prefetch(titles, **kwargs)
+    except Exception as exc:
+        errors.append(f"prefetch_failed:{exc}")
+
+
+def _uses_seed_word(text: str, seed_title: str, *, lang: str) -> bool:
+    # A shared stem, not shared letters: thermodynamic/thermodynamics, but not thermostat or Romania/Rome.
+    seed_words = [word for word in tokenize(seed_title, lang=lang) if len(word) >= 4]
+    return any(
+        len(os.path.commonprefix([word, seed])) >= max(4, len(seed) - 1)
+        for word in set(tokenize(text, lang=lang))
+        for seed in seed_words
+    )
+
+
+@lru_cache(maxsize=1)
+def _plain_words(text: str) -> str:
+    return " ".join(re.findall(r"\w+", strip_diacritics(text).casefold()))
+
+
+def _seed_mentions(title: str, seed_text: str, *, lang: str) -> int:
+    phrase = _TITLE_DISAMBIGUATOR.sub("", title).strip()
+    if lang != "el":
+        return len(answer_pattern(phrase).findall(seed_text))
+    # Greek inflects: each title word matches a text word that starts with its first max(4, len - 2) letters
+    # and adds at most three more, so a stem is not a substring ("ύλη" is not "υλικό").
+    stems = [word[: max(4, len(word) - 2)] for word in re.findall(r"\w+", strip_diacritics(phrase).casefold())]
+    if not stems:
+        return 0
+    pattern = r"(?<!\w)" + " ".join(re.escape(stem) + r"\w{0,3}" for stem in stems) + r"(?!\w)"
+    return len(re.findall(pattern, _plain_words(seed_text)))
 
 
 def _answer_key(answer: str, normalized_answer: str, *, lang: str) -> str:
@@ -622,6 +397,7 @@ def _build_clue_row(
     revid: int | None,
     sentence_offset: int | None,
     lang: str,
+    clue_style: str,
 ) -> dict:
     clue_word_count = len(clue_text.split())
     clue_score = round(1.0 - abs(clue_word_count - 9) / max(9, clue_word_count), 4)
@@ -631,6 +407,7 @@ def _build_clue_row(
         "clue": clue_text,
         "clue_score": clue_score,
         "clue_class": clue_class,
+        "clue_style": clue_style,
         "source_method": source_method,
         "source_page": source_page,
         "revid": revid,
@@ -639,11 +416,13 @@ def _build_clue_row(
     }
 
 
-def _clue_candidate_rank(row: dict) -> tuple[float, int, int, str]:
+def _clue_candidate_rank(row: dict, seed_title: str) -> tuple[bool, bool, float, int, int, str]:
     clue_text = str(row.get("clue") or "")
     sentence_offset = _safe_int(row.get("sentence_offset"), default=9999)
     masked_length_score = -abs(len(clue_text.split()) - 9)
     return (
+        not clue_text.startswith("...") and not clue_text.endswith("..."),
+        row.get("source_page") == seed_title,
         _safe_float(row.get("clue_score"), default=0.0),
         masked_length_score,
         -sentence_offset,
@@ -657,18 +436,24 @@ def _collect_source_backed_clue_candidates(
     normalized_answer: str,
     source_titles: list[str],
     source_payloads: dict[str, dict],
+    seed_title: str,
     term_source_method: str,
     lang: str,
     min_words: int,
     max_words: int,
     nlp: object | None,
+    allow_fragments: bool = True,
 ) -> list[dict]:
-    import re
+    """Fill-in candidates, complete sentences first, then the seed article's before other pages'.
 
+    A fragment is a window that is not a whole sentence and not a single clause-boundary cut; the
+    term stage still counts them as support, a clue never uses one.
+    """
     key = _answer_key(answer, normalized_answer, lang=lang)
     if not key:
         return []
 
+    pattern = answer_pattern(answer)
     candidates: list[dict] = []
     seen: set[tuple[str, int, str]] = set()
     for title in source_titles:
@@ -677,15 +462,25 @@ def _collect_source_backed_clue_candidates(
         extract = payload.get("extract", "")
         revid = payload.get("revid")
         for sentence_offset, candidate_sentence in enumerate(split_sentences(extract)):
-            if not re.search(re.escape(answer), candidate_sentence, re.IGNORECASE):
+            if not pattern.search(candidate_sentence):
                 continue
-            clue_text = clue_pass_mask_trim(candidate_sentence, answer, max_words=max_words)
+            # Headings and link lists are glued to a sentence by line breaks; the clue is the line with the answer.
+            candidate_sentence = max(
+                (line for line in candidate_sentence.splitlines() if pattern.search(line)),
+                key=len,
+                default=candidate_sentence,
+            )
+            clue_text, clean = clue_pass_mask_trim(candidate_sentence, answer, max_words=max_words)
+            if not (clean or allow_fragments):
+                continue
             if not clue_pass_validate(
                 clue_text,
                 answer,
                 min_words=min_words,
                 nlp=nlp,
                 original_sentence=candidate_sentence,
+                require_blank=True,
+                lang=lang,
             ):
                 continue
             signature = (source_title, sentence_offset, clue_text)
@@ -704,11 +499,61 @@ def _collect_source_backed_clue_candidates(
                     revid=revid,
                     sentence_offset=sentence_offset,
                     lang=lang,
+                    clue_style="fill_in_blank",
                 )
             )
 
-    candidates.sort(key=_clue_candidate_rank, reverse=True)
+    candidates.sort(key=lambda row: _clue_candidate_rank(row, seed_title), reverse=True)
     return candidates
+
+
+def _definition_clue_rows(
+    *,
+    answer: str,
+    normalized_answer: str,
+    answer_key_value: str,
+    title: str,
+    payload: dict,
+    term_source_method: str,
+    lang: str,
+    nlp: object | None,
+    lead_counts: Counter[str],
+    pool_size: int,
+) -> list[dict]:
+    """Clue an article-title answer with its own article's lead sentence, subject removed.
+
+    The second, longer cut is there for generic definitions ("An American physicist"): it may
+    reach the relative clause that says who the person was. A definition that stays generic is dropped.
+    """
+    sentences = split_sentences(payload.get("extract", ""))
+    texts: list[str] = []
+    for max_words in (16, MAX_CLUE_WORDS):
+        clue_text = (
+            definition_clue(sentences[0], answer=answer, max_words=max_words, nlp=nlp, lang=lang) if sentences else None
+        )
+        if (
+            clue_text
+            and clue_text not in texts
+            and clue_pass_validate(clue_text, answer, min_words=3, nlp=nlp, lang=lang)
+            and not is_generic_definition(clue_text, lead_counts, pool_size, nlp)
+        ):
+            texts.append(clue_text)
+    return [
+        _build_clue_row(
+            answer=answer,
+            normalized_answer=normalized_answer,
+            answer_key_value=answer_key_value,
+            clue_text=clue_text,
+            clue_class="source_backed",
+            source_method=term_source_method,
+            source_page=payload.get("title", title) or title,
+            revid=payload.get("revid"),
+            sentence_offset=0,
+            lang=lang,
+            clue_style="definition",
+        )
+        for clue_text in texts
+    ]
 
 
 def run_seed_ingestion_stage(
@@ -750,8 +595,11 @@ def run_seed_ingestion_stage(
     resolved_seed_title = seed_title
     resolved_seed_page_id: int | None = None
     try:
-        links_payload = client.fetch_links(seed_title, max_links=max_links)
+        links_payload = client.fetch_links(seed_title)
         links = links_payload["links"]
+        if max_links is not None and len(links) > max_links:
+            # Evenly spaced, not the first N: the API lists links alphabetically.
+            links = [links[i * len(links) // max_links] for i in range(max_links)]
         resolved_seed_title = links_payload["seed_title"]
         resolved_seed_page_id = links_payload["seed_page_id"]
     except Exception as exc:  # pragma: no cover - runtime/network path
@@ -793,10 +641,10 @@ def run_seed_ingestion_stage(
         parent_titles = [candidate["title"] for candidate in links]
         parent_extracts: list[str] = []
         if seed_extract:
+            _prefetch(errors, client.prefetch_intro_extracts, parent_titles)
             extract_payloads, extract_errors = client.fetch_page_extracts_concurrent(
                 parent_titles,
                 intro_only=True,
-                max_concurrency=8,
             )
             for title in parent_titles:
                 payload = extract_payloads.get(title, {})
@@ -819,7 +667,6 @@ def run_seed_ingestion_stage(
             parent_link_payloads, parent_link_errors = client.fetch_links_concurrent(
                 two_hop_parents,
                 max_links=max_two_hop_links,
-                max_concurrency=8,
             )
             for title, exc_text in parent_link_errors.items():
                 errors.append(f"two_hop_links_failed:{title}:{exc_text}")
@@ -928,7 +775,6 @@ def run_candidate_scoring_stage(
             pairwise=[],
             ranked_indices=[],
             term_scores=[],
-            term_length_hists=[],
             term_answer_inventories=[],
         )
 
@@ -936,11 +782,16 @@ def run_candidate_scoring_stage(
     api_base = f"https://{lang}.wikipedia.org/w/api.php"
     client = WikiClient(cache, api_base=api_base)
 
+    candidate_titles = [candidate["title"] for candidate in candidates]
+    _prefetch(errors, client.prefetch_intro_extracts, [seed_title, *candidate_titles])
+    _prefetch(errors, client.prefetch_lead_wikitext, candidate_titles)
+
     try:
         seed_extract = client.fetch_page_extract(seed_title, intro_only=True).get("extract", "")
     except Exception as exc:  # pragma: no cover
         seed_extract = ""
         errors.append(f"seed_extract_failed: {exc}")
+    seed_text = _fetch_extract_with_revid(client, seed_title, full=True)["extract"]
 
     nlp, backend_used, backend_errors, _, _ = _resolve_nlp_backend(lang=lang, nlp_backend="auto")
     errors.extend(backend_errors)
@@ -948,6 +799,8 @@ def run_candidate_scoring_stage(
     texts = [seed_extract]
     titles = [seed_title]
     term_answer_inventories: list[set[str]] = []
+    intro_on_topic: list[bool] = []
+    seed_mentions: list[int] = []
     for candidate in candidates:
         title = candidate["title"]
         try:
@@ -962,6 +815,8 @@ def run_candidate_scoring_stage(
             errors.append(f"lead_wikitext_failed:{title}:{exc}")
         titles.append(title)
         texts.append(extract)
+        intro_on_topic.append(_uses_seed_word(extract, seed_title, lang=lang))
+        seed_mentions.append(_seed_mentions(title, seed_text, lang=lang))
         term_answer_inventories.append(
             _extract_answer_inventory(
                 title=title,
@@ -973,10 +828,6 @@ def run_candidate_scoring_stage(
             )
         )
 
-    term_length_hists = [
-        _length_histogram_from_answers(inventory)
-        for inventory in term_answer_inventories
-    ]
     term_counts = [len(inventory) for inventory in term_answer_inventories]
     max_term_count = max(term_counts) if term_counts else 1
     max_term_count = max(1, max_term_count)
@@ -1013,6 +864,10 @@ def run_candidate_scoring_stage(
         d=weights["d"],
     )
 
+    # A linked page is on topic when its intro uses a seed word or the seed article names it twice.
+    on_topic = [intro or mentions >= 2 for intro, mentions in zip(intro_on_topic, seed_mentions)]
+    ranked.sort(key=lambda row: not on_topic[int(row["index"])])  # stable: MMR order within each group
+
     ranked_indices = [int(row["index"]) for row in ranked]
     scored_rows: list[dict] = []
     for rank_idx, row in enumerate(ranked):
@@ -1020,7 +875,10 @@ def run_candidate_scoring_stage(
         rel = rel_scores[idx]
         depth = candidates[idx].get("depth", 1)
         links_back = bool(candidates[idx].get("links_back_to_seed"))
-        if rel >= keep_threshold:
+        if not on_topic[idx]:
+            status = "CUT"
+            reason = "cut_off_topic"
+        elif rel >= keep_threshold:
             status = "KEEP"
             reason = "relevance_above_keep_threshold"
         elif rel >= borderline_threshold:
@@ -1044,6 +902,8 @@ def run_candidate_scoring_stage(
                 "lexicon_score": round(title_lexicon_scores[idx], 6),
                 "red_score": round(row["red_score"], 6),
                 "selection_score": round(row["selection_score"], 6),
+                "intro_on_topic": intro_on_topic[idx],
+                "seed_mentions": seed_mentions[idx],
                 "status": status,
                 "reason": reason,
             }
@@ -1064,6 +924,8 @@ def run_candidate_scoring_stage(
                 "lexicon_score",
                 "red_score",
                 "selection_score",
+                "intro_on_topic",
+                "seed_mentions",
                 "status",
                 "reason",
             ]
@@ -1079,6 +941,8 @@ def run_candidate_scoring_stage(
                     row["lexicon_score"],
                     row["red_score"],
                     row["selection_score"],
+                    row["intro_on_topic"],
+                    row["seed_mentions"],
                     row["status"],
                     row["reason"],
                 ]
@@ -1112,7 +976,6 @@ def run_candidate_scoring_stage(
         pairwise=pairwise,
         ranked_indices=ranked_indices,
         term_scores=term_scores,
-        term_length_hists=term_length_hists,
         term_answer_inventories=term_answer_inventories,
     )
 
@@ -1141,13 +1004,14 @@ def run_k_selection_stage(
     m: int = 2,
     weights: dict[str, float] | None = None,
     size: int = 15,
-    min_slot_len: int = 3,
     inventory_min_df: int = 2,
     lexicon_path: str | Path | None = "data/lexicon/combined_wordfreq.txt",
     lexicon_weight: float = 0.08,
+    scoring: ScoringStageResult | None = None,
 ) -> KSelectionStageResult:
-    weights = weights or {"w1": 1.0, "w2": 1.0, "w3": 1.0, "w4": 0.5, "w5": 0.5}
-    scoring = run_candidate_scoring_stage(
+    weights = weights or {"w1": 1.0, "w2": 1.0, "w3": 1.0}
+    # A caller that has already scored passes the result in; rescoring here would also drop its weights.
+    scoring = scoring or run_candidate_scoring_stage(
         seed_title=seed_title,
         lang=lang,
         cache_dir=cache_dir,
@@ -1210,52 +1074,6 @@ def run_k_selection_stage(
         inventory_min_df=inventory_min_df,
     )
 
-    template_fit_by_k: list[float] = []
-    fill_conflict_by_k: list[float] = []
-    if term_answer_inventories or scoring.term_length_hists:
-        templates = get_templates(size)
-        fit_weight = weights.get("w4", 0.5)
-        conflict_weight = weights.get("w5", 0.5)
-        for k in range(1, max_k_effective + 1):
-            selected = ranked_indices[:k]
-            if term_answer_inventories:
-                inventory_counts: dict[str, int] = {}
-                for idx in selected:
-                    for answer in term_answer_inventories[idx]:
-                        inventory_counts[answer] = inventory_counts.get(answer, 0) + 1
-                inventory = {
-                    answer
-                    for answer, count in inventory_counts.items()
-                    if count >= inventory_min_df
-                }
-                length_hist = _length_histogram_from_answers(inventory)
-            else:
-                length_hist = {}
-                for idx in selected:
-                    for length, count in scoring.term_length_hists[idx].items():
-                        length_hist[length] = length_hist.get(length, 0) + count
-            if not length_hist:
-                template_fit_by_k.append(0.0)
-                fill_conflict_by_k.append(1.0)
-                continue
-            max_word_len = max(length_hist.keys(), default=None)
-            scored_templates = [
-                score_template_from_length_hist(
-                    length_hist,
-                    template,
-                    min_len=min_slot_len,
-                    max_word_len=max_word_len,
-                    auto_block_long_slots_enabled=True,
-                )
-                for template in templates
-            ]
-            # Choose template using the same fit/conflict trade-off as J(K).
-            best = max(
-                scored_templates,
-                key=lambda row: (fit_weight * row["score"]) - (conflict_weight * row["fill_conflict"]),
-            )
-            template_fit_by_k.append(best["score"])
-            fill_conflict_by_k.append(best["fill_conflict"])
     selection = select_k(
         ranked_indices=ranked_indices,
         rel_scores=rel_scores,
@@ -1266,17 +1084,15 @@ def run_k_selection_stage(
         epsilon=epsilon,
         m=m,
         term_scores=term_scores,
-        template_fit_by_k=template_fit_by_k,
-        fill_conflict_by_k=fill_conflict_by_k,
     )
 
     Path(trace_path).parent.mkdir(parents=True, exist_ok=True)
     with Path(trace_path).open("w", encoding="utf-8") as handle:
-        handle.write("k,jk,delta,coherence,diversity,term_quality,template_fit,fill_conflict,stop\n")
+        handle.write("k,jk,delta,coherence,diversity,term_quality,stop\n")
         for row in selection.trace:
             handle.write(
                 f"{row['k']},{row['jk']},{row['delta']},{row['coherence']},{row['diversity']},"
-                f"{row['term_quality']},{row['template_fit']},{row['fill_conflict']},{row['stop']}\n"
+                f"{row['term_quality']},{row['stop']}\n"
             )
 
     ranked_scores = sorted(scoring.scores, key=lambda item: item["rank"])
@@ -1319,7 +1135,6 @@ def run_k_selection_stage(
         "notes": [
             "pairwise_similarity_cosine",
             "term_quality_proxy_extracted_answer_count",
-            "template_fit_proxy_extracted_answer_inventory",
         ],
     }
     final_diagnostics = write_json(diagnostics_path, diagnostics)
@@ -1333,6 +1148,108 @@ def run_k_selection_stage(
     )
 
 
+_MAX_ANSWER_POOL = 200
+
+
+def _build_title_answer_rows(
+    *,
+    seed_title: str,
+    scores_path: str | Path,
+    client: WikiClient,
+    extracts: dict[str, str],
+    lexicon: dict[str, float],
+    lang: str,
+    max_len: int,
+    max_title_answers: int,
+    errors: list[str],
+) -> list[dict]:
+    """Primary answer pool: titles of the most relevant linked articles, each backed by its own intro.
+
+    Scoring has already cut the off-topic titles; the seed article joins the sources of every title it names.
+    """
+    import csv
+
+    if not Path(scores_path).exists():
+        return []
+    with Path(scores_path).open("r", encoding="utf-8", newline="") as handle:
+        scored = [
+            (
+                (row.get("title") or "").strip(),
+                _safe_float(row.get("rel_score")),
+                (row.get("intro_on_topic") or "").strip().lower() == "true",
+                _safe_int(row.get("seed_mentions")),
+            )
+            for row in csv.DictReader(handle)
+            if (row.get("status") or "").strip().upper() in {"KEEP", "BORDERLINE"}
+        ]
+    best_rel = max((item[1] for item in scored), default=0.0)
+    # The cap keeps the titles with the most evidence, in the order the answers are scored by (minus the seed-word penalty).
+    scored.sort(key=lambda item: item[1] + 0.1 * min(item[3], 10) + (0.5 if item[2] else 0.0), reverse=True)
+
+    rows: list[dict] = []
+    seen: set[str] = set()
+    seen_intros: set[str] = set()
+    _prefetch(errors, client.prefetch_intro_extracts, [seed_title, *(title for title, *_ in scored)])
+    # The seed names itself, so it earns the full bonus.
+    for title, rel_score, intro_on_topic, seed_mentions in [(seed_title, best_rel, True, 10), *scored]:
+        if len(rows) >= max_title_answers:
+            break
+        try:
+            payload = client.fetch_page_extract(title, intro_only=True)
+        except Exception as exc:
+            errors.append(f"title_answer_extract_failed:{title}:{exc}")
+            continue
+        intro = (payload.get("extract") or "").strip()
+        # A redirect ("Big bands") is named after the page it leads to, unless that title is no answer ("Hugh Everett").
+        page_title = title if title == seed_title else payload.get("title") or title
+        pair = title_to_answer(page_title, lang=lang, max_len=max_len) or title_to_answer(
+            title, lang=lang, max_len=max_len
+        )
+        # A second title for the same page is skipped.
+        if pair is None or pair[1] in seen or not intro or intro in seen_intros:
+            continue
+        display, normalized = pair
+        seen.add(normalized)
+        seen_intros.add(intro)
+        pattern = answer_pattern(display)
+        mentioning = [other for other, text in extracts.items() if other != page_title and pattern.search(text)]
+        source_titles = [page_title, *([seed_title] if seed_mentions and title != seed_title else []), *mentioning]
+        lexicon_score = lexicon_score_for_token(normalized, lexicon)
+        # Relevance alone is noisy: reward pages that talk about the seed or that it names often, and push
+        # answers that repeat the seed word to the bottom of the title pool.
+        score = 1.0 + rel_score + 0.1 * min(seed_mentions, 10)
+        if intro_on_topic:
+            score += 0.5
+        if title != seed_title and _uses_seed_word(display, seed_title, lang=lang):
+            score -= 1.0
+        rows.append(
+            {
+                "answer": display,
+                "normalized_answer": normalized,
+                "length": len(normalized),
+                "source_method": "article_title",
+                "lead_bold_signal": False,
+                "token_count": len(display.split()),
+                "source_titles": "|".join(source_titles),
+                "source_title_count": len(source_titles),
+                "doc_frequency": len(mentioning),
+                "theme_score": round(rel_score, 4),
+                "entity_type_score": 0.0,
+                "title_support_score": 1.0,
+                "support_sentence_count": 0,
+                "answer_cleanliness_score": round(answer_cleanliness_score(display, lang=lang), 4),
+                "clueability_score": round(clueability_score(display, normalized, lang=lang), 4),
+                "source_diversity_score": round(min(1.0, len(source_titles) / 3.0), 4),
+                "evidence_tier": "article_title",
+                "crosswordability_score": round(crosswordability_score(normalized), 4),
+                "lexicon_score": round(lexicon_score, 4),
+                "shape_penalty": round(shape_penalty(normalized), 4),
+                "answer_score": round(score, 4),
+            }
+        )
+    return rows
+
+
 def run_term_extraction_stage(
     *,
     seed_title: str,
@@ -1342,7 +1259,7 @@ def run_term_extraction_stage(
     selected_path: str | Path = "outputs/selected_candidates.json",
     terms_path: str | Path = "outputs/answer_candidates.csv",
     min_len: int = 4,
-    max_len: int = 12,
+    max_len: int = 15,
     min_alpha_ratio: float = 0.8,
     min_df: int = 2,
     nlp_backend: str = "auto",
@@ -1350,6 +1267,8 @@ def run_term_extraction_stage(
     wikidata_cache_dir: str | Path = "data/cache/wikidata",
     lexicon_path: str | Path | None = "data/lexicon/combined_wordfreq.txt",
     lexicon_weight: float = 0.15,
+    scores_path: str | Path | None = None,
+    max_title_answers: int = 150,
 ) -> TermExtractionStageResult:
     errors: list[str] = []
     cache = DiskCache(cache_dir)
@@ -1394,24 +1313,21 @@ def run_term_extraction_stage(
     errors.extend(backend_errors)
 
     lead_terms: dict[str, list[str]] = {}
-    intro_extracts: dict[str, str] = {}
     full_payloads: dict[str, dict] = {}
     extracts: dict[str, str] = {}
+    _prefetch(errors, client.prefetch_lead_wikitext, selected_titles)
     for title in selected_titles:
         try:
             intro_extract = client.fetch_page_extract(title, intro_only=True).get("extract", "")
         except Exception as exc:  # pragma: no cover
             intro_extract = ""
             errors.append(f"candidate_extract_failed:{title}:{exc}")
-        intro_extracts[title] = intro_extract
 
-        try:
-            full_payload = _fetch_best_extract_with_revid(client, title)
-        except Exception as exc:  # pragma: no cover
+        full_payload = _fetch_extract_with_revid(client, title, full=True)
+        if not full_payload["extract"]:  # the plain intro serves term extraction, but has no revision id
             full_payload = {"title": title, "extract": intro_extract, "revid": None}
-            errors.append(f"candidate_full_extract_failed:{title}:{exc}")
         full_payloads[title] = full_payload
-        extracts[title] = full_payload.get("extract") or intro_extract
+        extracts[title] = full_payload["extract"]
 
         try:
             lead_wikitext = client.fetch_lead_wikitext(title).get("wikitext", "")
@@ -1467,8 +1383,13 @@ def run_term_extraction_stage(
     support_sentence_count_by_key: dict[str, int] = {}
     filtered_terms = []
     unsupported_reject_count = 0
-    generic_reject_count = 0
+    common_reject_count = 0
     for term, freq in eligible_terms:
+        # Extracted words ("players", "American", "result") only add noise; the title pool carries the
+        # names, so the secondary pool keeps lead-bold terms (an article's own alternative names) only.
+        if not term.lead_bold_signal or term.normalized_answer in GENERIC_GRID_JUNK_EN:
+            common_reject_count += 1
+            continue
         theme_score = 0.0 if max_df == 0 else freq / max_df
         shape = shape_penalty(term.normalized_answer)
         crossword_score = crosswordability_score(term.normalized_answer)
@@ -1486,6 +1407,7 @@ def run_term_extraction_stage(
                     normalized_answer=term.normalized_answer,
                     source_titles=sorted(term.source_titles),
                     source_payloads=full_payloads,
+                    seed_title=seed_title,
                     term_source_method=term.source_method,
                     lang=lang,
                     min_words=6,
@@ -1525,19 +1447,6 @@ def run_term_extraction_stage(
         if not support_override:
             unsupported_reject_count += 1
             continue
-        generic_penalty = genericness_penalty(
-            term.answer,
-            term.normalized_answer,
-            lang=lang,
-            lexicon_score=lexicon_score,
-            lead_bold_signal=term.lead_bold_signal,
-            title_support_score=title_support_score,
-            source_title_count=source_title_count,
-            support_sentence_count=support_sentence_count,
-        )
-        if generic_penalty >= 0.5:
-            generic_reject_count += 1
-            continue
         if term.lead_bold_signal:
             evidence_tier = "lead"
         elif support_sentence_count > 0:
@@ -1567,8 +1476,7 @@ def run_term_extraction_stage(
             + (0.12 * residual_weight * title_support_score)
             + (0.16 * residual_weight * support_sentence_score)
             + (0.08 * residual_weight * evidence_tier_score)
-            - (0.18 * residual_weight * generic_penalty)
-            + (lexicon_weight * lexicon_score)
+            - (lexicon_weight * lexicon_score)
         )
 
         filtered_terms.append(
@@ -1590,7 +1498,6 @@ def run_term_extraction_stage(
                 "answer_cleanliness_score": round(cleanliness_score, 4),
                 "clueability_score": round(clueability, 4),
                 "source_diversity_score": round(source_diversity_score, 4),
-                "genericness_penalty": round(generic_penalty, 4),
                 "evidence_tier": evidence_tier,
                 "crosswordability_score": round(crossword_score, 4),
                 "lexicon_score": round(lexicon_score, 4),
@@ -1599,6 +1506,25 @@ def run_term_extraction_stage(
             }
         )
 
+    title_rows = (
+        _build_title_answer_rows(
+            seed_title=seed_title,
+            scores_path=scores_path,
+            client=client,
+            extracts=extracts,
+            lexicon=lexicon,
+            lang=lang,
+            max_len=max_len,
+            max_title_answers=max_title_answers,
+            errors=errors,
+        )
+        if scores_path is not None
+        else []
+    )
+    title_keys = {row["normalized_answer"] for row in title_rows}
+    filtered_terms = merge_plural_duplicates(
+        title_rows + [row for row in filtered_terms if row["normalized_answer"] not in title_keys]
+    )
     filtered_terms.sort(
         key=lambda row: (
             row["answer_score"],
@@ -1613,6 +1539,7 @@ def run_term_extraction_stage(
         ),
         reverse=True,
     )
+    del filtered_terms[_MAX_ANSWER_POOL:]
 
     Path(terms_path).parent.mkdir(parents=True, exist_ok=True)
     import csv
@@ -1637,7 +1564,6 @@ def run_term_extraction_stage(
                 "answer_cleanliness_score",
                 "clueability_score",
                 "source_diversity_score",
-                "genericness_penalty",
                 "evidence_tier",
                 "crosswordability_score",
                 "lexicon_score",
@@ -1664,7 +1590,6 @@ def run_term_extraction_stage(
                     row["answer_cleanliness_score"],
                     row["clueability_score"],
                     row["source_diversity_score"],
-                    row["genericness_penalty"],
                     row["evidence_tier"],
                     row["crosswordability_score"],
                     row["lexicon_score"],
@@ -1679,6 +1604,7 @@ def run_term_extraction_stage(
         "seed_title": seed_title,
         "terms_written": True,
         "term_count": len(filtered_terms),
+        "title_answer_count": sum(1 for row in filtered_terms if row["source_method"] == "article_title"),
         "min_df": min_df,
         "nlp_backend": backend_used,
         "spacy_version": spacy_version if backend_used == "spacy" else None,
@@ -1689,8 +1615,8 @@ def run_term_extraction_stage(
         "multiword_reject_count": merge_diagnostics.multiword_reject_count,
         "stopword_boundary_reject_count": merge_diagnostics.stopword_boundary_reject_count,
         "low_cleanliness_reject_count": merge_diagnostics.low_cleanliness_reject_count,
+        "common_term_reject_count": common_reject_count,
         "unsupported_term_reject_count": unsupported_reject_count,
-        "generic_term_reject_count": generic_reject_count,
         "promoted_by_lead_bold_count": merge_diagnostics.promoted_by_lead_bold_count,
         "promoted_by_source_diversity_count": merge_diagnostics.promoted_by_source_diversity_count,
         "full_extract_source_count": len(full_payloads),
@@ -1718,25 +1644,33 @@ def run_vocab_gate_stage(
     lang: str = "en",
     diagnostics_path: str | Path = "outputs/diagnostics_vocab_gate.json",
     terms_path: str | Path = "outputs/answer_candidates.csv",
-    min_required: int = 40,
-    max_allowed: int = 250,
+    clues_path: str | Path | None = None,
+    min_required: int = 30,
+    max_allowed: int | None = None,
 ) -> VocabGateStageResult:
     errors: list[str] = []
-    if not Path(terms_path).exists():
-        errors.append("terms_missing")
+    source_path = Path(terms_path if clues_path is None else clues_path)
+    if not source_path.exists():
+        missing = "terms_missing" if clues_path is None else "clues_missing"
+        errors.append(missing)
         diagnostics = {
             "stage": "vocab_gate",
             "lang": lang,
             "seed_title": seed_title,
             "passed": False,
-            "reason": "terms_missing",
+            "reason": missing,
             "errors": errors,
         }
         final_diagnostics = write_json(diagnostics_path, diagnostics)
         return VocabGateStageResult(diagnostics_path=final_diagnostics, diagnostics=diagnostics)
 
-    lines = Path(terms_path).read_text(encoding="utf-8").splitlines()
-    term_count = max(0, len(lines) - 1)
+    if clues_path is None:
+        term_count = max(0, len(source_path.read_text(encoding="utf-8").splitlines()) - 1)
+    else:
+        import csv
+
+        with source_path.open("r", encoding="utf-8", newline="") as handle:
+            term_count = _clued_answer_count(list(csv.DictReader(handle)), lang=lang)
     result = evaluate_vocab_gate(term_count, min_required=min_required, max_allowed=max_allowed)
 
     diagnostics = {
@@ -1745,6 +1679,7 @@ def run_vocab_gate_stage(
         "seed_title": seed_title,
         "passed": result.passed,
         "reason": result.reason,
+        "counted": "terms" if clues_path is None else "clued_answers",
         "term_count": result.term_count,
         "min_required": result.min_required,
         "max_allowed": result.max_allowed,
@@ -1765,10 +1700,9 @@ def run_rescue_ladder(
     candidate_scores_path: str | Path = "outputs/candidate_scores.csv",
     terms_diagnostics_path: str | Path = "outputs/diagnostics_terms_rescue.json",
     selected_override_path: str | Path = "outputs/selected_candidates_rescue.json",
-    gate_min: int = 40,
-    gate_max: int = 250,
+    gate_min: int = 30,
     min_len: int = 4,
-    max_len: int = 12,
+    max_len: int = 15,
     min_alpha_ratio: float = 0.8,
     min_df: int = 2,
     nlp_backend: str = "auto",
@@ -1801,13 +1735,17 @@ def run_rescue_ladder(
         }
         return write_json(path, payload)
 
-    def _run_terms(min_df_value: int, min_len_value: int) -> TermExtractionStageResult:
-        return run_term_extraction_stage(
+    def _run_gate(
+        min_df_value: int,
+        min_len_value: int,
+        selected: str | Path | None = None,
+    ) -> VocabGateResult:
+        run_term_extraction_stage(
             seed_title=seed_title,
             lang=lang,
             cache_dir=cache_dir,
             diagnostics_path=terms_diagnostics_path,
-            selected_path=selected_path,
+            selected_path=selected or selected_path,
             terms_path=terms_path,
             min_len=min_len_value,
             max_len=max_len,
@@ -1818,7 +1756,18 @@ def run_rescue_ladder(
             wikidata_cache_dir=wikidata_cache_dir,
             lexicon_path=lexicon_path,
             lexicon_weight=lexicon_weight,
+            scores_path=candidate_scores_path,
         )
+        clues = run_clue_extraction_stage(
+            seed_title=seed_title,
+            lang=lang,
+            cache_dir=cache_dir,
+            diagnostics_path=Path(diagnostics_path).with_name("diagnostics_clues_rescue.json"),
+            terms_path=terms_path,
+            clues_path=Path(terms_path).with_name("clues.csv"),
+            selected_path=selected or selected_path,
+        )
+        return evaluate_vocab_gate(_clued_answer_count(clues.clues, lang=lang), min_required=gate_min)
 
     selected_titles = _load_selected_titles(Path(selected_path))
     if not selected_titles:
@@ -1834,8 +1783,7 @@ def run_rescue_ladder(
         final_diagnostics = write_json(diagnostics_path, diagnostics)
         return {"passed": False, "diagnostics": diagnostics, "diagnostics_path": final_diagnostics}
 
-    result = _run_terms(min_df_value=min_df, min_len_value=min_len)
-    gate = evaluate_vocab_gate(len(result.terms), min_required=gate_min, max_allowed=gate_max)
+    gate = _run_gate(min_df_value=min_df, min_len_value=min_len)
     if gate.passed:
         diagnostics = {
             "stage": "rescue_ladder",
@@ -1851,8 +1799,7 @@ def run_rescue_ladder(
         return {"passed": True, "diagnostics": diagnostics, "diagnostics_path": final_diagnostics}
 
     steps.append({"action": "loosen_min_df", "value": 1})
-    result = _run_terms(min_df_value=1, min_len_value=min_len)
-    gate = evaluate_vocab_gate(len(result.terms), min_required=gate_min, max_allowed=gate_max)
+    gate = _run_gate(min_df_value=1, min_len_value=min_len)
     if gate.passed:
         diagnostics = {
             "stage": "rescue_ladder",
@@ -1868,7 +1815,6 @@ def run_rescue_ladder(
         return {"passed": True, "diagnostics": diagnostics, "diagnostics_path": final_diagnostics}
 
     # Promote borderline candidates (up to 3) into the selected set.
-    promoted_titles: list[str] = []
     if Path(candidate_scores_path).exists():
         import csv
 
@@ -1888,25 +1834,12 @@ def run_rescue_ladder(
                     break
         steps.append({"action": "promote_borderline", "value": len(borderline)})
         if borderline:
-            promoted_titles = borderline
             selected_titles = selected_titles + borderline
             selected_path = _write_selected(Path(selected_override_path), selected_titles)
     else:
         steps.append({"action": "promote_borderline", "value": 0, "note": "candidate_scores_missing"})
 
-    result = run_term_extraction_stage(
-        seed_title=seed_title,
-        lang=lang,
-        cache_dir=cache_dir,
-        diagnostics_path=terms_diagnostics_path,
-        selected_path=selected_path,
-        terms_path=terms_path,
-        min_len=min_len,
-        max_len=max_len,
-        min_alpha_ratio=min_alpha_ratio,
-        min_df=1,
-    )
-    gate = evaluate_vocab_gate(len(result.terms), min_required=gate_min, max_allowed=gate_max)
+    gate = _run_gate(min_df_value=1, min_len_value=min_len)
     if gate.passed:
         diagnostics = {
             "stage": "rescue_ladder",
@@ -1927,7 +1860,7 @@ def run_rescue_ladder(
         seed_title=seed_title,
         lang=lang,
         cache_dir=cache_dir,
-        diagnostics_path=str(terms_diagnostics_path),
+        diagnostics_path=Path(diagnostics_path).with_name("diagnostics_rescue_two_hop.json"),
         expansion="one_hop_plus_bounded_two_hop",
         include_backlinks=False,
         max_two_hop_parents=5,
@@ -1942,19 +1875,7 @@ def run_rescue_ladder(
     if extra_titles:
         expanded_titles = selected_titles + extra_titles[:10]
         _write_selected(Path(selected_override_path), expanded_titles)
-        result = run_term_extraction_stage(
-            seed_title=seed_title,
-            lang=lang,
-            cache_dir=cache_dir,
-            diagnostics_path=terms_diagnostics_path,
-            selected_path=selected_override_path,
-            terms_path=terms_path,
-            min_len=min_len,
-            max_len=max_len,
-            min_alpha_ratio=min_alpha_ratio,
-            min_df=1,
-        )
-        gate = evaluate_vocab_gate(len(result.terms), min_required=gate_min, max_allowed=gate_max)
+        gate = _run_gate(min_df_value=1, min_len_value=min_len, selected=selected_override_path)
         if gate.passed:
             diagnostics = {
                 "stage": "rescue_ladder",
@@ -1970,19 +1891,7 @@ def run_rescue_ladder(
             return {"passed": True, "diagnostics": diagnostics, "diagnostics_path": final_diagnostics}
 
     steps.append({"action": "shorten_min_len", "value": 3})
-    result = run_term_extraction_stage(
-        seed_title=seed_title,
-        lang=lang,
-        cache_dir=cache_dir,
-        diagnostics_path=terms_diagnostics_path,
-        selected_path=selected_path,
-        terms_path=terms_path,
-        min_len=3,
-        max_len=max_len,
-        min_alpha_ratio=min_alpha_ratio,
-        min_df=1,
-    )
-    gate = evaluate_vocab_gate(len(result.terms), min_required=gate_min, max_allowed=gate_max)
+    gate = _run_gate(min_df_value=1, min_len_value=3)
     if gate.passed:
         diagnostics = {
             "stage": "rescue_ladder",
@@ -2019,6 +1928,7 @@ def run_clue_extraction_stage(
     diagnostics_path: str | Path = "outputs/diagnostics_clues.json",
     terms_path: str | Path = "outputs/answer_candidates.csv",
     clues_path: str | Path = "outputs/clues.csv",
+    selected_path: str | Path = "outputs/selected_candidates.json",
     min_words: int = 6,
     max_words: int = 12,
     diversity_cap: int = 2,
@@ -2061,7 +1971,7 @@ def run_clue_extraction_stage(
         errors.append(f"clue_spacy_unavailable:{exc}")
 
     import csv
-    import re
+    import json
 
     terms: list[dict[str, str]] = []
     with Path(terms_path).open("r", encoding="utf-8", newline="") as handle:
@@ -2076,19 +1986,39 @@ def run_clue_extraction_stage(
                 }
             )
 
+    # The seed and the selected articles are cited from their full text; every other page from its intro.
+    selected_titles: list[str] = []
+    try:
+        selected = json.loads(Path(selected_path).read_text(encoding="utf-8"))
+        selected_titles = SelectedCandidatesArtifact.from_dict(selected).selected_titles
+    except Exception as exc:
+        errors.append(f"selected_unavailable:{exc}")
+    full_titles = {seed_title, *selected_titles}
+    pool_titles = {title for term in terms for title in term["source_titles"].split("|") if title}
+    _prefetch(errors, client.prefetch_intro_extracts, sorted(pool_titles - full_titles), with_revid=True)
+
     source_cache: dict[str, dict] = {}
 
     def load_source_payload(title: str) -> dict:
         if title not in source_cache:
-            try:
-                source_cache[title] = _fetch_best_extract_with_revid(client, title)
-            except Exception as exc:  # pragma: no cover
-                source_cache[title] = {"title": title, "extract": "", "revid": None}
-                errors.append(f"clue_extract_failed:{title}:{exc}")
+            source_cache[title] = _fetch_extract_with_revid(client, title, full=title in full_titles)
         return source_cache[title]
-    candidate_rows_by_key: dict[str, list[dict]] = {}
-    term_by_key: dict[str, dict] = {}
+
+    leads = [
+        sentences[0]
+        for term in terms
+        if term["source_method"] == "article_title" and term["source_titles"]
+        if (sentences := split_sentences(load_source_payload(term["source_titles"].split("|")[0]).get("extract", "")))
+    ]
+    lead_counts = lead_word_counts(leads)
+
+    clues: list[dict] = []
+    clued_keys: set[str] = set()
     unique_term_keys: set[str] = set()
+    used_texts: set[str] = set()
+    used_sentences: set[tuple[str, int | None]] = set()
+    fill_clues: list[dict] = []
+    diversity_rejected_count = 0
 
     for term in terms:
         answer = term["answer"]
@@ -2097,103 +2027,56 @@ def run_clue_extraction_stage(
         if not key:
             continue
         unique_term_keys.add(key)
-        term_by_key.setdefault(key, term)
-        if key in candidate_rows_by_key:
+        if key in clued_keys:
             continue
         source_titles = [title for title in term["source_titles"].split("|") if title]
         for title in source_titles:
-            payload = load_source_payload(title)
-        candidate_rows_by_key[key] = _collect_source_backed_clue_candidates(
+            load_source_payload(title)
+        candidates = _collect_source_backed_clue_candidates(
             answer=answer,
             normalized_answer=normalized_answer,
             source_titles=source_titles,
             source_payloads=source_cache,
+            seed_title=seed_title,
             term_source_method=term["source_method"],
             lang=lang,
             min_words=min_words,
             max_words=max_words,
             nlp=nlp,
+            allow_fragments=False,
         )
+        if term["source_method"] == "article_title" and source_titles:
+            definitions = _definition_clue_rows(
+                answer=answer,
+                normalized_answer=normalized_answer,
+                answer_key_value=key,
+                title=source_titles[0],
+                payload=source_cache[source_titles[0]],
+                term_source_method=term["source_method"],
+                lang=lang,
+                nlp=nlp,
+                lead_counts=lead_counts,
+                pool_size=len(leads),
+            )
+            candidates = definitions + candidates
 
-    extracted_by_key = {
-        key: rows[0]
-        for key, rows in candidate_rows_by_key.items()
-        if rows
-    }
-    extracted_clues = list(extracted_by_key.values())
-    diverse_initial, _ = enforce_diversity(
-        extracted_clues,
-        max_per_bucket=diversity_cap,
-        definitional_cap=3,
-    )
-    kept_initial_keys = {
-        _answer_key(clue.get("answer", ""), clue.get("normalized_answer", ""), lang=lang)
-        for clue in diverse_initial
-    }
-    rejected_keys = {key for key in extracted_by_key if key not in kept_initial_keys}
-
-    retry_by_key: dict[str, dict] = {}
-    for key in rejected_keys:
-        rows = candidate_rows_by_key.get(key, [])
-        if len(rows) < 2:
-            continue
-        retry_by_key[key] = rows[1]
-
-    retry_clues = list(retry_by_key.values())
-    retried_attempted = len(retry_clues)
-    retried_keys = set(retry_by_key.keys())
-    if retry_clues:
-        combined = retry_clues + diverse_initial
-        diverse_final, final_rejected = enforce_diversity(
-            combined,
-            max_per_bucket=diversity_cap,
-            definitional_cap=3,
-        )
-        retried_kept = sum(
-            1
-            for clue in diverse_final
-            if _answer_key(clue.get("answer", ""), clue.get("normalized_answer", ""), lang=lang) in retried_keys
-        )
-    else:
-        diverse_final = diverse_initial
-        final_rejected = []
-        retried_kept = 0
-
-    diverse_final_by_key: dict[str, dict] = {}
-    for clue in diverse_final:
-        key = _answer_key(clue.get("answer", ""), clue.get("normalized_answer", ""), lang=lang)
-        if key and key not in diverse_final_by_key:
-            diverse_final_by_key[key] = clue
-
-    final_by_key: dict[str, dict] = dict(extracted_by_key)
-    final_by_key.update(retry_by_key)
-    final_by_key.update(diverse_final_by_key)
-
-    fallback_template_added = 0
-    fallback_template_failed = 0
-    for key in unique_term_keys:
-        if key in final_by_key:
-            continue
-        term = term_by_key.get(key)
-        if term is None:
-            fallback_template_failed += 1
-            continue
-        source_titles = [title for title in term["source_titles"].split("|") if title]
-        for title in source_titles:
-            load_source_payload(title)
-        fallback_template_failed += 1
-
-    clues: list[dict] = []
-    seen_keys: set[str] = set()
-    for term in terms:
-        key = _answer_key(term["answer"], term.get("normalized_answer", ""), lang=lang)
-        if not key or key in seen_keys:
-            continue
-        clue_row = final_by_key.get(key)
-        if clue_row is None:
-            continue
-        clues.append(clue_row)
-        seen_keys.add(key)
+        for row in candidates:
+            sentence = (row["source_page"], row["sentence_offset"])
+            if row["clue"].lower() in used_texts:
+                continue
+            if row["clue_style"] == "fill_in_blank":
+                if sentence in used_sentences or (nlp is not None and not has_verb(row["clue"], nlp)):
+                    continue
+                kept, _ = enforce_diversity(fill_clues + [row], max_per_bucket=diversity_cap)
+                if len(kept) == len(fill_clues):
+                    diversity_rejected_count += 1
+                    continue
+                fill_clues.append(row)
+            used_texts.add(row["clue"].lower())
+            used_sentences.add(sentence)
+            clues.append(row)
+            clued_keys.add(key)
+            break
 
     Path(clues_path).parent.mkdir(parents=True, exist_ok=True)
     with Path(clues_path).open("w", encoding="utf-8", newline="") as handle:
@@ -2205,6 +2088,7 @@ def run_clue_extraction_stage(
                 "clue",
                 "clue_score",
                 "clue_class",
+                "clue_style",
                 "source_method",
                 "source_page",
                 "revid",
@@ -2220,6 +2104,7 @@ def run_clue_extraction_stage(
                     row["clue"],
                     row.get("clue_score", ""),
                     row.get("clue_class", ""),
+                    row.get("clue_style", ""),
                     row.get("source_method", ""),
                     row.get("source_page", ""),
                     row.get("revid", ""),
@@ -2233,23 +2118,20 @@ def run_clue_extraction_stage(
     for row in clues:
         clue_class = _infer_clue_class(row)
         clue_class_counts[clue_class] = clue_class_counts.get(clue_class, 0) + 1
+    definition_count = sum(1 for row in clues if row["clue_style"] == "definition")
     diagnostics = {
         "stage": "clue_extraction",
         "lang": lang,
         "seed_title": seed_title,
         "clues_written": True,
         "term_count": len(unique_term_keys),
-        "extracted_clue_count": len(extracted_clues),
-        "diverse_clue_count": len(diverse_final),
         "clue_count": len(clues),
+        "definition_clue_count": definition_count,
+        "fill_in_blank_clue_count": len(clues) - definition_count,
         "spacy_version": clue_spacy_version,
         "spacy_model_version": clue_spacy_model_version,
-        "diversity_rejected_count": len(rejected_keys),
-        "diversity_retried_attempted": retried_attempted,
-        "diversity_retried_count": retried_kept,
-        "diversity_rejected_after_retry": len(final_rejected),
-        "fallback_template_added": fallback_template_added,
-        "fallback_template_failed": fallback_template_failed,
+        "diversity_rejected_count": diversity_rejected_count,
+        "unclued_term_count": len(unique_term_keys - clued_keys),
         "clue_class_counts": clue_class_counts,
         "source_backed_clue_count": clue_class_counts.get("source_backed", 0),
         "template_fallback_clue_count": clue_class_counts.get("template_fallback", 0),
@@ -2266,853 +2148,108 @@ def run_clue_extraction_stage(
     )
 
 
-def run_topology_selection_stage(
+def _read_csv_rows(path: str | Path) -> list[dict]:
+    import csv
+
+    if not Path(path).exists():
+        return []
+    with Path(path).open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _shared_words(display: str) -> set[str]:
+    """Case-folded, accent-free words of 4+ letters; two answers sharing one cannot share a grid."""
+    words = re.findall(r"[^\W\d_]+", strip_diacritics(display).casefold())
+    return {word for word in words if len(word) >= 4}
+
+
+def _layout_candidates(
+    term_rows: list[dict],
+    clue_rows: list[dict],
     *,
-    seed_title: str,
-    lang: str = "en",
-    terms_path: str | Path = "outputs/answer_candidates.csv",
-    diagnostics_path: str | Path = "outputs/diagnostics_topology.json",
-    size: int = 15,
-    min_slot_len: int = 3,
-    require_gate: bool = True,
-    gate_min: int = 40,
-    gate_max: int = 250,
-) -> TopologyStageResult:
-    errors: list[str] = []
-    if not Path(terms_path).exists():
-        errors.append("terms_missing")
-        diagnostics = {
-            "stage": "topology_selection",
-            "lang": lang,
-            "seed_title": seed_title,
-            "selected_template": None,
-            "errors": errors,
-        }
-        final_diagnostics = write_json(diagnostics_path, diagnostics)
-        return TopologyStageResult(diagnostics_path=final_diagnostics, diagnostics=diagnostics)
-
-    vocabulary = build_solver_vocabulary(
-        terms_path=terms_path,
-        lang=lang,
-        filler_path=None,
-        filler_min_len=min_slot_len,
-        filler_max_len=size,
-        filler_max_per_length=0,
-        filler_weight=0.0,
-    )
-    words = vocabulary.words
-    ranking_words = vocabulary.themed_words
-    inventory_source = "themed"
-    if vocabulary.clue_answers_available:
-        ranking_words = sorted(
-            vocabulary.clue_answers,
-            key=lambda word: (vocabulary.word_scores.get(word, 0.0), word),
-            reverse=True,
-        )
-        inventory_source = "clued"
-
-    gate_result = evaluate_vocab_gate(len(words), min_required=gate_min, max_allowed=gate_max)
-    if require_gate and not gate_result.passed:
-        errors.append(f"vocab_gate_failed:{gate_result.reason}")
-        diagnostics = {
-            "stage": "topology_selection",
-            "lang": lang,
-            "seed_title": seed_title,
-            "selected_template": None,
-            "gate": gate_result.__dict__,
-            "errors": errors,
-        }
-        final_diagnostics = write_json(diagnostics_path, diagnostics)
-        return TopologyStageResult(diagnostics_path=final_diagnostics, diagnostics=diagnostics)
-
-    min_word_len = min((len(word) for word in ranking_words), default=None)
-    max_word_len = max((len(word) for word in ranking_words), default=None)
-    effective_min_slot_len = min_slot_len
-    if min_word_len is not None:
-        effective_min_slot_len = max(min_slot_len, min_word_len)
-
-    selection = select_best_template(
-        ranking_words,
-        size=size,
-        min_len=effective_min_slot_len,
-        max_word_len=max_word_len,
-        auto_block_long_slots_enabled=True,
-    )
-    diagnostics = {
-        "stage": "topology_selection",
-        "lang": lang,
-        "seed_title": seed_title,
-        "selected_template": selection["selected"],
-        "scored": selection["scored"],
-        "gate": gate_result.__dict__,
-        "min_slot_len": min_slot_len,
-        "effective_min_slot_len": effective_min_slot_len,
-        "min_word_len": min_word_len,
-        "max_word_len": max_word_len,
-        "inventory_source": inventory_source,
-        "ranking_word_count": len(ranking_words),
-        "errors": errors,
+    lang: str,
+    limit: int,
+) -> list[tuple[str, float]]:
+    """Packageable answers by descending answer_score, skipping any that repeats a word already taken."""
+    clued = {
+        _answer_key(row.get("answer", ""), row.get("normalized_answer", ""), lang=lang)
+        for row in clue_rows
+        if _is_packageable_clue(row)
     }
-    final_diagnostics = write_json(diagnostics_path, diagnostics)
-    return TopologyStageResult(diagnostics_path=final_diagnostics, diagnostics=diagnostics)
-
-
-def _slot_pattern(rendered_grid: list[list[str]], slot) -> str:
-    letters: list[str] = []
-    for row, col in slot.cells:
-        cell = rendered_grid[row][col]
-        letters.append(cell if cell not in {".", "#"} else ".")
-    return "".join(letters)
-
-
-def _matches_pattern(word: str, pattern: str) -> bool:
-    if len(word) != len(pattern):
-        return False
-    return all(pattern_char == "." or pattern_char == word_char for word_char, pattern_char in zip(word, pattern))
-
-
-def _count_unfilled_short_slots(slots: list, assignments: dict[int, str], *, max_len: int = 5) -> int:
-    return sum(1 for slot in slots if slot.id not in assignments and slot.length <= max_len)
-
-
-def _apply_short_slot_completion(
-    *,
-    rendered_grid: list[list[str]],
-    slots: list,
-    assignments: dict[int, str],
-    candidate_words: set[str],
-    word_scores: dict[str, float],
-    render_grid_fn,
-    max_len: int = 5,
-    allow_ranked_choice: bool = False,
-) -> tuple[dict[int, str], list[list[str]], list[dict[str, int | str]]]:
-    assignments_out = dict(assignments)
-    used_words = set(assignments_out.values())
-    working_grid = [list(row) for row in rendered_grid]
-    additions: list[dict[str, int | str]] = []
-    candidate_buckets: dict[int, list[str]] = {}
-    for word in candidate_words:
-        candidate_buckets.setdefault(len(word), []).append(word)
-
-    while True:
-        best_choice: tuple[int, int, float, int, object, str] | None = None
-        for slot in slots:
-            if slot.id in assignments_out or slot.length > max_len:
-                continue
-            pattern = _slot_pattern(working_grid, slot)
-            anchored = sum(1 for char in pattern if char != ".")
-            if anchored == 0:
-                continue
-            matches = [
-                word
-                for word in candidate_buckets.get(slot.length, [])
-                if word not in used_words and _matches_pattern(word, pattern)
-            ]
-            if not matches:
-                continue
-            matches.sort(key=lambda word: (word_scores.get(word, 0.0), word), reverse=True)
-            if len(matches) != 1:
-                if not allow_ranked_choice or anchored < 2 or len(matches) > 3:
-                    continue
-                top_score = word_scores.get(matches[0], 0.0)
-                second_score = word_scores.get(matches[1], 0.0)
-                if top_score - second_score < 0.08:
-                    continue
-            choice = (
-                len(matches),
-                -anchored,
-                -word_scores.get(matches[0], 0.0),
-                slot.id,
-                slot,
-                matches[0],
-            )
-            if best_choice is None or choice < best_choice:
-                best_choice = choice
-
-        if best_choice is None:
+    ranked = sorted(term_rows, key=lambda row: -_safe_float(row.get("answer_score")))
+    picked: list[tuple[str, float]] = []
+    taken: set[str] = set()
+    words: set[str] = set()
+    for row in ranked:
+        key = _answer_key(row.get("answer", ""), row.get("normalized_answer", ""), lang=lang)
+        if key not in clued or key in taken:
+            continue
+        row_words = _shared_words(row.get("answer", ""))
+        if row_words & words:
+            continue
+        taken.add(key)
+        words |= row_words
+        picked.append((key, _safe_float(row.get("answer_score"))))
+        if len(picked) >= limit:
             break
-
-        slot = best_choice[4]
-        word = best_choice[5]
-        assignments_out[slot.id] = word
-        used_words.add(word)
-        additions.append(
-            {
-                "slot_id": slot.id,
-                "word": word,
-                "length": slot.length,
-            }
-        )
-        working_grid = render_grid_fn(working_grid, slots, assignments_out)
-
-    return assignments_out, working_grid, additions
+    return picked
 
 
-def _summarize_assignment_state(
-    *,
-    rendered_grid: list[list[str]],
-    slots: list,
-    assignments: dict[int, str],
-    themed_set: set[str],
-    clue_answers: set[str],
-    source_backed_answers: set[str],
-    fallback_only_answers: set[str],
-    clue_answers_available: bool,
-) -> dict:
-    assigned_ids = set(assignments)
-    fill_count = sum(1 for row in rendered_grid for cell in row if cell not in (".", "#"))
-    total_cells = sum(1 for row in rendered_grid for cell in row if cell != "#")
-    fill_percent = 0.0 if total_cells == 0 else fill_count / total_cells
-    unfilled_slots = [
-        {
-            "slot_id": slot.id,
-            "direction": slot.direction,
-            "length": slot.length,
-            "position": slot.cells[0],
-        }
-        for slot in slots
-        if slot.id not in assigned_ids
-    ]
-    long_slot_ids = {slot.id for slot in slots if slot.length >= 6}
-    assigned_count = len(assignments)
-    themed_assigned_count = sum(1 for word in assignments.values() if word in themed_set)
-    if clue_answers_available:
-        clued_assigned_count = sum(1 for word in assignments.values() if word in clue_answers)
-    else:
-        clued_assigned_count = assigned_count
-    filler_used_count = max(0, assigned_count - themed_assigned_count)
-    filler_used_ratio = 0.0 if assigned_count == 0 else filler_used_count / assigned_count
-    clued_entry_ratio = 0.0 if assigned_count == 0 else clued_assigned_count / assigned_count
-    source_backed_entry_count = sum(1 for word in assignments.values() if word in source_backed_answers)
-    source_backed_entry_ratio = 0.0 if assigned_count == 0 else source_backed_entry_count / assigned_count
-    fallback_only_assigned_count = sum(1 for word in assignments.values() if word in fallback_only_answers)
-    fallback_only_entry_ratio = 0.0 if assigned_count == 0 else fallback_only_assigned_count / assigned_count
-    long_slot_assigned_count = sum(1 for slot_id in assignments if slot_id in long_slot_ids)
-    long_slot_non_theme_count = sum(
-        1 for slot_id, word in assignments.items() if slot_id in long_slot_ids and word not in themed_set
-    )
-    fallback_only_long_count = sum(
-        1 for slot_id, word in assignments.items() if slot_id in long_slot_ids and word in fallback_only_answers
-    )
-    fallback_only_long_ratio = (
-        0.0 if long_slot_assigned_count == 0 else fallback_only_long_count / long_slot_assigned_count
-    )
-    long_slot_theme_ratio = (
-        1.0 if long_slot_assigned_count == 0 else (long_slot_assigned_count - long_slot_non_theme_count) / long_slot_assigned_count
-    )
-    unfilled_short_slot_count = sum(1 for slot in slots if slot.id not in assigned_ids and slot.length <= 5)
-    quality_objective = (
-        (1.35 * fill_percent)
-        + (0.75 * (0.0 if assigned_count == 0 else themed_assigned_count / assigned_count))
-        + (0.90 * source_backed_entry_ratio)
-        + (0.25 * clued_entry_ratio)
-        + (0.35 * long_slot_theme_ratio)
-        - (1.10 * filler_used_ratio)
-        - (0.75 * fallback_only_entry_ratio)
-        - (0.90 * fallback_only_long_ratio)
-        - (0.10 * unfilled_short_slot_count)
-        - (0.70 * long_slot_non_theme_count)
-    )
-    return {
-        "fill_count": fill_count,
-        "total_cells": total_cells,
-        "fill_percent": fill_percent,
-        "unfilled_slots": unfilled_slots,
-        "assigned_count": assigned_count,
-        "themed_assigned_count": themed_assigned_count,
-        "clued_assigned_count": clued_assigned_count,
-        "filler_used_count": filler_used_count,
-        "filler_used_ratio": filler_used_ratio,
-        "clued_entry_ratio": clued_entry_ratio,
-        "source_backed_entry_count": source_backed_entry_count,
-        "source_backed_entry_ratio": source_backed_entry_ratio,
-        "fallback_only_assigned_count": fallback_only_assigned_count,
-        "fallback_only_entry_ratio": fallback_only_entry_ratio,
-        "long_slot_assigned_count": long_slot_assigned_count,
-        "long_slot_non_theme_count": long_slot_non_theme_count,
-        "fallback_only_long_count": fallback_only_long_count,
-        "fallback_only_long_ratio": fallback_only_long_ratio,
-        "long_slot_theme_ratio": long_slot_theme_ratio,
-        "unfilled_short_slot_count": unfilled_short_slot_count,
-        "quality_objective": quality_objective,
-    }
-
-
-def run_csp_solve_stage(
+def run_layout_stage(
     *,
     seed_title: str,
     lang: str = "en",
     terms_path: str | Path = "outputs/answer_candidates.csv",
-    diagnostics_path: str | Path = "outputs/diagnostics_csp.json",
+    clues_path: str | Path = "outputs/clues.csv",
     grid_path: str | Path = "outputs/grid.json",
+    diagnostics_path: str | Path = "outputs/diagnostics_layout.json",
     size: int = 15,
-    min_slot_len: int = 3,
-    template_name: str | None = None,
-    max_steps: int = 20000,
-    min_domain: int = 1,
-    max_restarts: int = 2,
     random_seed: int = 13,
-    use_ac3: bool = True,
-    beam_width: int = 32,
-    enable_local_repair: bool = True,
-    repair_steps: int = 300,
-    template_trials: int = 3,
-    filler_path: str | Path | None = "data/lexicon/filler_words.txt",
-    filler_min_len: int = 3,
-    filler_max_len: int = 12,
-    filler_max_per_length: int = 1200,
-    filler_weight: float = 0.01,
-    use_rust: bool | None = None,
-    template_priority_names: list[str] | None = None,
-    require_gate: bool = True,
-    gate_min: int = 40,
-    gate_max: int = 250,
-    preferred_fill_target: float = 0.85,
-) -> SolveStageResult:
+    restarts: int = 96,
+    candidates: int = 80,
+    min_words: int = 12,
+    gate_min: int = 30,
+) -> LayoutStageResult:
     errors: list[str] = []
-    if not Path(terms_path).exists():
-        errors.append("terms_missing")
-        diagnostics = {
-            "stage": "csp_solve",
-            "lang": lang,
-            "seed_title": seed_title,
-            "solved": False,
-            "errors": errors,
-        }
-        final_diagnostics = write_json(diagnostics_path, diagnostics)
-        return SolveStageResult(
-            grid_path=Path(grid_path),
-            diagnostics_path=final_diagnostics,
-            diagnostics=diagnostics,
-        )
+    term_rows = _read_csv_rows(terms_path)
+    clue_rows = _read_csv_rows(clues_path)
+    if _clued_answer_count(clue_rows, lang=lang) < gate_min:
+        errors.append("vocab_gate_failed")
 
-    vocabulary = build_solver_vocabulary(
-        terms_path=terms_path,
-        lang=lang,
-        filler_path=filler_path,
-        filler_min_len=filler_min_len,
-        filler_max_len=filler_max_len,
-        filler_max_per_length=filler_max_per_length,
-        filler_weight=filler_weight,
-    )
-    word_scores = vocabulary.word_scores
-    words = vocabulary.words
-    themed_words = vocabulary.themed_words
-    themed_set = vocabulary.themed_set
-    clue_answers = vocabulary.clue_answers
-    clue_answers_available = vocabulary.clue_answers_available
-    source_backed_answers = getattr(vocabulary, "source_backed_answers", set())
-    template_fallback_answers = getattr(vocabulary, "template_fallback_answers", set())
-    fallback_only_answers = getattr(vocabulary, "fallback_only_answers", set())
-    unsupported_answers = getattr(vocabulary, "unsupported_answers", set())
-    filler_words = vocabulary.filler_words
-    filler_raw_count = vocabulary.filler_raw_count
-    filler_added = vocabulary.filler_added
-    filler_limit_per_length = vocabulary.filler_limit_per_length
-    filler_weight = vocabulary.filler_weight
-    long_filler_weight = vocabulary.long_filler_weight
-    effective_filler_max_len = getattr(vocabulary, "effective_filler_max_len", filler_max_len)
-    min_word_len = vocabulary.min_word_len
-    max_word_len = vocabulary.max_word_len
+    picked = [] if errors else _layout_candidates(term_rows, clue_rows, lang=lang, limit=candidates)
+    layout = build_layout(picked, size=size, random_seed=random_seed, restarts=restarts)
+    problems = validate_layout(layout.grid, layout.placements)
+    complete = not problems and layout.metrics["word_count"] >= min_words
+    fill_status = "complete" if complete else "failed"
 
-    gate_result = evaluate_vocab_gate(len(themed_words), min_required=gate_min, max_allowed=gate_max)
-    if require_gate and not gate_result.passed:
-        errors.append(f"vocab_gate_failed:{gate_result.reason}")
-        diagnostics = {
-            "stage": "csp_solve",
-            "lang": lang,
-            "seed_title": seed_title,
-            "solved": False,
-            "gate": gate_result.__dict__,
-            "errors": errors,
-        }
-        final_diagnostics = write_json(diagnostics_path, diagnostics)
-        return SolveStageResult(
-            grid_path=Path(grid_path),
-            diagnostics_path=final_diagnostics,
-            diagnostics=diagnostics,
-        )
-
-    effective_min_slot_len = min_slot_len
-    if min_word_len is not None:
-        effective_min_slot_len = max(min_slot_len, min_word_len)
-    if clue_answers_available:
-        min_clue_word_len = min((len(answer) for answer in clue_answers), default=effective_min_slot_len)
-        effective_min_slot_len = max(effective_min_slot_len, min_clue_word_len)
-
-    templates = get_templates(size)
-    template_trials = max(1, template_trials)
-    if template_name:
-        templates_to_try = [next((t for t in templates if t.name == template_name), templates[0])]
-        scored_templates = []
-    else:
-        ranking_words = themed_words
-        if source_backed_answers:
-            ranking_words = sorted(
-                source_backed_answers,
-                key=lambda word: (word_scores.get(word, 0.0), word),
-                reverse=True,
-            )
-        elif clue_answers_available:
-            ranking_words = sorted(
-                clue_answers,
-                key=lambda word: (word_scores.get(word, 0.0), word),
-                reverse=True,
-            )
-        selection = select_best_template(
-            ranking_words,
-            size=size,
-            min_len=effective_min_slot_len,
-            max_word_len=max_word_len,
-            auto_block_long_slots_enabled=True,
-        )
-        scored_templates = selection.get("scored", [])
-        ordered_names = [row["template"] for row in scored_templates]
-        if template_priority_names:
-            priority_order = {
-                name: index for index, name in enumerate(template_priority_names)
-            }
-            default_order = {
-                name: index for index, name in enumerate(ordered_names)
-            }
-            ordered_names.sort(
-                key=lambda name: (
-                    priority_order.get(name, len(priority_order)),
-                    default_order.get(name, len(default_order)),
-                )
-            )
-        templates_to_try = [
-            next(t for t in templates if t.name == name)
-            for name in ordered_names[:template_trials]
-        ]
-
-    def _status_rank(status: str) -> int:
-        if status == "complete":
-            return 2
-        if status == "partial":
-            return 1
-        return 0
-
-    solver_backend = "python"
-    solver = solve_crossword
-    use_rust_solver = use_rust
-    if use_rust_solver is None:
-        import os
-
-        use_rust_solver = os.getenv("CROSSWORD_USE_RUST", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-    if use_rust_solver:
-        rust_module, rust_error = load_rust_csp()
-        if rust_module is None:
-            errors.append(rust_error or "rust_solver_unavailable")
-            diagnostics = {
-                "stage": "csp_solve",
-                "lang": lang,
-                "seed_title": seed_title,
-                "solved": False,
-                "solver_backend": "rust",
-                "errors": errors,
-            }
-            final_diagnostics = write_json(diagnostics_path, diagnostics)
-            return SolveStageResult(
-                grid_path=Path(grid_path),
-                diagnostics_path=final_diagnostics,
-                diagnostics=diagnostics,
-            )
-        solver = rust_module.solve_crossword
-        solver_backend = "rust"
-
-    template_trials_log: list[dict] = []
-    best_trial: dict | None = None
-    best_rank: tuple[int, float, int, int, float, float, float, int, float, int, int] | None = None
-
-    for idx, template in enumerate(templates_to_try):
-        trial_seed = random_seed + (idx * 101)
-        trial = run_template_trial(
-            template=template,
-            trial_seed=trial_seed,
-            solver=solver,
-            build_grid_fn=build_grid,
-            auto_block_long_slots_fn=auto_block_long_slots,
-            build_slots_fn=build_slots,
-            render_grid_fn=render_grid,
-            words=words,
-            themed_words=themed_words,
-            themed_set=themed_set,
-            clue_answers=clue_answers,
-            source_backed_answers=source_backed_answers,
-            fallback_only_answers=fallback_only_answers,
-            clue_answers_available=clue_answers_available,
-            word_scores=word_scores,
-            long_filler_weight=long_filler_weight,
-            max_word_len=max_word_len,
-            effective_min_slot_len=effective_min_slot_len,
-            min_domain=min_domain,
-            max_steps=max_steps,
-            max_restarts=max_restarts,
-            use_ac3=use_ac3,
-            beam_width=beam_width,
-            enable_local_repair=enable_local_repair,
-            repair_steps=repair_steps,
-        )
-        trial_quality_gate_passed, trial_quality_gate_reasons = evaluate_quality_gate(
-            fill_percent=trial["fill_percent"],
-            invalid_slots=trial["invalid_slots"],
-            filler_used_ratio=trial["filler_used_ratio"],
-            clued_entry_ratio=trial["clued_entry_ratio"],
-            clue_answers_available=clue_answers_available,
-            long_slot_non_theme_count=trial["long_slot_non_theme_count"],
-        )
-        trial_source_backed_entry_ratio = _safe_float(
-            trial.get("source_backed_entry_ratio"),
-            default=0.0,
-        )
-        trial_fallback_only_assigned_count = _safe_int(
-            trial.get("fallback_only_assigned_count"),
-            default=0,
-        )
-        trial_fallback_only_long_count = _safe_int(
-            trial.get("fallback_only_long_count"),
-            default=0,
-        )
-        trial_long_slot_theme_ratio = _safe_float(
-            trial.get("long_slot_theme_ratio"),
-            default=0.0,
-        )
-        trial_unfilled_short_slot_count = _safe_int(
-            trial.get("unfilled_short_slot_count"),
-            default=0,
-        )
-        template_trials_log.append(
-            {
-                "template": template.name,
-                "fill_status": trial["fill_status"],
-                "fill_percent": trial["fill_percent"],
-                "fill_count": trial["fill_count"],
-                "total_cells": trial["total_cells"],
-                "slot_count": len(trial["slots"]),
-                "active_slot_count": len(trial["active_slots"]),
-                "pruned_slot_count": len(trial["slots"]) - len(trial["active_slots"]),
-                "steps": trial["result"]["steps"],
-                "restarts": trial["result"].get("restarts", 0),
-                "implicit_added_count": trial["implicit_added_count"],
-                "removed_assignments_count": len(trial["removed_assignments"]),
-                "invalid_slots_count": len(trial["invalid_slots"]),
-                "solved_final": trial["solved_final"],
-                "quality_objective": trial["quality_objective"],
-                "filler_used_ratio": trial["filler_used_ratio"],
-                "clued_entry_ratio": trial["clued_entry_ratio"],
-                "source_backed_entry_ratio": trial_source_backed_entry_ratio,
-                "long_slot_non_theme_count": trial["long_slot_non_theme_count"],
-                "long_slot_theme_ratio": trial_long_slot_theme_ratio,
-                "unfilled_short_slot_count": trial_unfilled_short_slot_count,
-                "fallback_only_assigned_count": trial_fallback_only_assigned_count,
-                "fallback_only_long_count": trial_fallback_only_long_count,
-                "quality_gate": {
-                    "passed": trial_quality_gate_passed,
-                    "reasons": trial_quality_gate_reasons,
-                },
-                "phase_a": trial["phase_a"],
-                "auto_block": {
-                    "max_word_len": max_word_len,
-                    "added_block_count": len(trial["auto_block"]["added_blocks"]),
-                    "added_blocks": trial["auto_block"]["added_blocks"],
-                    "long_slot_count_before": len(trial["auto_block"]["long_slots_before"]),
-                    "long_slot_count_after": len(trial["auto_block"]["long_slots_after"]),
-                    "iterations": trial["auto_block"]["iterations"],
-                },
-                "errors": trial["trial_errors"],
-            }
-        )
-
-        rank = (
-            1 if trial_quality_gate_passed else 0,
-            trial["fill_percent"],
-            -len(trial["invalid_slots"]),
-            -trial_unfilled_short_slot_count,
-            trial_source_backed_entry_ratio,
-            trial_long_slot_theme_ratio,
-            -trial["filler_used_ratio"],
-            -trial_fallback_only_assigned_count,
-            trial["quality_objective"],
-            -trial["long_slot_non_theme_count"],
-            _status_rank(trial["fill_status"]),
-            trial["fill_count"],
-        )
-        if best_trial is None or rank > best_rank:
-            best_trial = trial
-            best_rank = rank
-        if (
-            trial["fill_status"] == "complete"
-            and trial_quality_gate_passed
-        ):
-            break
-
-    assert best_trial is not None
-    template = best_trial["template"]
-    rendered = [list(row) for row in best_trial["rendered"]]
-    result = dict(best_trial["result"])
-    slots = best_trial["slots"]
-    active_slots = best_trial["active_slots"]
-    auto_block = best_trial["auto_block"]
-    implicit_added_count = best_trial["implicit_added_count"]
-    invalid_slots = best_trial["invalid_slots"]
-    unclued_removed_count = best_trial["unclued_removed_count"]
-    completion_log = {
-        "preferred_fill_target": preferred_fill_target,
-        "source_backed_added": [],
-        "template_fallback_added": [],
-    }
-    current_assignments = {
-        int(slot_id): str(word)
-        for slot_id, word in result.get("assignments", {}).items()
-    }
-    short_unfilled_before = _count_unfilled_short_slots(slots, current_assignments)
-    if short_unfilled_before > 0:
-        current_assignments, rendered, source_backed_additions = _apply_short_slot_completion(
-            rendered_grid=rendered,
-            slots=slots,
-            assignments=current_assignments,
-            candidate_words=source_backed_answers,
-            word_scores=word_scores,
-            render_grid_fn=render_grid,
-            max_len=5,
-            allow_ranked_choice=False,
-        )
-        completion_log["source_backed_added"] = source_backed_additions
-        if _count_unfilled_short_slots(slots, current_assignments) > 0:
-            current_assignments, rendered, template_fallback_additions = _apply_short_slot_completion(
-                rendered_grid=rendered,
-                slots=slots,
-                assignments=current_assignments,
-                candidate_words=template_fallback_answers,
-                word_scores=word_scores,
-                render_grid_fn=render_grid,
-                max_len=5,
-                allow_ranked_choice=True,
-            )
-            completion_log["template_fallback_added"] = template_fallback_additions
-
-    completion_applied = bool(completion_log["source_backed_added"] or completion_log["template_fallback_added"])
-    if completion_applied:
-        result["assignments"] = current_assignments
-        summary = _summarize_assignment_state(
-            rendered_grid=rendered,
-            slots=slots,
-            assignments=current_assignments,
-            themed_set=themed_set,
-            clue_answers=clue_answers,
-            source_backed_answers=source_backed_answers,
-            fallback_only_answers=fallback_only_answers,
-            clue_answers_available=clue_answers_available,
-        )
-        fill_percent = summary["fill_percent"]
-        fill_status = "complete" if len(current_assignments) == len(slots) and not invalid_slots else ("partial" if current_assignments else "failed")
-        unfilled_slots = summary["unfilled_slots"]
-        solved_final = bool(result.get("solved", False)) or (len(current_assignments) == len(slots) and not invalid_slots)
-        assigned_count = summary["assigned_count"]
-        themed_assigned_count = summary["themed_assigned_count"]
-        clued_assigned_count = summary["clued_assigned_count"]
-        filler_used_count = summary["filler_used_count"]
-        filler_used_ratio = summary["filler_used_ratio"]
-        clued_entry_ratio = summary["clued_entry_ratio"]
-        source_backed_entry_count = summary["source_backed_entry_count"]
-        source_backed_entry_ratio = summary["source_backed_entry_ratio"]
-        fallback_only_assigned_count = summary["fallback_only_assigned_count"]
-        fallback_only_entry_ratio = summary["fallback_only_entry_ratio"]
-        long_slot_assigned_count = summary["long_slot_assigned_count"]
-        long_slot_non_theme_count = summary["long_slot_non_theme_count"]
-        fallback_only_long_count = summary["fallback_only_long_count"]
-        fallback_only_long_ratio = summary["fallback_only_long_ratio"]
-        long_slot_theme_ratio = summary["long_slot_theme_ratio"]
-        unfilled_short_slot_count = summary["unfilled_short_slot_count"]
-        quality_objective = summary["quality_objective"]
-    else:
-        fill_percent = best_trial["fill_percent"]
-        fill_status = best_trial["fill_status"]
-        unfilled_slots = best_trial["unfilled_slots"]
-        solved_final = best_trial["solved_final"]
-        assigned_count = best_trial["assigned_count"]
-        themed_assigned_count = best_trial["themed_assigned_count"]
-        clued_assigned_count = best_trial["clued_assigned_count"]
-        filler_used_count = best_trial["filler_used_count"]
-        filler_used_ratio = best_trial["filler_used_ratio"]
-        clued_entry_ratio = best_trial["clued_entry_ratio"]
-        source_backed_entry_count = _safe_int(best_trial.get("source_backed_entry_count"), default=0)
-        source_backed_entry_ratio = _safe_float(best_trial.get("source_backed_entry_ratio"), default=0.0)
-        fallback_only_assigned_count = _safe_int(best_trial.get("fallback_only_assigned_count"), default=0)
-        fallback_only_entry_ratio = _safe_float(best_trial.get("fallback_only_entry_ratio"), default=0.0)
-        long_slot_assigned_count = best_trial["long_slot_assigned_count"]
-        long_slot_non_theme_count = best_trial["long_slot_non_theme_count"]
-        fallback_only_long_count = _safe_int(best_trial.get("fallback_only_long_count"), default=0)
-        fallback_only_long_ratio = _safe_float(best_trial.get("fallback_only_long_ratio"), default=0.0)
-        long_slot_theme_ratio = best_trial["long_slot_theme_ratio"]
-        unfilled_short_slot_count = _safe_int(best_trial.get("unfilled_short_slot_count"), default=0)
-        quality_objective = best_trial["quality_objective"]
-    quality_gate_passed, quality_gate_reasons = evaluate_quality_gate(
-        fill_percent=fill_percent,
-        invalid_slots=invalid_slots,
-        filler_used_ratio=filler_used_ratio,
-        clued_entry_ratio=clued_entry_ratio,
-        clue_answers_available=clue_answers_available,
-        long_slot_non_theme_count=long_slot_non_theme_count,
-    )
-    if not quality_gate_passed:
-        fill_status = "failed"
-        solved_final = False
-        errors.append("quality_gate_failed")
-    if unclued_removed_count > 0:
-        errors.append(f"unclued_assignments_present:{unclued_removed_count}")
-
-    grid_artifact = GridArtifact(
+    grid_model = GridArtifact(
         seed_title=seed_title,
         lang=lang,
-        template=template.name,
         size=size,
-        min_slot_len=min_slot_len,
-        effective_min_slot_len=effective_min_slot_len,
-        grid=rendered,
-        assignments=result["assignments"],
-        slots=[
-            GridSlotRecord(
-                id=slot.id,
-                direction=slot.direction,
-                length=slot.length,
-                cells=slot.cells,
-            )
-            for slot in slots
+        grid=layout.grid,
+        placements=[
+            {"answer": p.answer, "row": p.row, "col": p.col, "direction": p.direction}
+            for p in layout.placements
         ],
-        auto_block={
-            "max_word_len": max_word_len,
-            "added_block_count": len(auto_block["added_blocks"]),
-            "added_blocks": auto_block["added_blocks"],
-            "long_slot_count_before": len(auto_block["long_slots_before"]),
-            "long_slot_count_after": len(auto_block["long_slots_after"]),
-            "iterations": auto_block["iterations"],
-        },
-        filler={
-            "path": str(filler_path) if filler_path is not None else None,
-            "loaded": bool(filler_words),
-            "min_len": filler_min_len,
-            "max_len": effective_filler_max_len,
-            "max_per_length": filler_limit_per_length,
-            "weight": filler_weight,
-            "word_count": len(filler_words),
-            "raw_word_count": filler_raw_count,
-            "added_count": filler_added,
-            "used_count": filler_used_count,
-            "used_ratio": filler_used_ratio,
-            "strict_filter_enabled": True,
-        },
-        invalid_slots=invalid_slots,
         fill_status=fill_status,
-        fill_percent=fill_percent,
-        unfilled_slots=unfilled_slots,
-        extras={
-            "implicit_assignments_added": implicit_added_count,
-            "removed_assignments": best_trial["removed_assignments"],
-            "completion": completion_log,
-            "quality_gate": {
-                "passed": quality_gate_passed,
-                "reasons": quality_gate_reasons,
-                "objective": quality_objective,
-                "min_fill_percent": QUALITY_GATE_MIN_FILL_PERCENT,
-                "preferred_fill_target": preferred_fill_target,
-                "max_filler_ratio": QUALITY_GATE_MAX_FILLER_RATIO,
-                "min_clued_ratio": QUALITY_GATE_MIN_CLUED_RATIO if clue_answers_available else None,
-            },
-            "assigned_count": assigned_count,
-            "themed_assigned_count": themed_assigned_count,
-            "clued_assigned_count": clued_assigned_count,
-            "clue_answers_available": clue_answers_available,
-            "clued_entry_ratio": clued_entry_ratio,
-            "source_backed_entry_count": source_backed_entry_count,
-            "source_backed_entry_ratio": source_backed_entry_ratio,
-            "fallback_only_assigned_count": fallback_only_assigned_count,
-            "fallback_only_entry_ratio": fallback_only_entry_ratio,
-            "long_slot_assigned_count": long_slot_assigned_count,
-            "long_slot_non_theme_count": long_slot_non_theme_count,
-            "fallback_only_long_count": fallback_only_long_count,
-            "fallback_only_long_ratio": fallback_only_long_ratio,
-            "long_slot_theme_ratio": long_slot_theme_ratio,
-            "unfilled_short_slot_count": unfilled_short_slot_count,
-            "unsupported_answers_count": len(unsupported_answers),
-        },
     )
-    payload = grid_artifact.to_dict()
-
-    if best_trial["trial_errors"]:
-        errors.extend(best_trial["trial_errors"])
-    final_grid = write_json(grid_path, payload)
+    final_grid = write_json(grid_path, grid_model.to_dict())
     diagnostics = {
-        "stage": "csp_solve",
+        "stage": "layout",
         "lang": lang,
         "seed_title": seed_title,
-        "solved": solved_final,
-        "steps": result["steps"],
-        "restarts": result.get("restarts", 0),
-        "fill_percent": fill_percent,
-        "fill_status": fill_status,
-        "template": template.name,
-        "template_trials": template_trials_log,
-        "gate": gate_result.__dict__,
-        "min_slot_len": min_slot_len,
-        "effective_min_slot_len": effective_min_slot_len,
-        "min_word_len": min_word_len,
-        "max_word_len": max_word_len,
-        "slot_count": len(slots),
-        "active_slot_count": len(active_slots),
-        "pruned_slot_count": len(slots) - len(active_slots),
-        "max_restarts": max_restarts,
+        "size": size,
         "random_seed": random_seed,
-        "use_ac3": use_ac3,
-        "beam_width": beam_width,
-        "preferred_fill_target": preferred_fill_target,
-        "local_repair_enabled": enable_local_repair,
-        "repair_steps": repair_steps,
-        "local_repair_applied": result.get("local_repair_applied", False),
-        "completion": completion_log,
-        "word_score_count": len(word_scores),
-        "themed_word_count": len(themed_words),
-        "filler": payload["filler"],
-        "quality_gate": payload["quality_gate"],
-        "auto_block": payload["auto_block"],
-        "implicit_assignments_added": implicit_added_count,
-        "removed_assignments_count": len(best_trial["removed_assignments"]),
-        "invalid_slots_count": len(invalid_slots),
-        "invalid_slots": invalid_slots,
-        "assigned_count": assigned_count,
-        "themed_assigned_count": themed_assigned_count,
-        "clued_assigned_count": clued_assigned_count,
-        "clue_answers_available": clue_answers_available,
-        "clue_answers_count": len(clue_answers),
-        "clued_entry_ratio": clued_entry_ratio,
-        "source_backed_answers_count": len(source_backed_answers),
-        "source_backed_entry_count": source_backed_entry_count,
-        "source_backed_entry_ratio": source_backed_entry_ratio,
-        "filler_used_ratio": filler_used_ratio,
-        "fallback_only_answers_count": len(fallback_only_answers),
-        "fallback_only_assigned_count": fallback_only_assigned_count,
-        "fallback_only_entry_ratio": fallback_only_entry_ratio,
-        "long_slot_assigned_count": long_slot_assigned_count,
-        "long_slot_non_theme_count": long_slot_non_theme_count,
-        "fallback_only_long_count": fallback_only_long_count,
-        "fallback_only_long_ratio": fallback_only_long_ratio,
-        "long_slot_theme_ratio": long_slot_theme_ratio,
-        "unfilled_short_slot_count": unfilled_short_slot_count,
-        "unsupported_answers_count": len(unsupported_answers),
-        "quality_objective": quality_objective,
-        "unclued_removed_count": unclued_removed_count,
-        "unfilled_slots": unfilled_slots,
-        "solver_backend": solver_backend,
+        "restarts": restarts,
+        "min_words": min_words,
+        "candidate_count": len(picked),
+        "fill_status": fill_status,
+        "validity_errors": problems,
         "errors": errors,
+        **layout.metrics,
     }
     final_diagnostics = write_json(diagnostics_path, diagnostics)
-    return SolveStageResult(
+    return LayoutStageResult(
         grid_path=final_grid,
         diagnostics_path=final_diagnostics,
         diagnostics=diagnostics,
@@ -3129,251 +2266,117 @@ def run_packaging_stage(
     puzzle_path: str | Path = "outputs/puzzle.json",
     attribution_path: str | Path = "outputs/attribution.json",
     diagnostics_path: str | Path = "outputs/diagnostics_package.json",
+    gate_min: int = 30,
 ) -> PackagingStageResult:
+    import json
+
     errors: list[str] = []
 
-    selected_titles: list[str] = []
-    selected_k = 0
-    selected_artifact: SelectedCandidatesArtifact | None = None
+    selected = SelectedCandidatesArtifact(seed_title=seed_title, lang=lang, selected_k=0, selected_titles=[])
     if Path(selected_path).exists():
         try:
-            import json
-
-            payload = json.loads(Path(selected_path).read_text(encoding="utf-8"))
-            selected_artifact = SelectedCandidatesArtifact.from_dict(payload)
-            selected_titles = selected_artifact.selected_titles
-            selected_k = selected_artifact.selected_k
+            selected = SelectedCandidatesArtifact.from_dict(
+                json.loads(Path(selected_path).read_text(encoding="utf-8"))
+            )
         except Exception as exc:  # pragma: no cover
             errors.append(f"selected_parse_failed:{exc}")
     else:
         errors.append("selected_missing")
 
-    grid_payload: dict = {}
-    grid_artifact: GridArtifact | None = None
+    grid = GridArtifact(seed_title=seed_title, lang=lang, size=15, grid=[], placements=[])
     if Path(grid_path).exists():
         try:
-            import json
-
-            grid_payload = json.loads(Path(grid_path).read_text(encoding="utf-8"))
-            grid_artifact = GridArtifact.from_dict(grid_payload)
+            grid = GridArtifact.from_dict(json.loads(Path(grid_path).read_text(encoding="utf-8")))
         except Exception as exc:  # pragma: no cover
             errors.append(f"grid_parse_failed:{exc}")
     else:
         errors.append("grid_missing")
 
-    clues: list[dict] = []
-    if Path(clues_path).exists():
-        import csv
-
-        with Path(clues_path).open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.DictReader(handle)
-            for row in reader:
-                clues.append(row)
-    else:
+    clues = _read_csv_rows(clues_path)
+    if not Path(clues_path).exists():
         errors.append("clues_missing")
-
-    clue_by_normalized: dict[str, dict] = {}
+    clue_by_key: dict[str, dict] = {}
     for clue in clues:
-        normalized = clue.get("normalized_answer") or ""
-        if normalized:
-            existing = clue_by_normalized.get(normalized)
-            candidate_rank = (
-                1 if _is_packageable_clue(clue) else 0,
-                _clue_class_rank(_infer_clue_class(clue)),
-            )
-            existing_rank = (
-                -1,
-                -1,
-            ) if existing is None else (
-                1 if _is_packageable_clue(existing) else 0,
-                _clue_class_rank(_infer_clue_class(existing)),
-            )
-            if existing is None or candidate_rank > existing_rank:
-                clue_by_normalized[normalized] = clue
+        if _is_packageable_clue(clue):
+            key = _answer_key(clue.get("answer", ""), clue.get("normalized_answer", ""), lang=lang)
+            clue_by_key.setdefault(key, clue)
 
-    def _has_valid_clue(clue_row: dict) -> bool:
-        return _is_packageable_clue(clue_row)
-
-    template_name = grid_artifact.template if grid_artifact is not None else grid_payload.get("template")
-    size = grid_artifact.size if grid_artifact is not None else grid_payload.get("size", 15)
-    if grid_artifact is not None:
-        min_slot_len = grid_artifact.effective_min_slot_len or grid_artifact.min_slot_len
-    else:
-        min_slot_len = grid_payload.get("effective_min_slot_len") or grid_payload.get("min_slot_len") or 3
-
-    across_entries: list[dict] = []
-    down_entries: list[dict] = []
-    unclued_assigned_slots: list[dict] = []
-    entry_clue_classes: list[str] = []
+    placements = [Placement(p["answer"], p["row"], p["col"], p["direction"]) for p in grid.placements]
+    numbers = number_placements(placements)
+    entries: dict[str, list[dict]] = {"across": [], "down": []}
     used_clues: list[dict] = []
-    if grid_artifact is not None:
-        normalized_assignments = dict(grid_artifact.assignments)
-    else:
-        assignments = grid_payload.get("assignments", {})
-        normalized_assignments = {int(k): v for k, v in assignments.items()}
-    slot_records: list[dict] = []
-
-    if grid_artifact is not None:
-        slot_records = [slot.to_dict() for slot in grid_artifact.slots]
-    else:
-        raw_slots = grid_payload.get("slots")
-        if isinstance(raw_slots, list):
-            for row in raw_slots:
-                try:
-                    slot_records.append(
-                        {
-                            "id": int(row["id"]),
-                            "direction": str(row["direction"]),
-                            "length": int(row["length"]),
-                            "cells": [tuple(cell) for cell in row["cells"]],
-                        }
-                    )
-                except Exception:
-                    continue
-
-    if not slot_records and template_name:
-        templates = get_templates(size)
-        template = next((t for t in templates if t.name == template_name), None)
-        if template is None:
-            errors.append(f"template_missing:{template_name}")
-        else:
-            grid = build_grid(template)
-            slots = build_slots(grid, min_len=min_slot_len)
-            slot_records = [
-                {
-                    "id": slot.id,
-                    "direction": slot.direction,
-                    "length": slot.length,
-                    "cells": slot.cells,
-                }
-                for slot in slots
-            ]
-
-    for slot in slot_records:
-        answer = normalized_assignments.get(slot["id"])
-        if not answer:
+    unclued: list[str] = []
+    for placement in sorted(placements, key=lambda p: numbers[(p.row, p.col)]):
+        clue = clue_by_key.get(placement.answer)
+        if clue is None:
+            unclued.append(placement.answer)
             continue
-        clue = clue_by_normalized.get(answer, {})
-        if not _has_valid_clue(clue):
-            unclued_assigned_slots.append(
-                {
-                    "slot_id": slot["id"],
-                    "direction": slot["direction"],
-                    "length": slot["length"],
-                    "position": slot["cells"][0],
-                    "answer": answer,
-                }
-            )
-            continue
-        entry = {
-            "slot_id": slot["id"],
-            "answer": answer,
-            "clue": clue.get("clue", ""),
-            "row": slot["cells"][0][0],
-            "col": slot["cells"][0][1],
-            "length": slot["length"],
-            "clue_class": _infer_clue_class(clue),
-        }
-        entry_clue_classes.append(entry["clue_class"])
+        display = clue.get("answer") or placement.answer
+        entries[placement.direction].append(
+            {
+                "number": numbers[(placement.row, placement.col)],
+                "answer": placement.answer,
+                "display_answer": display,
+                "enumeration": enumeration(display),
+                "clue": clue["clue"],
+                "clue_style": clue.get("clue_style", ""),
+                "clue_class": _infer_clue_class(clue),
+                "row": placement.row,
+                "col": placement.col,
+                "length": len(placement.answer),
+            }
+        )
         used_clues.append(clue)
-        if slot["direction"] == "across":
-            across_entries.append(entry)
-        else:
-            down_entries.append(entry)
-
-    fill_status = grid_artifact.fill_status if grid_artifact is not None else grid_payload.get("fill_status", "failed")
-    fill_percent = grid_artifact.fill_percent if grid_artifact is not None else grid_payload.get("fill_percent", 0.0)
-    unfilled_slots = grid_artifact.unfilled_slots if grid_artifact is not None else grid_payload.get("unfilled_slots", [])
-    assigned_slot_count = len(normalized_assignments)
-    clued_entry_count = len(across_entries) + len(down_entries)
-    source_backed_entry_count = sum(1 for clue_class in entry_clue_classes if clue_class == "source_backed")
-    fallback_only_entry_count = sum(1 for clue_class in entry_clue_classes if clue_class == "template_fallback")
-    synthetic_filler_clue_count = sum(1 for clue_class in entry_clue_classes if clue_class == "synthetic_filler")
-    clued_entry_ratio = 0.0 if assigned_slot_count == 0 else clued_entry_count / assigned_slot_count
-    source_backed_entry_ratio = 0.0 if assigned_slot_count == 0 else source_backed_entry_count / assigned_slot_count
-    fallback_only_entry_ratio = 0.0 if assigned_slot_count == 0 else fallback_only_entry_count / assigned_slot_count
-    puzzle_status = "ok"
-    if not selected_titles or not clues:
-        puzzle_status = "insufficient_vocabulary"
-    elif clued_entry_ratio < 0.90:
-        puzzle_status = "insufficient_clues"
-        errors.append("clue_coverage_failed")
-    elif fill_status == "failed":
-        puzzle_status = "insufficient_quality"
 
     provenance_missing = validate_clue_provenance(used_clues)
     if provenance_missing:
         errors.append("provenance_incomplete")
-    if synthetic_filler_clue_count > 0:
-        errors.append("synthetic_filler_disallowed")
-        if puzzle_status == "ok":
-            puzzle_status = "insufficient_clues"
+    if unclued:
+        errors.append("clue_coverage_failed")
+    if _clued_answer_count(clues, lang=lang) < gate_min:
+        puzzle_status = "insufficient_vocabulary"
+    elif unclued:
+        puzzle_status = "insufficient_clues"
+    elif grid.fill_status != "complete":
+        puzzle_status = "insufficient_quality"
+    else:
+        puzzle_status = "ok"
 
-    puzzle_model = PuzzleArtifact(
-        seed_title=seed_title,
-        lang=lang,
-        selected_articles=selected_titles,
-        selected_k=selected_k,
-        grid_template_id=template_name,
-        grid_cells=grid_artifact.grid if grid_artifact is not None else grid_payload.get("grid", []),
-        across_entries=across_entries,
-        down_entries=down_entries,
-        fill_status=fill_status,
-        fill_percent=fill_percent,
-        unfilled_slots=unfilled_slots,
-        puzzle_status=puzzle_status,
-        diagnostics={
-            "errors": errors,
-            "used_clue_provenance_missing_count": len(provenance_missing),
-            "assigned_slot_count": assigned_slot_count,
-            "clued_entry_count": clued_entry_count,
-            "clued_entry_ratio": clued_entry_ratio,
-            "used_source_backed_entry_count": source_backed_entry_count,
-            "used_source_backed_entry_ratio": source_backed_entry_ratio,
-            "used_template_fallback_entry_count": fallback_only_entry_count,
-            "used_template_fallback_entry_ratio": fallback_only_entry_ratio,
-            "source_backed_entry_count": source_backed_entry_count,
-            "source_backed_entry_ratio": source_backed_entry_ratio,
-            "fallback_only_entry_count": fallback_only_entry_count,
-            "fallback_only_entry_ratio": fallback_only_entry_ratio,
-            "unclued_assigned_slots_count": len(unclued_assigned_slots),
-            "unclued_assigned_slots": unclued_assigned_slots,
-            "packaged_synthetic_filler_count": synthetic_filler_clue_count,
-            "synthetic_filler_clue_count": synthetic_filler_clue_count,
-        },
-        attribution=used_clues,
-    )
-    puzzle_payload = puzzle_model.to_dict()
-
-    final_puzzle = write_json(puzzle_path, puzzle_payload)
-    final_attribution = write_json(attribution_path, {"clues": used_clues})
-
+    placed = [entry for rows in entries.values() for entry in rows]
+    clue_texts = [entry["clue"].lower() for entry in placed]
+    definition_count = sum(entry["clue_style"] == "definition" for entry in placed)
     diagnostics = {
         "stage": "packaging",
         "lang": lang,
         "seed_title": seed_title,
-        "selected_k": selected_k,
+        "selected_k": selected.selected_k,
         "clue_count": len(clues),
-        "fill_status": fill_status,
+        "entry_count": len(placed),
+        "fill_status": grid.fill_status,
         "puzzle_status": puzzle_status,
-        "assigned_slot_count": assigned_slot_count,
-        "clued_entry_count": clued_entry_count,
-        "clued_entry_ratio": clued_entry_ratio,
-        "used_source_backed_entry_count": source_backed_entry_count,
-        "used_source_backed_entry_ratio": source_backed_entry_ratio,
-        "used_template_fallback_entry_count": fallback_only_entry_count,
-        "used_template_fallback_entry_ratio": fallback_only_entry_ratio,
-        "source_backed_entry_count": source_backed_entry_count,
-        "source_backed_entry_ratio": source_backed_entry_ratio,
-        "fallback_only_entry_count": fallback_only_entry_count,
-        "fallback_only_entry_ratio": fallback_only_entry_ratio,
-        "unclued_assigned_slots_count": len(unclued_assigned_slots),
-        "packaged_synthetic_filler_count": synthetic_filler_clue_count,
-        "synthetic_filler_clue_count": synthetic_filler_clue_count,
-        "errors": errors,
+        "definition_clue_count": definition_count,
+        "fill_in_blank_clue_count": len(placed) - definition_count,
+        "duplicate_clue_text_count": len(clue_texts) - len(set(clue_texts)),
         "used_clue_provenance_missing_count": len(provenance_missing),
-        "provenance_missing_count": len(provenance_missing),
+        "errors": errors,
     }
+    puzzle_model = PuzzleArtifact(
+        seed_title=seed_title,
+        lang=lang,
+        selected_articles=selected.selected_titles,
+        selected_k=selected.selected_k,
+        size=grid.size,
+        grid_cells=grid.grid,
+        across_entries=entries["across"],
+        down_entries=entries["down"],
+        fill_status=grid.fill_status,
+        puzzle_status=puzzle_status,
+        layout=layout_metrics(grid.grid, placements),
+        diagnostics=diagnostics,
+        attribution=used_clues,
+    )
+    final_puzzle = write_json(puzzle_path, puzzle_model.to_dict())
+    final_attribution = write_json(attribution_path, {"clues": used_clues})
     final_diagnostics = write_json(diagnostics_path, diagnostics)
     return PackagingStageResult(
         puzzle_path=final_puzzle,
@@ -3409,68 +2412,36 @@ def run_generate_pipeline(
     epsilon: float = 0.01,
     m: int = 2,
     min_len: int = 4,
-    max_len: int = 12,
+    max_len: int = 15,
     min_alpha_ratio: float = 0.8,
     min_df: int = 2,
     nlp_backend: str = "auto",
     entity_type_scoring: bool = False,
-    gate_min: int = 40,
-    gate_max: int = 250,
+    gate_min: int = 30,
     rescue: bool = True,
     clue_min_words: int = 6,
     clue_max_words: int = 12,
     diversity_cap: int = 2,
     size: int = 15,
-    min_slot_len: int = 3,
-    template_name: str | None = None,
-    max_steps: int = 20000,
-    min_domain: int = 1,
-    max_restarts: int = 2,
     random_seed: int = 13,
-    use_ac3: bool = True,
-    beam_width: int = 32,
-    enable_local_repair: bool = True,
-    repair_steps: int = 300,
-    template_trials: int = 3,
-    filler_path: str | Path | None = "data/lexicon/filler_words.txt",
-    filler_min_len: int = 3,
-    filler_max_len: int = 12,
-    filler_max_per_length: int = 1200,
-    filler_weight: float = 0.01,
-    use_rust: bool | None = None,
-    skip_gate: bool = False,
-    use_topology: bool = False,
-    preferred_fill_target: float = 0.85,
+    layout_restarts: int = 96,
+    layout_candidates: int = 80,
+    min_words: int = 12,
 ) -> dict:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     scores_path = output_dir / "candidate_scores.csv"
-    diagnostics_scores = output_dir / "diagnostics_scores.json"
     selected_path = output_dir / "selected_candidates.json"
-    trace_path = output_dir / "k_selection_trace.csv"
-    diagnostics_k = output_dir / "diagnostics_k.json"
     terms_path = output_dir / "answer_candidates.csv"
-    diagnostics_terms = output_dir / "diagnostics_terms.json"
-    diagnostics_gate = output_dir / "diagnostics_vocab_gate.json"
     clues_path = output_dir / "clues.csv"
-    diagnostics_clues = output_dir / "diagnostics_clues.json"
-    diagnostics_rescue = output_dir / "diagnostics_rescue.json"
-    diagnostics_terms_rescue = output_dir / "diagnostics_terms_rescue.json"
     selected_rescue_path = output_dir / "selected_candidates_rescue.json"
-    selected_quality_rescue_path = output_dir / "selected_candidates_quality_rescue.json"
-    grid_path = output_dir / "grid.json"
-    diagnostics_csp = output_dir / "diagnostics_csp.json"
-    diagnostics_topology = output_dir / "diagnostics_topology.json"
-    puzzle_path = output_dir / "puzzle.json"
-    attribution_path = output_dir / "attribution.json"
-    diagnostics_package = output_dir / "diagnostics_package.json"
 
     scoring = run_candidate_scoring_stage(
         seed_title=seed_title,
         lang=lang,
         cache_dir=cache_dir,
-        diagnostics_path=diagnostics_scores,
+        diagnostics_path=output_dir / "diagnostics_scores.json",
         scores_path=scores_path,
         include_backlinks=include_backlinks,
         max_links=max_links,
@@ -3490,9 +2461,9 @@ def run_generate_pipeline(
         seed_title=seed_title,
         lang=lang,
         cache_dir=cache_dir,
-        diagnostics_path=diagnostics_k,
+        diagnostics_path=output_dir / "diagnostics_k.json",
         scores_path=scores_path,
-        trace_path=trace_path,
+        trace_path=output_dir / "k_selection_trace.csv",
         selected_path=selected_path,
         include_backlinks=include_backlinks,
         max_links=max_links,
@@ -3508,18 +2479,18 @@ def run_generate_pipeline(
         epsilon=epsilon,
         m=m,
         size=size,
-        min_slot_len=min_slot_len,
         inventory_min_df=min_df,
         weights=k_weights,
         lexicon_path=lexicon_path,
         lexicon_weight=candidate_lexicon_weight,
+        scoring=scoring,
     )
 
     terms = run_term_extraction_stage(
         seed_title=seed_title,
         lang=lang,
         cache_dir=cache_dir,
-        diagnostics_path=diagnostics_terms,
+        diagnostics_path=output_dir / "diagnostics_terms.json",
         selected_path=selected_path,
         terms_path=terms_path,
         min_len=min_len,
@@ -3531,18 +2502,37 @@ def run_generate_pipeline(
         wikidata_cache_dir=wikidata_cache_dir,
         lexicon_path=lexicon_path,
         lexicon_weight=term_lexicon_weight,
-    )
-
-    gate = run_vocab_gate_stage(
-        seed_title=seed_title,
-        lang=lang,
-        diagnostics_path=diagnostics_gate,
-        terms_path=terms_path,
-        min_required=gate_min,
-        max_allowed=gate_max,
+        scores_path=scores_path,
     )
 
     selected_for_package = selected_path
+
+    def run_clues() -> ClueStageResult:
+        return run_clue_extraction_stage(
+            seed_title=seed_title,
+            lang=lang,
+            cache_dir=cache_dir,
+            diagnostics_path=output_dir / "diagnostics_clues.json",
+            terms_path=terms_path,
+            clues_path=clues_path,
+            selected_path=selected_for_package,
+            min_words=clue_min_words,
+            max_words=clue_max_words,
+            diversity_cap=diversity_cap,
+        )
+
+    def run_gate() -> VocabGateStageResult:
+        return run_vocab_gate_stage(
+            seed_title=seed_title,
+            lang=lang,
+            diagnostics_path=output_dir / "diagnostics_vocab_gate.json",
+            clues_path=clues_path,
+            min_required=gate_min,
+        )
+
+    clues = run_clues()
+    gate = run_gate()
+
     rescue_result = None
     if rescue and not gate.diagnostics.get("passed", False):
         rescue_result = run_rescue_ladder(
@@ -3551,12 +2541,11 @@ def run_generate_pipeline(
             cache_dir=cache_dir,
             selected_path=selected_path,
             terms_path=terms_path,
-            diagnostics_path=diagnostics_rescue,
+            diagnostics_path=output_dir / "diagnostics_rescue.json",
             candidate_scores_path=scores_path,
-            terms_diagnostics_path=diagnostics_terms_rescue,
+            terms_diagnostics_path=output_dir / "diagnostics_terms_rescue.json",
             selected_override_path=selected_rescue_path,
             gate_min=gate_min,
-            gate_max=gate_max,
             min_len=min_len,
             max_len=max_len,
             min_alpha_ratio=min_alpha_ratio,
@@ -3569,259 +2558,34 @@ def run_generate_pipeline(
         )
         if selected_rescue_path.exists():
             selected_for_package = selected_rescue_path
-        gate = run_vocab_gate_stage(
-            seed_title=seed_title,
-            lang=lang,
-            diagnostics_path=diagnostics_gate,
-            terms_path=terms_path,
-            min_required=gate_min,
-            max_allowed=gate_max,
-        )
+        clues = run_clues()
+        gate = run_gate()
 
-    clues = run_clue_extraction_stage(
+    layout = run_layout_stage(
         seed_title=seed_title,
         lang=lang,
-        cache_dir=cache_dir,
-        diagnostics_path=diagnostics_clues,
         terms_path=terms_path,
         clues_path=clues_path,
-        min_words=clue_min_words,
-        max_words=clue_max_words,
-        diversity_cap=diversity_cap,
-    )
-
-    topology = run_topology_selection_stage(
-        seed_title=seed_title,
-        lang=lang,
-        terms_path=terms_path,
-        diagnostics_path=diagnostics_topology,
+        grid_path=output_dir / "grid.json",
+        diagnostics_path=output_dir / "diagnostics_layout.json",
         size=size,
-        min_slot_len=min_slot_len,
-        require_gate=not skip_gate,
-        gate_min=gate_min,
-        gate_max=gate_max,
-    )
-
-    template_for_csp = template_name
-    template_priority_names: list[str] | None = None
-    if template_for_csp is None and use_topology:
-        template_priority_names = [
-            row.get("template")
-            for row in topology.diagnostics.get("scored", [])
-            if row.get("template")
-        ]
-    current_template_priority_names = template_priority_names
-
-    solve = run_csp_solve_stage(
-        seed_title=seed_title,
-        lang=lang,
-        terms_path=terms_path,
-        diagnostics_path=diagnostics_csp,
-        grid_path=grid_path,
-        size=size,
-        min_slot_len=min_slot_len,
-        template_name=template_for_csp,
-        max_steps=max_steps,
-        min_domain=min_domain,
-        max_restarts=max_restarts,
         random_seed=random_seed,
-        use_ac3=use_ac3,
-        beam_width=beam_width,
-        enable_local_repair=enable_local_repair,
-        repair_steps=repair_steps,
-        template_trials=template_trials,
-        filler_path=filler_path,
-        filler_min_len=filler_min_len,
-        filler_max_len=filler_max_len,
-        filler_max_per_length=filler_max_per_length,
-        filler_weight=filler_weight,
-        use_rust=use_rust,
-        template_priority_names=current_template_priority_names,
-        require_gate=not skip_gate,
+        restarts=layout_restarts,
+        candidates=layout_candidates,
+        min_words=min_words,
         gate_min=gate_min,
-        gate_max=gate_max,
-        preferred_fill_target=preferred_fill_target,
     )
-
-    if (
-        rescue
-        and template_name is None
-        and _should_expand_selection_inventory(
-            size=size,
-            terms=terms.terms,
-            solve_diagnostics=solve.diagnostics,
-            preferred_fill_target=preferred_fill_target,
-        )
-    ):
-        current_selected_titles = _load_selected_titles(selected_for_package)
-        expanded_titles = _expand_selected_titles_from_scores(
-            selected_titles=current_selected_titles,
-            candidate_scores_path=scores_path,
-            target_count=_quality_rescue_target_count(
-                size=size,
-                current_selected_count=len(current_selected_titles),
-                terms=terms.terms,
-            ),
-        )
-        rescue_min_df = (
-            max(1, min_df - 1)
-            if _should_relax_min_df_for_quality_rescue(
-                size=size,
-                min_df=min_df,
-                terms=terms.terms,
-                solve_diagnostics=solve.diagnostics,
-                preferred_fill_target=preferred_fill_target,
-            )
-            else min_df
-        )
-        if len(expanded_titles) > len(current_selected_titles) or rescue_min_df != min_df:
-            expanded_selected_path = _write_selected_titles(
-                path=selected_quality_rescue_path,
-                seed_title=seed_title,
-                lang=lang,
-                titles=expanded_titles,
-            )
-            expanded_terms = run_term_extraction_stage(
-                seed_title=seed_title,
-                lang=lang,
-                cache_dir=cache_dir,
-                diagnostics_path=diagnostics_terms_rescue,
-                selected_path=expanded_selected_path,
-                terms_path=terms_path,
-                min_len=min_len,
-                max_len=max_len,
-                min_alpha_ratio=min_alpha_ratio,
-                min_df=rescue_min_df,
-                nlp_backend=nlp_backend,
-                entity_type_scoring=entity_type_scoring,
-                wikidata_cache_dir=wikidata_cache_dir,
-                lexicon_path=lexicon_path,
-                lexicon_weight=term_lexicon_weight,
-            )
-            expanded_gate = run_vocab_gate_stage(
-                seed_title=seed_title,
-                lang=lang,
-                diagnostics_path=diagnostics_gate,
-                terms_path=terms_path,
-                min_required=gate_min,
-                max_allowed=gate_max,
-            )
-            if skip_gate or expanded_gate.diagnostics.get("passed", False):
-                expanded_clues = run_clue_extraction_stage(
-                    seed_title=seed_title,
-                    lang=lang,
-                    cache_dir=cache_dir,
-                    diagnostics_path=diagnostics_clues,
-                    terms_path=terms_path,
-                    clues_path=clues_path,
-                    min_words=clue_min_words,
-                    max_words=clue_max_words,
-                    diversity_cap=diversity_cap,
-                )
-                expanded_topology = run_topology_selection_stage(
-                    seed_title=seed_title,
-                    lang=lang,
-                    terms_path=terms_path,
-                    diagnostics_path=diagnostics_topology,
-                    size=size,
-                    min_slot_len=min_slot_len,
-                    require_gate=not skip_gate,
-                    gate_min=gate_min,
-                    gate_max=gate_max,
-                )
-                expanded_template_for_csp = template_name
-                expanded_template_priority_names: list[str] | None = None
-                if expanded_template_for_csp is None and use_topology:
-                    expanded_template_priority_names = [
-                        row.get("template")
-                        for row in expanded_topology.diagnostics.get("scored", [])
-                        if row.get("template")
-                    ]
-                expanded_solve = run_csp_solve_stage(
-                    seed_title=seed_title,
-                    lang=lang,
-                    terms_path=terms_path,
-                    diagnostics_path=diagnostics_csp,
-                    grid_path=grid_path,
-                    size=size,
-                    min_slot_len=min_slot_len,
-                    template_name=expanded_template_for_csp,
-                    max_steps=max_steps,
-                    min_domain=min_domain,
-                    max_restarts=max_restarts,
-                    random_seed=random_seed,
-                    use_ac3=use_ac3,
-                    beam_width=beam_width,
-                    enable_local_repair=enable_local_repair,
-                    repair_steps=repair_steps,
-                    template_trials=template_trials,
-                    filler_path=filler_path,
-                    filler_min_len=filler_min_len,
-                    filler_max_len=filler_max_len,
-                    filler_max_per_length=filler_max_per_length,
-                    filler_weight=filler_weight,
-                    use_rust=use_rust,
-                    template_priority_names=expanded_template_priority_names,
-                    require_gate=not skip_gate,
-                    gate_min=gate_min,
-                    gate_max=gate_max,
-                    preferred_fill_target=preferred_fill_target,
-                )
-                if _solve_result_rank(expanded_solve.diagnostics) > _solve_result_rank(solve.diagnostics):
-                    selected_for_package = expanded_selected_path
-                    terms = expanded_terms
-                    gate = expanded_gate
-                    clues = expanded_clues
-                    topology = expanded_topology
-                    solve = expanded_solve
-                    current_template_priority_names = expanded_template_priority_names
-
-    if _should_retry_solve_budget(
-        solve_diagnostics=solve.diagnostics,
-        preferred_fill_target=preferred_fill_target,
-    ):
-        retried_solve = run_csp_solve_stage(
-            seed_title=seed_title,
-            lang=lang,
-            terms_path=terms_path,
-            diagnostics_path=diagnostics_csp,
-            grid_path=grid_path,
-            size=size,
-            min_slot_len=min_slot_len,
-            template_name=template_name,
-            max_steps=max(max_steps * 2, max_steps + 4000),
-            min_domain=min_domain,
-            max_restarts=max(max_restarts + 1, 2),
-            random_seed=random_seed + 907,
-            use_ac3=use_ac3,
-            beam_width=max(48, beam_width * 2),
-            enable_local_repair=enable_local_repair,
-            repair_steps=repair_steps,
-            template_trials=max(template_trials, 3),
-            filler_path=filler_path,
-            filler_min_len=filler_min_len,
-            filler_max_len=filler_max_len,
-            filler_max_per_length=filler_max_per_length,
-            filler_weight=filler_weight,
-            use_rust=use_rust,
-            template_priority_names=current_template_priority_names,
-            require_gate=not skip_gate,
-            gate_min=gate_min,
-            gate_max=gate_max,
-            preferred_fill_target=preferred_fill_target,
-        )
-        if _solve_result_rank(retried_solve.diagnostics) > _solve_result_rank(solve.diagnostics):
-            solve = retried_solve
 
     package = run_packaging_stage(
         seed_title=seed_title,
         lang=lang,
         selected_path=selected_for_package,
-        grid_path=grid_path,
+        grid_path=layout.grid_path,
         clues_path=clues_path,
-        puzzle_path=puzzle_path,
-        attribution_path=attribution_path,
-        diagnostics_path=diagnostics_package,
+        puzzle_path=output_dir / "puzzle.json",
+        attribution_path=output_dir / "attribution.json",
+        diagnostics_path=output_dir / "diagnostics_package.json",
+        gate_min=gate_min,
     )
 
     return {
@@ -3831,8 +2595,7 @@ def run_generate_pipeline(
         "gate": gate,
         "rescue": rescue_result,
         "clues": clues,
-        "topology": topology,
-        "solve": solve,
+        "layout": layout,
         "package": package,
         "output_dir": output_dir,
     }

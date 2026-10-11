@@ -46,8 +46,6 @@ def compute_jk(
     selected: list[int],
     weights: dict[str, float],
     term_scores: list[float] | None = None,
-    template_fit: float = 0.0,
-    fill_conflict: float = 0.0,
 ) -> dict[str, float]:
     coherence = coherence_score(rel_scores, selected)
     diversity = diversity_score(pairwise, selected)
@@ -55,18 +53,12 @@ def compute_jk(
     w1 = weights.get("w1", 1.0)
     w2 = weights.get("w2", 1.0)
     w3 = weights.get("w3", 1.0)
-    w4 = weights.get("w4", 0.5)
-    w5 = weights.get("w5", 0.5)
-    jk = (w1 * coherence) + (w2 * diversity) + (w3 * term_quality) + (w4 * template_fit) - (
-        w5 * fill_conflict
-    )
+    jk = (w1 * coherence) + (w2 * diversity) + (w3 * term_quality)
     return {
         "jk": jk,
         "coherence": coherence,
         "diversity": diversity,
         "term_quality": term_quality,
-        "template_fit": template_fit,
-        "fill_conflict": fill_conflict,
     }
 
 
@@ -81,11 +73,9 @@ def select_k(
     epsilon: float = 0.01,
     m: int = 2,
     term_scores: list[float] | None = None,
-    template_fit_by_k: list[float] | None = None,
-    fill_conflict_by_k: list[float] | None = None,
 ) -> KSelectionResult:
     if weights is None:
-        weights = {"w1": 1.0, "w2": 1.0, "w3": 1.0, "w4": 0.5, "w5": 0.5}
+        weights = {"w1": 1.0, "w2": 1.0, "w3": 1.0}
     if not ranked_indices:
         return KSelectionResult(selected_indices=[], selected_k=0, trace=[])
 
@@ -98,18 +88,12 @@ def select_k(
 
     for k in range(1, max_k + 1):
         selected = ranked_indices[:k]
-        template_fit = template_fit_by_k[k - 1] if template_fit_by_k and k - 1 < len(template_fit_by_k) else 0.0
-        fill_conflict = (
-            fill_conflict_by_k[k - 1] if fill_conflict_by_k and k - 1 < len(fill_conflict_by_k) else 0.0
-        )
         metrics = compute_jk(
             rel_scores=rel_scores,
             pairwise=pairwise,
             selected=selected,
             weights=weights,
             term_scores=term_scores,
-            template_fit=template_fit,
-            fill_conflict=fill_conflict,
         )
         jk = metrics["jk"]
         delta = None if prev_jk is None else jk - prev_jk

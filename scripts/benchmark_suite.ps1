@@ -8,7 +8,7 @@ if ($Offline) {
   $env:CROSSWORD_OFFLINE = "1"
 }
 
-python scripts/bench.py `
+py -3 scripts/bench.py `
   --seeds "$Seeds" `
   --lang en `
   --cache-dir data/cache/wiki `
@@ -20,8 +20,4 @@ python scripts/bench.py `
   --max-two-hop-links 60 `
   --max-candidates 1500 `
   --min-df 1 `
-  --gate-max 250 `
-  --grid-size 15 `
-  --min-slot-len 3 `
-  --max-steps 80000 `
-  --max-restarts 5
+  --grid-size 15

@@ -1,0 +1,121 @@
+{
+  "comment": "Gate A fixture. Pages are named by their resolved title, as the answer pool names them (the seed links to Roman roads as \"Roman road\" and to Oxford University Press as \"Clarendon Press\"). central = pages a puzzle on the topic should be able to use (chosen from subject knowledge before looking at any pipeline output; each is linked from the seed and is at most 3 words and 15 letters). off_theme = pages linked from the seed but unrelated to the topic. Ancient Rome is benchmarked with --max-links 200 (links[i * len(links) // 200]), so its central pages were chosen from that 200-link sample, the only pages that can reach the pool; its off-theme pages are drawn from the full link list and BBC News, Baltic Assembly and Anglosphere fall outside that sample.",
+  "seeds": {
+    "Thermodynamics": {
+      "central": [
+        "Entropy",
+        "Enthalpy",
+        "Heat",
+        "Temperature",
+        "Internal energy",
+        "Carnot cycle",
+        "Heat engine",
+        "Gibbs free energy",
+        "Pressure",
+        "Ideal gas",
+        "Rudolf Clausius",
+        "Absolute zero",
+        "Phase transition",
+        "Heat capacity",
+        "Heat pump"
+      ],
+      "off_theme": [
+        "Wayback Machine",
+        "Napoleonic Wars",
+        "English people",
+        "Sparkling wine",
+        "Tropical cyclone",
+        "Warm Spaces",
+        "Passive smoking",
+        "Economics"
+      ]
+    },
+    "Quantum mechanics": {
+      "central": [
+        "Wave function",
+        "Max Planck",
+        "Albert Einstein",
+        "Niels Bohr",
+        "Photon",
+        "Electron",
+        "Atom",
+        "Spin (physics)",
+        "Hilbert space",
+        "Born rule",
+        "Paul Dirac",
+        "Planck constant",
+        "Hydrogen atom",
+        "Matrix mechanics",
+        "Louis de Broglie"
+      ],
+      "off_theme": [
+        "Wayback Machine",
+        "The New York Times",
+        "Brussels",
+        "Greek language",
+        "Polymath",
+        "Oxford University Press",
+        "Pergamon Press",
+        "Princeton University Press"
+      ]
+    },
+    "Jazz": {
+      "central": [
+        "Miles Davis",
+        "Louis Armstrong",
+        "Bebop",
+        "Swing music",
+        "Saxophone",
+        "Duke Ellington",
+        "John Coltrane",
+        "New Orleans",
+        "Blues",
+        "Trumpet",
+        "Charlie Parker",
+        "Dizzy Gillespie",
+        "Ragtime",
+        "Big band",
+        "Cool jazz"
+      ],
+      "off_theme": [
+        "Catholic Church",
+        "Barcelona",
+        "Chicago Tribune",
+        "Forbes",
+        "Newsweek",
+        "Congo River",
+        "Hausa people",
+        "Northwestern University"
+      ]
+    },
+    "Ancient Rome": {
+      "central": [
+        "Roman emperor",
+        "Roman law",
+        "Praetorian Guard",
+        "Diocletian",
+        "Pax Romana",
+        "Palatine Hill",
+        "Constantinople",
+        "Third Punic War",
+        "Domitian",
+        "Commodus",
+        "Roman roads",
+        "Parthian Empire",
+        "SPQR",
+        "Cloaca Maxima",
+        "Principate"
+      ],
+      "off_theme": [
+        "Abolitionism",
+        "Wayback Machine",
+        "BBC News",
+        "Baltic Assembly",
+        "Anglosphere",
+        "Five Eyes",
+        "G7",
+        "Organization of American States"
+      ]
+    }
+  }
+}

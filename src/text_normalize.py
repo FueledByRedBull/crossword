@@ -24,3 +24,10 @@ def tokenize(text: str, *, lang: str = "en") -> list[str]:
         return _WORD_RE_EL.findall(cleaned)
     return _WORD_RE.findall(cleaned)
 
+
+def enumeration(display: str) -> str:
+    """Crossword letter-count notation: "Rock and roll" -> "4,3,4", "Synth-pop" -> "5-3"."""
+    joined = re.sub(r"(?<=\w)['\u2019](?=\w)", "", display)  # "Bell's" counts as 5
+    counted = re.sub(r"[^\W\d_]+", lambda match: str(len(match.group())), joined)
+    return re.sub(r"\s+", ",", re.sub(r"[^\d\s-]", "", counted).strip())
+

@@ -10,16 +10,15 @@ Build an end-to-end system that generates coherent, educational crossword puzzle
 2. Measuring semantic drift while controlling thematic creep.
 3. Choosing article count `K` from data (not a fixed constant).
 4. Extracting high-quality answers and robust clues.
-5. Selecting a grid topology that fits the vocabulary.
-6. Filling the grid with a constraint solver.
+5. Laying the clued answers out in a free-form crossword grid where words cross.
 
-The system should optimize for thematic coherence, fillability, clue quality, and reproducibility.
+The system should optimize for thematic coherence, layout quality, clue quality, and reproducibility.
 
 ## 2. Product Requirements
 
 ### Functional Requirements
 
-1. Accept a seed Wikipedia page title and grid parameters (`size`, optional symmetry, optional strictness profile).
+1. Accept a seed Wikipedia page title and grid parameters (`size`, layout search controls).
 2. Fetch outgoing links via MediaWiki API (no scraping).
 3. Optionally expand to bounded 2-hop candidates.
 4. Fetch article content and metadata for seed + candidates.
@@ -27,9 +26,9 @@ The system should optimize for thematic coherence, fillability, clue quality, an
 6. Select coherent-yet-diverse articles and derive optimal `K`.
 7. Extract, filter, and score crossword answer candidates using an explicit NLP backend strategy (`spaCy` default, `nltk` fallback).
 8. Support a `--lang` flag (`en` default, `el` for Greek) that switches the Wikipedia base URL, spaCy model, alphabet filter, and accent normalization profile.
-9. Generate clues through a strict four-pass clue pipeline.
-10. Evaluate multiple grid templates before CSP fill.
-11. Fill crossword with arc consistency + backtracking heuristics.
+9. Generate clues: definition clues from each article's first sentence, with fill-in-the-blank clues from article text as fallback, validated by a strict four-pass pipeline.
+10. Lay out the clued answers in a free-form grid (no templates, no filler words).
+11. Render a puzzle as text (`py -3 cli.py render --puzzle <path>`).
 12. Emit puzzle, diagnostics, and attribution/provenance artifacts.
 
 ### Non-Functional Requirements
@@ -53,11 +52,13 @@ The system should optimize for thematic coherence, fillability, clue quality, an
    - Pairwise coherence of selected set.
 2. Controlled diversity:
    - Novel information gain per selected article.
-3. Fillability:
-   - Usable answer pool size by length bucket.
-   - Successful full-grid fill rate.
+3. Layout quality:
+   - Usable answer pool size.
+   - Share of seeds with a valid layout (`fill_status == "complete"`).
+   - Crossings per word, share of words with two or more crossings, checked-letter ratio.
 4. Clue quality:
    - Clue leakage rate (exact term or morphological cousin appears in clue).
+   - Share of definition clues versus fill-in-the-blank clues.
    - Readability proxy (6-12 word clues preferred).
 5. Operational quality:
    - Runtime distribution.
@@ -67,10 +68,12 @@ The system should optimize for thematic coherence, fillability, clue quality, an
 
 ### Release Gates
 
-1. Gate A: Selection keeps thematically central pages and suppresses drift on benchmark seeds.
-2. Gate B: >=80% fill success on target grid family.
-3. Gate C: <=5% clue leakage and low duplicate clue collisions.
-4. Gate D: 100% clue attribution metadata present in output.
+1. Gate A: Selection keeps thematically central pages and suppresses drift on benchmark seeds. Every seed needs a fixture in `data/benchmarks/gate_a.json` and an answer pool, with `central_recall >= 0.75` and `off_theme_count == 0`, measured on the first source title of each row of `answer_candidates.csv`.
+2. Gate B: `fill_pass_rate >= 0.80` (share of seeds with `fill_status == "complete"`) and `valid_rate == 1.0` among seeds that produced a layout. An invalid layout never passes.
+3. Gate C: every seed graded, average leakage rate <= 5%, no duplicate clue text, no fill-in-the-blank clue missing its blank.
+4. Gate D: every seed graded and every used clue has attribution metadata.
+
+A seed is graded when it has `word_count > 0` and a known `puzzle_status`; Gates C and D fail closed otherwise. The release candidate passes when Gates A, B, C and D pass and `puzzle_ok_rate >= 0.80`.
 
 ## 4. End-to-End Pipeline
 
@@ -86,14 +89,13 @@ The system should optimize for thematic coherence, fillability, clue quality, an
 4. `K Optimization`:
    - Add candidates until crossword-aware marginal utility plateaus.
 5. `Term Extraction + Filtering`:
-   - Extract noun phrases/entities and apply quality filters.
+   - Take answers primarily from the titles of the most relevant linked articles, then from extracted noun phrases/entities, and apply quality filters.
 6. `Clue Generation`:
+   - Definition clue from the article's first sentence; fill-in-the-blank as fallback.
    - Four-pass extract/mask-trim/validate/diversity pipeline.
-7. `Grid Topology Selection`:
-   - Score 2-3 templates against word-length distribution and crossing potential.
-8. `CSP Fill`:
-   - Arc consistency + informed backtracking with forward checking.
-9. `Evaluation + Packaging`:
+7. `Free-Form Layout`:
+   - Place clued answers so they intersect where letters match (see 5.6).
+8. `Evaluation + Packaging`:
    - Produce puzzle artifacts, diagnostics, and provenance bundle.
    - Emit `diagnostics.json` from the first runnable stage, even before full pipeline completion.
 
@@ -164,7 +166,7 @@ Notes:
 
 1. Keep depth and backlink as soft features, not hard gates.
 2. Depth penalty only differentiates if 2-hop expansion is enabled.
-3. Retain borderline set for later fillability rescue.
+3. Retain borderline set for later vocabulary rescue.
 
 #### Outputs
 
@@ -175,13 +177,13 @@ Notes:
 
 #### Objective
 
-Choose `K` with diminishing returns while accounting for puzzle construction costs:
+Choose `K` with diminishing returns:
 
-`J(K) = w1*coherence + w2*diversity + w3*term_quality + w4*template_fit - w5*fill_conflict_cost`
+`J(K) = w1*coherence + w2*diversity + w3*term_quality`
 
 #### J(K) Weight Defaults (BASELINE_V1)
 
-`w1 = w2 = w3 = 1.0; w4 = 0.5; w5 = 0.5`. Rationale: equal weight on quality signals, half-weight on construction signals to prevent fillability from dominating semantic selection.
+`w1 = w2 = w3 = 1.0`. Rationale: equal weight on the three quality signals.
 
 #### Procedure
 
@@ -238,14 +240,14 @@ Additional notes:
 #### Quality Filters
 
 1. Basic crosswordability:
-   - Length range (default 4-12), high alphabetic ratio.
+   - Length range (default 4-15), high alphabetic ratio.
 2. Wikidata entity type preference:
    - Prioritize scientific concept, physical quantity, unit of measurement.
 3. Frequency floor across selected articles:
    - Prefer terms appearing in at least `min_df` selected pages.
    - Recommended adaptive default: `min_df = max(2, ceil(0.2*K))`.
 4. Answer shape scoring:
-   - Penalize low-fillability letter patterns early.
+   - Penalize low-crossability letter patterns early.
    - Treat shape as a score penalty, not a hard reject.
 5. Composite answer score:
    - Combine theme relevance, entity-type preference, frequency support, lead-bold prior, and shape penalty.
@@ -285,58 +287,30 @@ Additional notes:
 
 1. One canonical clue per answer plus confidence score.
 
-### 5.6 Step 6: Grid Topology as First-Class Variable
+### 5.6 Step 6: Free-Form Layout
 
-#### Candidate Templates
+Implemented in `src/layout.py`. Words are placed on a `size` x `size` grid so that they intersect where letters match; there are no templates, no black-square patterns, and no filler words.
 
-1. Generate/select 2-3 topology options (for example: more-open center vs tighter symmetric blocks).
-2. Support style families (for example American-style blocked, alternative blocked patterns).
+#### Validity Rules
 
-#### Topology Scoring
-
-Score each template before CSP using:
-
-1. Length-fit score:
-   - Match between slot length histogram and answer length histogram.
-2. Anchor suitability:
-   - Availability of enough long terms (9-12) for anchor slots.
-3. Short-fill coverage:
-   - Availability of enough 4-5 letter words for constrained regions.
-4. Crossing potential:
-   - Expected intersection quality from current pool.
-
-Choose highest-scoring topology prior to fill.
-
-### 5.7 Step 7: CSP Solver and Search Heuristics
-
-#### Model
-
-1. Variables: grid slots.
-2. Domains: remaining answer candidates matching slot length.
-3. Constraints:
-   - Intersection letter agreement.
-   - No duplicate answers.
-   - Optional theme density constraints.
+1. Every word crosses at least one other word.
+2. All words form one connected piece.
+3. Every run of two or more letters in a row or column is exactly one placed word.
 
 #### Search
 
-1. Arc consistency preprocessing (AC-3 or equivalent).
-2. Variable ordering:
-   - MRV first, degree as tie-break.
-3. Value ordering:
-   - Position-aware letter frequency at intersecting coordinates.
-4. Forward checking:
-   - After each placement, ensure each intersecting slot keeps >=1 valid candidate.
-   - Backtrack immediately on dead-end lookahead failure.
-5. Controlled restarts with shuffled value order for robustness.
+1. Start from one of a few high-scoring long answers and greedily add the placement with the most crossings (bounding-box growth and answer score break ties).
+2. Repeat for `layout_restarts` restarts with a different start word and noise; keep the layout with the most words, then most crossings. `layout_candidates` caps how many clued answers are offered to the layout.
 
 #### Outputs
 
-1. Completed grid (or best partial; partial fill is a first-class artifact, not a failure).
-2. Solver trace and failure reasons.
-3. `fill_status: complete | partial | failed`
-4. `fill_percent: float` (0.0-1.0)
-5. `unfilled_slots: list[{slot_id, direction, length, position}]`
+1. `grid.json` and `diagnostics_layout.json`.
+2. `fill_status: complete | failed` (`complete` means valid and at least `min_words` words).
+3. `validity_errors` (empty when valid) and the layout metrics: `word_count`, `across_count`, `down_count`, `crossing_count`, `mean_crossings_per_word`, `words_with_two_plus_crossings`, `two_plus_crossings_ratio`, `letter_count`, `checked_letter_ratio`, `bbox_rows`, `bbox_cols`, `density`.
+
+### 5.7 Step 7: Rendering
+
+`py -3 cli.py render --puzzle <path>` prints a `puzzle.json` as a text grid with numbered clues and a validity report.
 
 ### 5.8 Step 8: Attribution and Provenance
 
@@ -364,16 +338,20 @@ This is required for reliable CC BY-SA attribution in published outputs.
    - Candidate term extraction (`spaCy` primary, `nltk` fallback), lead-bold integration, and scoring.
 6. `src/clue_builder.py`:
    - Four-pass clue pipeline (including diversity) and leakage checks.
-7. `src/topology.py`:
-   - Template generation and topology fit scoring.
-8. `src/crossword_csp.py`:
-   - AC, backtracking, heuristics, restarts.
-9. `src/provenance.py`:
-   - Attribution capture and output validation.
-10. `src/pipeline.py`:
+7. `src/vocab_gate.py`:
+   - Vocabulary readiness gate.
+8. `src/layout.py`:
+   - Free-form layout search, validity checks, layout metrics.
+9. `src/render.py`:
+   - Text rendering of `puzzle.json`.
+10. `src/provenance.py`:
+    - Attribution capture and output validation.
+11. `src/evaluation.py`:
+    - Benchmark summaries and release gates.
+12. `src/pipeline.py`:
     - Stage orchestration.
-11. `cli.py`:
-    - User entry point.
+13. `cli.py`:
+    - User entry point (`generate`, `render`, per-stage commands).
 
 ## 7. Data Models
 
@@ -420,16 +398,17 @@ This is required for reliable CC BY-SA attribution in published outputs.
 2. `lang: str`
 3. `selected_articles: list`
 4. `selected_k: int`
-5. `grid_template_id: str`
-6. `grid_cells: list`
+5. `size: int`
+6. `grid_cells: list` (`size` x `size`, `#` = empty cell)
 7. `across_entries: list`
 8. `down_entries: list`
-9. `fill_status: str` (`complete | partial | failed`)
-10. `fill_percent: float`
-11. `unfilled_slots: list`
-12. `puzzle_status: str` (`ok | insufficient_vocabulary`)
-13. `diagnostics: dict`
-14. `attribution: list`
+9. `fill_status: str` (`complete | failed`)
+10. `puzzle_status: str` (`ok | insufficient_vocabulary | insufficient_clues | insufficient_quality`)
+11. `layout: dict` (the layout metrics)
+12. `diagnostics: dict`
+13. `attribution: list`
+
+Entry record: `number`, `answer`, `display_answer`, `enumeration`, `clue`, `clue_style` (`definition | fill_in_blank`), `clue_class`, `row`, `col`, `length`.
 
 ## 8. Implementation Backlog
 
@@ -472,26 +451,19 @@ This is required for reliable CC BY-SA attribution in published outputs.
 5. Add answer shape scoring.
 6. Implement four-pass clue pipeline (extract, mask, validate, diversity) with leakage validation.
 
-### Phase Gate: Vocabulary Readiness (Before 5a/5b)
+### Phase Gate: Vocabulary Readiness (Before Layout)
 
-1. Do not start topology/CSP work until word list quality gate passes.
+1. Do not start layout work until the word list quality gate passes.
 2. Gate criteria:
-   - 40-80 thematically coherent, crossword-friendly answers.
+   - At least `gate_min` (default 30) thematically coherent, crossword-friendly answers.
    - Acceptable clue quality/leakage on sampled entries.
    - Diagnostics support score-level auditing for kept/dropped terms.
 
-### Phase 5a: Grid Topology Selection
+### Phase 5: Free-Form Layout
 
-1. Implement topology template scoring.
-2. Validate length-distribution fit and anchor/short-fill coverage checks.
-3. Select and freeze template for downstream fill.
-
-### Phase 5b: CSP Search and Fill
-
-1. Integrate selected template into CSP stage.
-2. Implement AC-3, MRV/degree ordering, and position-aware letter scoring.
-3. Implement forward checking and immediate dead-end backtracking.
-4. Add restart policy and solver diagnostics.
+1. Implement greedy crossing-based placement with restarts.
+2. Implement layout validity checks and metrics.
+3. Implement text rendering (`render`).
 
 ### Phase 6: Provenance and Packaging
 
@@ -502,7 +474,7 @@ This is required for reliable CC BY-SA attribution in published outputs.
 ### Phase 7: Evaluation and Tuning
 
 1. Benchmark across seed sets.
-2. Tune weights and thresholds against coherence/fillability/clue metrics.
+2. Tune weights and thresholds against coherence/layout/clue metrics.
 3. Lock release defaults.
 
 ## 9. Testing Strategy
@@ -519,8 +491,8 @@ This is required for reliable CC BY-SA attribution in published outputs.
 8. Backend parity smoke test (`spaCy` vs `nltk` fallback behavior).
 9. Clue leakage rejection (exact + morphological cousin).
 10. Clue diversity bucketing and cap enforcement.
-11. Topology fit scoring.
-12. CSP forward-check dead-end detection.
+11. Layout validity rules (crossing, connectivity, every letter run is one word).
+12. Layout metrics and determinism for a fixed random seed.
 13. Attribution completeness validation.
 14. Cache key stability test for `(endpoint, params_hash)` addressing.
 15. Dependency/version pin check for `spaCy` and model package.
@@ -530,16 +502,15 @@ This is required for reliable CC BY-SA attribution in published outputs.
 1. End-to-end generation for benchmark seeds.
 2. Cached vs uncached consistency.
 3. API retry behavior under transient failures.
-4. Template selection stage stability independent of CSP.
-5. Template-selected CSP fill pipeline stability.
-6. Partial-fill output contains `fill_status` and `unfilled_slots`.
+4. Layout stage stability for a fixed random seed.
+5. Failed layouts emit `fill_status: failed`, `validity_errors` and `puzzle_status: insufficient_quality`.
 
 ### Quality Tests
 
 1. Thermodynamics benchmark keep/cut sanity.
 2. Secondary-domain benchmark keep/cut sanity (`Jazz` or `Ancient Rome`).
 3. Clue readability and leakage thresholds.
-4. Fill success regression suite by grid style.
+4. Layout validity and crossing-quality regression suite.
 5. Clue diversity bucket distribution check.
 
 ## 10. Operational Details
@@ -548,18 +519,17 @@ This is required for reliable CC BY-SA attribution in published outputs.
 
 1. Language: `lang` (`en` | `el`), controls Wikipedia URL, spaCy model, alphabet filter, accent normalization.
 2. Selection weights: `a`, `b`, `c`, `d` (see BASELINE_V1 defaults in Section 5.2).
-3. `J(K)` weights: `w1-w5` (see BASELINE_V1 defaults in Section 5.3).
+3. `J(K)` weights: `w1-w3` (see BASELINE_V1 defaults in Section 5.3).
 4. `K` optimization params: `epsilon`, `m`, `min_k`, `max_k`.
 5. Term filter params: length bounds, `min_df`, entity-type weights, shape penalty weight.
 6. Clue constraints: min/max words, leakage strictness, diversity bucket cap.
-7. Topology pool and template scoring weights.
-8. CSP limits: timeout, restart budget, backtrack cap.
+7. Layout limits: `size`, `layout_restarts`, `layout_candidates`, `min_words`.
 
 ### Weight Calibration Plan
 
-1. Start with documented defaults for `a,b,c,d` and `w1..w5` that bias relevance over novelty.
+1. Start with documented defaults for `a,b,c,d` and `w1..w3` that bias relevance over novelty.
 2. Run a small grid search over benchmark seeds with logged outcomes.
-3. Select weights that maximize coherence and fillability while keeping clue leakage under threshold.
+3. Select weights that maximize coherence and layout quality while keeping clue leakage under threshold.
 4. Record chosen defaults in diagnostics and configuration docs.
 
 ### CLI Example
@@ -601,7 +571,7 @@ python cli.py generate \
 2. Risk: link graph introduces topic drift.
    - Mitigation: depth penalty + backlink bonus + strict bounded 2-hop expansion.
 3. Risk: answer set is thematic but hard to fill.
-   - Mitigation: shape penalty, topology pre-scoring, conflict-aware `J(K)`.
+   - Mitigation: shape penalty, crossing-aware answer scoring, conflict-aware `J(K)`.
 4. Risk: extractor quality variance across domains.
    - Mitigation: `spaCy` default, `nltk` fallback, lead-bold structural priors, and benchmark-based calibration.
 5. Risk: clues are awkward or leaky.
@@ -610,8 +580,8 @@ python cli.py generate \
    - Mitigation: capture revid/span metadata at extraction time and enforce output validation.
 7. Risk: `J(K)` plateaus before sufficient vocabulary is available.
    - Mitigation: four-step rescue ladder (loosen min_df -> promote borderline -> 2-hop -> shorten min length) before failing gracefully.
-8. Risk: Greek accent variants break CSP intersection matching.
-   - Mitigation: strip diacritics at normalization time for grid/CSP; retain accented form only in display and clue text.
+8. Risk: Greek accent variants break layout intersection matching.
+   - Mitigation: strip diacritics at normalization time for the grid; retain accented form only in display and clue text.
 9. Risk: overfitting selection/weights to a single STEM seed.
    - Mitigation: tune and gate against at least two dissimilar seeds from the start.
 
@@ -627,9 +597,9 @@ python cli.py generate \
 4. Week 4:
    - Term extraction backends, structural signals, and clue pipeline.
 5. Week 5:
-   - Vocabulary readiness gate, then topology scorer and template selection.
+   - Vocabulary readiness gate, then free-form layout.
 6. Week 6:
-   - CSP heuristics, evaluation, tuning, attribution QA, release.
+   - Layout search, render, evaluation, tuning, attribution QA, release.
 
 ## 13. Acceptance Criteria
 
@@ -638,11 +608,10 @@ python cli.py generate \
 3. Chosen `K` is justified via logged marginal utility.
 4. Terms pass entity/frequency/shape quality controls with documented extraction method provenance.
 5. Clues pass mask/trim/validate checks with low leakage.
-6. Grid template is selected by fit score before solving.
-7. Topology/CSP starts only after vocabulary readiness gate passes.
-8. Solver uses forward checking and avoids known dead-end waste.
-9. Partial fills emit `fill_status` and `unfilled_slots` when incomplete.
-10. Every published clue includes stable source provenance.
+6. Layout starts only after the vocabulary readiness gate passes.
+7. Every layout is valid: each word crosses another, one connected piece, every run of 2+ letters is one placed word.
+8. A failed layout emits `fill_status: failed` and `validity_errors`, never a partial grid labelled ok.
+9. Every published clue includes stable source provenance.
 
 ## 14. Immediate Next Tasks (Execution Order)
 
@@ -651,9 +620,9 @@ python cli.py generate \
 3. Add lead-section boldface extraction via `mwparserfromhell` and storage.
 4. Select and fix benchmark seeds: `Thermodynamics` + one dissimilar domain (`Jazz` or `Ancient Rome`).
 5. Implement semantic scorer with depth/backlink-aware MMR ranking.
-6. Implement `K` optimizer with topology-fit and conflict-aware objective, plus thin-pool fallbacks.
+6. Implement `K` optimizer with a conflict-aware objective, plus thin-pool fallbacks.
 7. Implement term extraction (`spaCy` primary, `nltk` fallback) with entity/frequency/shape scoring.
 8. Implement four-pass clue builder (extract, mask, validate, diversity) with leakage checks.
-9. Gate topology/CSP start on vocabulary readiness criteria.
-10. Implement topology scorer (Phase 5a), then CSP solver integration and heuristics (Phase 5b).
+9. Gate layout start on vocabulary readiness criteria.
+10. Implement the free-form layout (Phase 5) and `render`.
 11. Add attribution persistence and validation in final output.

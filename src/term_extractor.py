@@ -69,34 +69,36 @@ STOPWORDS_EN = {
 }
 
 STOPWORDS_EL = {
-    "KAI",
-    "TO",
-    "THN",
-    "THS",
-    "TON",
-    "TA",
-    "TOU",
-    "ME",
-    "GIA",
-    "APO",
-    "SE",
-    "STO",
-    "STHN",
-    "STOUS",
-    "STIS",
-    "AUTO",
-    "AUTH",
-    "AUTOI",
-    "AUTES",
-    "TIS",
-    "ALL",
-    "ENA",
-    "ENAN",
-    "MIA",
-    "OTI",
-    "AN",
-    "EAN",
-    "OS",
+    "ΚΑΙ",
+    "ΤΟ",
+    "ΤΗΝ",
+    "ΤΗΣ",
+    "ΤΟΝ",
+    "ΤΑ",
+    "ΤΟΥ",
+    "ΤΟΥΣ",
+    "ΤΩΝ",
+    "ΜΕ",
+    "ΓΙΑ",
+    "ΑΠΟ",
+    "ΣΕ",
+    "ΣΤΟ",
+    "ΣΤΗΝ",
+    "ΣΤΟΥΣ",
+    "ΣΤΙΣ",
+    "ΑΥΤΟ",
+    "ΑΥΤΗ",
+    "ΑΥΤΟΙ",
+    "ΑΥΤΕΣ",
+    "ΤΙΣ",
+    "ΑΛΛΑ",
+    "ΕΝΑ",
+    "ΕΝΑΝ",
+    "ΜΙΑ",
+    "ΟΤΙ",
+    "ΑΝ",
+    "ΕΑΝ",
+    "ΩΣ",
 }
 
 LEADING_DETERMINERS_EN = {
@@ -132,11 +134,26 @@ GENERIC_GRID_JUNK_EN = {
     "USES",
     "WORK",
     "YEARS",
+    # Words that crowded earlier answer pools without being about any topic.
+    "ANOTHER",
+    "DEFINITION",
+    "EXAMPLE",
+    "GROUP",
+    "LIST",
+    "OTHER",
+    "OTHERS",
+    "RESULT",
+    "RESULTS",
+    "SERIES",
+    "STYLE",
+    "STYLES",
+    "TIME",
+    "WORLD",
 }
 
-from .text_normalize import normalize_text, strip_diacritics, tokenize
+from .text_normalize import strip_diacritics, tokenize  # noqa: E402
 
-RARE_LETTERS = {"Q", "X", "Z", "J"}
+RARE_LETTERS = {"Q", "X", "Z", "J", "Ξ", "Ζ", "Ψ"}
 MAX_NLP_TERM_TOKENS = 3
 
 
@@ -174,66 +191,17 @@ def _answer_tokens(text: str) -> list[str]:
     return [token for token in text.replace("’", "'").split() if token]
 
 
-def _normalize_answer(text: str, *, lang: str = "en") -> str:
-    normalized = normalize_text(text, lang=lang)
-    if lang == "el":
-        normalized = strip_diacritics(normalized)
-        normalized = normalized.translate(
-            str.maketrans(
-                {
-                    "Α": "A",
-                    "Β": "B",
-                    "Γ": "G",
-                    "Δ": "D",
-                    "Ε": "E",
-                    "Ζ": "Z",
-                    "Η": "H",
-                    "Θ": "TH",
-                    "Ι": "I",
-                    "Κ": "K",
-                    "Λ": "L",
-                    "Μ": "M",
-                    "Ν": "N",
-                    "Ξ": "X",
-                    "Ο": "O",
-                    "Π": "P",
-                    "Ρ": "R",
-                    "Σ": "S",
-                    "Τ": "T",
-                    "Υ": "Y",
-                    "Φ": "F",
-                    "Χ": "CH",
-                    "Ψ": "PS",
-                    "Ω": "O",
-                    "α": "a",
-                    "β": "b",
-                    "γ": "g",
-                    "δ": "d",
-                    "ε": "e",
-                    "ζ": "z",
-                    "η": "h",
-                    "θ": "th",
-                    "ι": "i",
-                    "κ": "k",
-                    "λ": "l",
-                    "μ": "m",
-                    "ν": "n",
-                    "ξ": "x",
-                    "ο": "o",
-                    "π": "p",
-                    "ρ": "r",
-                    "σ": "s",
-                    "ς": "s",
-                    "τ": "t",
-                    "υ": "y",
-                    "φ": "f",
-                    "χ": "ch",
-                    "ψ": "ps",
-                    "ω": "o",
-                }
-            )
-        )
-    return "".join(ch for ch in normalized if ch.isalpha()).upper()
+def _normalize_answer(text: str) -> str:
+    """Letters only, upper case, accents removed: Θερμότητα -> ΘΕΡΜΟΤΗΤΑ (Greek stays Greek)."""
+    return "".join(ch for ch in strip_diacritics(text) if ch.isalpha()).upper()
+
+
+_ALPHABET = {"en": re.compile(r"[A-Z]+"), "el": re.compile(r"[Α-Ω]+")}
+
+
+def _in_alphabet(normalized: str, lang: str) -> bool:
+    """False for any letter outside the language's own alphabet ("Μηχανή Carnot", "Søren")."""
+    return _ALPHABET[lang].fullmatch(normalized) is not None
 
 
 def shape_penalty(normalized: str) -> float:
@@ -305,32 +273,36 @@ def clueability_score(answer: str, normalized: str, *, lang: str = "en") -> floa
     )
 
 
-def genericness_penalty(
-    answer: str,
-    normalized: str,
-    *,
-    lang: str = "en",
-    lexicon_score: float = 0.0,
-    lead_bold_signal: bool = False,
-    title_support_score: float = 0.0,
-    source_title_count: int = 1,
-    support_sentence_count: int = 0,
-) -> float:
-    if lang != "en" or not normalized:
-        return 0.0
-    if " " in answer.strip():
-        return 0.0
-    if normalized not in GENERIC_GRID_JUNK_EN:
-        return 0.0
-    if lead_bold_signal or title_support_score >= 0.5 or source_title_count >= 2 or support_sentence_count > 0:
-        return 0.0
+_NON_TOPIC_TITLE_PREFIXES = ("list of", "outline of", "index of", "timeline of", "glossary of")
+_TITLE_PUNCTUATION = " -'\u2019."
+_TITLE_DISAMBIGUATOR = re.compile(r"\s*\([^)]*\)\s*$")
 
-    penalty = 0.35
-    if lexicon_score >= 0.7:
-        penalty += 0.25
-    elif lexicon_score >= 0.45:
-        penalty += 0.15
-    return min(0.75, penalty)
+
+def title_to_answer(title: str, *, lang: str = "en", max_len: int = 15) -> tuple[str, str] | None:
+    """Return (display, normalized) when an article title can serve as a crossword answer."""
+    if title.lower().startswith(_NON_TOPIC_TITLE_PREFIXES):
+        return None
+    display = _TITLE_DISAMBIGUATOR.sub("", title).strip()
+    if not display or len(display.split()) > 3 or not all(ch.isalpha() or ch in _TITLE_PUNCTUATION for ch in display):
+        return None
+    normalized = _normalize_answer(display)
+    if not 3 <= len(normalized) <= max_len or not _in_alphabet(normalized, lang):
+        return None
+    if lang == "en" and normalized in GENERIC_GRID_JUNK_EN:
+        return None
+    return display, normalized
+
+
+def merge_plural_duplicates(rows: list[dict]) -> list[dict]:
+    """Drop the weaker of X and XS/XES; the singular wins ties."""
+    by_key = {row["normalized_answer"]: row for row in rows}
+    dropped: set[str] = set()
+    for key, row in by_key.items():
+        for suffix in ("S", "ES"):
+            singular = by_key.get(key[: -len(suffix)]) if key.endswith(suffix) else None
+            if singular is not None:
+                dropped.add(key if singular["answer_score"] >= row["answer_score"] else singular["normalized_answer"])
+    return [row for row in rows if row["normalized_answer"] not in dropped]
 
 
 def _clean_answer_text(text: str, *, lang: str = "en") -> str:
@@ -354,8 +326,8 @@ def _build_term_candidate(
     raw = _clean_answer_text(text, lang=lang)
     if not raw:
         return None
-    normalized = _normalize_answer(raw, lang=lang)
-    if not normalized:
+    normalized = _normalize_answer(raw)
+    if not _in_alphabet(normalized, lang):
         return None
     return TermCandidate(
         answer=raw,
@@ -586,13 +558,7 @@ def term_frequency_across_docs(
     for doc in docs:
         tokens = set(tokenize(doc, lang=lang))
         for term in tokens:
-            if lang == "el":
-                normalized = _normalize_answer(term, lang=lang)
-            else:
-                normalized = term.upper()
-            if not normalized:
-                continue
-            df[normalized] = df.get(normalized, 0) + 1
+            df[term.upper()] = df.get(term.upper(), 0) + 1
     return df
 
 

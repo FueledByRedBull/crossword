@@ -3,35 +3,36 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import asdict, dataclass
 
+RELEASE_MIN_SEED_PASS_RATE = 0.80
+MAX_AVERAGE_LEAKAGE_RATE = 0.05
+MIN_CENTRAL_RECALL = 0.75
+
 
 @dataclass
 class BenchmarkResult:
     seed: str
-    solver_backend: str
     puzzle_status: str
     pipeline_errors: list[str]
     candidate_count: int
     selected_k: int
     term_count: int
     clue_count: int
+    fill_status: str
+    valid: bool
+    word_count: int
+    crossing_count: int
+    mean_crossings_per_word: float
+    two_plus_crossings_ratio: float
+    checked_letter_ratio: float
+    definition_clue_ratio: float
+    blank_missing_count: int
+    duplicate_clue_count: int
     leakage_count: int
     leakage_rate: float
-    fill_status: str
-    fill_percent: float
-    filler_used_ratio: float
-    clued_entry_ratio: float
-    source_backed_entry_ratio: float
-    used_source_backed_entry_ratio: float
-    fallback_only_entry_count: int
-    fallback_only_entry_ratio: float
-    used_template_fallback_entry_ratio: float
-    long_slot_theme_ratio: float
-    quality_objective: float
-    provenance_missing_count: int
     used_clue_provenance_missing_count: int
-    synthetic_filler_clue_count: int
-    packaged_synthetic_filler_count: int
-    preferred_fill_target: float
+    gate_a_graded: bool = False
+    central_recall: float = 0.0
+    off_theme_count: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -40,23 +41,28 @@ class BenchmarkResult:
 @dataclass
 class BenchmarkAggregate:
     seed_count: int
-    backend_counts: dict[str, int]
     fill_status_counts: dict[str, int]
     puzzle_status_counts: dict[str, int]
-    average_fill_percent: float
-    average_filler_used_ratio: float
-    average_long_slot_theme_ratio: float
-    average_clued_entry_ratio: float
-    average_source_backed_entry_ratio: float
-    average_fallback_only_entry_ratio: float
-    average_used_source_backed_entry_ratio: float
-    average_used_template_fallback_entry_ratio: float
-    average_synthetic_filler_clue_count: float
-    average_packaged_synthetic_filler_count: float
-    average_used_clue_provenance_missing_count: float
+    average_word_count: float
+    average_crossing_count: float
+    average_mean_crossings_per_word: float
+    average_two_plus_crossings_ratio: float
+    average_checked_letter_ratio: float
+    average_definition_clue_ratio: float
     average_leakage_rate: float
+    average_used_clue_provenance_missing_count: float
+    average_central_recall: float
+    off_theme_total: int
+    blank_missing_count: int
+    duplicate_clue_count: int
+    valid_rate: float
     fill_pass_rate: float
     puzzle_ok_rate: float
+    gate_a_pass: bool
+    gate_b_pass: bool
+    gate_c_pass: bool
+    gate_d_pass: bool
+    release_candidate_pass: bool
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -65,43 +71,28 @@ class BenchmarkAggregate:
 def summarize_benchmark(payload: dict) -> BenchmarkResult:
     return BenchmarkResult(
         seed=payload.get("seed", ""),
-        solver_backend=payload.get("solver_backend", "python"),
         puzzle_status=payload.get("puzzle_status", "unknown"),
         pipeline_errors=payload.get("pipeline_errors", []),
         candidate_count=payload.get("candidate_count", 0),
         selected_k=payload.get("selected_k", 0),
         term_count=payload.get("term_count", 0),
         clue_count=payload.get("clue_count", 0),
+        fill_status=payload.get("fill_status", "failed"),
+        valid=payload.get("valid", False),
+        word_count=payload.get("word_count", 0),
+        crossing_count=payload.get("crossing_count", 0),
+        mean_crossings_per_word=payload.get("mean_crossings_per_word", 0.0),
+        two_plus_crossings_ratio=payload.get("two_plus_crossings_ratio", 0.0),
+        checked_letter_ratio=payload.get("checked_letter_ratio", 0.0),
+        definition_clue_ratio=payload.get("definition_clue_ratio", 0.0),
+        blank_missing_count=payload.get("blank_missing_count", 0),
+        duplicate_clue_count=payload.get("duplicate_clue_count", 0),
         leakage_count=payload.get("leakage_count", 0),
         leakage_rate=payload.get("leakage_rate", 0.0),
-        fill_status=payload.get("fill_status", "failed"),
-        fill_percent=payload.get("fill_percent", 0.0),
-        filler_used_ratio=payload.get("filler_used_ratio", 0.0),
-        clued_entry_ratio=payload.get("clued_entry_ratio", 0.0),
-        source_backed_entry_ratio=payload.get("source_backed_entry_ratio", 0.0),
-        used_source_backed_entry_ratio=payload.get(
-            "used_source_backed_entry_ratio",
-            payload.get("source_backed_entry_ratio", 0.0),
-        ),
-        fallback_only_entry_count=payload.get("fallback_only_entry_count", 0),
-        fallback_only_entry_ratio=payload.get("fallback_only_entry_ratio", 0.0),
-        used_template_fallback_entry_ratio=payload.get(
-            "used_template_fallback_entry_ratio",
-            payload.get("fallback_only_entry_ratio", 0.0),
-        ),
-        long_slot_theme_ratio=payload.get("long_slot_theme_ratio", 0.0),
-        quality_objective=payload.get("quality_objective", 0.0),
-        provenance_missing_count=payload.get("provenance_missing_count", 0),
-        used_clue_provenance_missing_count=payload.get(
-            "used_clue_provenance_missing_count",
-            payload.get("provenance_missing_count", 0),
-        ),
-        synthetic_filler_clue_count=payload.get("synthetic_filler_clue_count", 0),
-        packaged_synthetic_filler_count=payload.get(
-            "packaged_synthetic_filler_count",
-            payload.get("synthetic_filler_clue_count", 0),
-        ),
-        preferred_fill_target=payload.get("preferred_fill_target", 0.85),
+        used_clue_provenance_missing_count=payload.get("used_clue_provenance_missing_count", 0),
+        gate_a_graded=payload.get("gate_a_graded", False),
+        central_recall=payload.get("central_recall", 0.0),
+        off_theme_count=payload.get("off_theme_count", 0),
     )
 
 
@@ -110,60 +101,71 @@ def summarize_benchmark_collection(results: list[dict] | list[BenchmarkResult]) 
         result if isinstance(result, BenchmarkResult) else summarize_benchmark(result)
         for result in results
     ]
-    if not normalized:
-        return BenchmarkAggregate(
-            seed_count=0,
-            backend_counts={},
-            fill_status_counts={},
-            puzzle_status_counts={},
-            average_fill_percent=0.0,
-            average_filler_used_ratio=0.0,
-            average_long_slot_theme_ratio=0.0,
-            average_clued_entry_ratio=0.0,
-            average_source_backed_entry_ratio=0.0,
-            average_fallback_only_entry_ratio=0.0,
-            average_used_source_backed_entry_ratio=0.0,
-            average_used_template_fallback_entry_ratio=0.0,
-            average_synthetic_filler_clue_count=0.0,
-            average_packaged_synthetic_filler_count=0.0,
-            average_used_clue_provenance_missing_count=0.0,
-            average_leakage_rate=0.0,
-            fill_pass_rate=0.0,
-            puzzle_ok_rate=0.0,
-        )
-
     count = len(normalized)
-    backend_counts = Counter(result.solver_backend for result in normalized)
-    fill_status_counts = Counter(result.fill_status for result in normalized)
-    puzzle_status_counts = Counter(result.puzzle_status for result in normalized)
-    fill_pass_count = sum(1 for result in normalized if result.fill_status in {"partial", "complete"})
-    puzzle_ok_count = sum(1 for result in normalized if result.puzzle_status == "ok")
+
+    def average(field: str) -> float:
+        return sum(getattr(result, field) for result in normalized) / count if count else 0.0
+
+    def rate(flags: list[bool]) -> float:
+        return sum(flags) / len(flags) if flags else 0.0
+
+    laid_out = [result for result in normalized if result.word_count > 0]
+    valid_rate = rate([result.valid for result in laid_out])
+    fill_pass_rate = rate([result.fill_status == "complete" for result in normalized])
+    puzzle_ok_rate = rate([result.puzzle_status == "ok" for result in normalized])
+    blank_missing_count = sum(result.blank_missing_count for result in normalized)
+    duplicate_clue_count = sum(result.duplicate_clue_count for result in normalized)
+    average_leakage_rate = average("leakage_rate")
+    provenance_missing = sum(result.used_clue_provenance_missing_count for result in normalized)
+    off_theme_total = sum(result.off_theme_count for result in normalized)
+    # Gates fail closed: a seed with no layout or no packaging diagnostics has nothing to grade.
+    graded = count > 0 and all(
+        result.word_count > 0 and result.puzzle_status != "unknown" for result in normalized
+    )
+    # An invalid layout must never pass, so B needs every laid-out seed valid.
+    gate_b_pass = fill_pass_rate >= RELEASE_MIN_SEED_PASS_RATE and bool(laid_out) and valid_rate == 1.0
+    gate_c_pass = (
+        graded
+        and average_leakage_rate <= MAX_AVERAGE_LEAKAGE_RATE
+        and blank_missing_count == 0
+        and duplicate_clue_count == 0
+    )
+    gate_d_pass = graded and provenance_missing == 0
+    # A needs a fixture and a pool for every seed, each seed above the recall bar, and no off-theme page.
+    gate_a_pass = (
+        count > 0
+        and all(result.gate_a_graded and result.central_recall >= MIN_CENTRAL_RECALL for result in normalized)
+        and off_theme_total == 0
+    )
 
     return BenchmarkAggregate(
         seed_count=count,
-        backend_counts=dict(backend_counts),
-        fill_status_counts=dict(fill_status_counts),
-        puzzle_status_counts=dict(puzzle_status_counts),
-        average_fill_percent=sum(result.fill_percent for result in normalized) / count,
-        average_filler_used_ratio=sum(result.filler_used_ratio for result in normalized) / count,
-        average_long_slot_theme_ratio=sum(result.long_slot_theme_ratio for result in normalized) / count,
-        average_clued_entry_ratio=sum(result.clued_entry_ratio for result in normalized) / count,
-        average_source_backed_entry_ratio=sum(result.source_backed_entry_ratio for result in normalized) / count,
-        average_fallback_only_entry_ratio=sum(result.fallback_only_entry_ratio for result in normalized) / count,
-        average_used_source_backed_entry_ratio=sum(
-            result.used_source_backed_entry_ratio for result in normalized
-        ) / count,
-        average_used_template_fallback_entry_ratio=sum(
-            result.used_template_fallback_entry_ratio for result in normalized
-        ) / count,
-        average_synthetic_filler_clue_count=sum(result.synthetic_filler_clue_count for result in normalized) / count,
-        average_packaged_synthetic_filler_count=sum(
-            result.packaged_synthetic_filler_count for result in normalized
-        ) / count,
-        average_used_clue_provenance_missing_count=sum(
-            result.used_clue_provenance_missing_count for result in normalized
-        ) / count,
-        average_leakage_rate=sum(result.leakage_rate for result in normalized) / count,
-        fill_pass_rate=fill_pass_count / count,
-        puzzle_ok_rate=puzzle_ok_count / count,
+        fill_status_counts=dict(Counter(result.fill_status for result in normalized)),
+        puzzle_status_counts=dict(Counter(result.puzzle_status for result in normalized)),
+        average_word_count=average("word_count"),
+        average_crossing_count=average("crossing_count"),
+        average_mean_crossings_per_word=average("mean_crossings_per_word"),
+        average_two_plus_crossings_ratio=average("two_plus_crossings_ratio"),
+        average_checked_letter_ratio=average("checked_letter_ratio"),
+        average_definition_clue_ratio=average("definition_clue_ratio"),
+        average_leakage_rate=average_leakage_rate,
+        average_used_clue_provenance_missing_count=average("used_clue_provenance_missing_count"),
+        average_central_recall=average("central_recall"),
+        off_theme_total=off_theme_total,
+        blank_missing_count=blank_missing_count,
+        duplicate_clue_count=duplicate_clue_count,
+        valid_rate=valid_rate,
+        fill_pass_rate=fill_pass_rate,
+        puzzle_ok_rate=puzzle_ok_rate,
+        gate_a_pass=gate_a_pass,
+        gate_b_pass=gate_b_pass,
+        gate_c_pass=gate_c_pass,
+        gate_d_pass=gate_d_pass,
+        release_candidate_pass=(
+            gate_a_pass
+            and gate_b_pass
+            and gate_c_pass
+            and gate_d_pass
+            and puzzle_ok_rate >= RELEASE_MIN_SEED_PASS_RATE
+        ),
     )
