@@ -46,6 +46,11 @@ def _sources(puzzle: dict) -> dict[str, str]:
     return {a["source_page"]: a["oldid_url"] for a in puzzle.get("attribution", []) if a.get("source_page")}
 
 
+def _text(value: str) -> str:
+    """ipuz display strings are HTML, and this text comes from Wikipedia: it must show as written."""
+    return escape(value, quote=False)
+
+
 def export_ipuz(puzzle: dict) -> str:
     # Blocks are "#" (not null): every solving app understands them, null cells are patchy.
     # Cropped to the letters' bounding box so a 15x15 grid does not carry empty margins.
@@ -54,9 +59,9 @@ def export_ipuz(puzzle: dict) -> str:
     ipuz = {
         "version": "http://ipuz.org/v2",
         "kind": ["http://ipuz.org/crossword#1"],
-        "title": puzzle.get("seed_title", "Crossword"),
+        "title": _text(str(puzzle.get("seed_title", "Crossword"))),
         "copyright": f"Clues adapted from Wikipedia, licensed CC BY-SA 4.0 ({_LICENSE})",
-        "notes": "Sources: " + "; ".join(f"{page} <{url}>" for page, url in sources.items()),
+        "notes": "Sources: " + "; ".join(f"{_text(page)} ({_text(url)})" for page, url in sources.items()),
         "dimensions": {"width": len(grid[0]), "height": len(grid)},
         "block": "#",
         "empty": 0,
@@ -67,7 +72,7 @@ def export_ipuz(puzzle: dict) -> str:
         "solution": [[ch or "#" for ch in row] for row in grid],
         "clues": {
             name: [
-                {"number": e["number"], "clue": e.get("clue", ""), "enumeration": _enumeration(e)}
+                {"number": e["number"], "clue": _text(e.get("clue", "")), "enumeration": _enumeration(e)}
                 for e in _clues(puzzle, key)
             ]
             for name, key in (("Across", "across_entries"), ("Down", "down_entries"))

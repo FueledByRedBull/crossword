@@ -148,7 +148,13 @@ Per-seed checks in `tests/test_generate_integration.py`:
 - no clue contains its answer, no duplicate clue text, no fill-in-the-blank clue missing its blank
 - no used clue missing provenance
 
-The benchmark runner writes per-seed results and a top-level `aggregate` block to `benchmarks_summary.json`. Leakage, blank and duplicate counts are computed over the entries in `puzzle.json`, so they describe the clues actually used.
+The benchmark runner writes per-seed results and a top-level `aggregate` block (with the release gates below) to `benchmarks_summary.json`. Leakage, blank and duplicate counts are computed over the entries in `puzzle.json`, so they describe the clues actually used.
+
+```powershell
+.\scripts\benchmark_suite.ps1 -Offline
+```
+
+runs the four corpus seeds from the cache through `scripts/bench.py`. A seed whose Gate A fixture carries `max_links` (Ancient Rome: 200) is run on that link sample; the other seeds use `--max-links`.
 
 ## Release Gates
 

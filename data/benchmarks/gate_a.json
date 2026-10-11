@@ -1,5 +1,5 @@
 {
-  "comment": "Gate A fixture. Pages are named by their resolved title, as the answer pool names them (the seed links to Roman roads as \"Roman road\" and to Oxford University Press as \"Clarendon Press\"). central = pages a puzzle on the topic should be able to use (chosen from subject knowledge before looking at any pipeline output; each is linked from the seed and is at most 3 words and 15 letters). off_theme = pages linked from the seed but unrelated to the topic. Ancient Rome is benchmarked with --max-links 200 (links[i * len(links) // 200]), so its central pages were chosen from that 200-link sample, the only pages that can reach the pool; its off-theme pages are drawn from the full link list and BBC News, Baltic Assembly and Anglosphere fall outside that sample.",
+  "comment": "Gate A fixture. Pages are named by their resolved title, as the answer pool names them (the seed links to Roman roads as \"Roman road\" and to Oxford University Press as \"Clarendon Press\"). central = pages a puzzle on the topic should be able to use (chosen from subject knowledge before looking at any pipeline output; each is linked from the seed and is at most 3 words and 15 letters). off_theme = pages linked from the seed but unrelated to the topic. max_links = the link cap scripts/bench.py applies to that seed. Ancient Rome is benchmarked on 200 of its 2,193 links (links[i * len(links) // 200]), so its central pages were chosen from that 200-link sample, the only pages that can reach the pool; its off-theme pages are drawn from the full link list and BBC News, Baltic Assembly and Anglosphere fall outside that sample.",
   "seeds": {
     "Thermodynamics": {
       "central": [
@@ -89,6 +89,7 @@
       ]
     },
     "Ancient Rome": {
+      "max_links": 200,
       "central": [
         "Roman emperor",
         "Roman law",

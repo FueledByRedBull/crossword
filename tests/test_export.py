@@ -30,8 +30,12 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(len(data["clues"]["Across"]), 1)
         self.assertEqual(len(data["clues"]["Down"]), 1)
         across = data["clues"]["Across"][0]
-        self.assertEqual(across, {"number": 1, "clue": "Pet with <b>claws</b> & fur", "enumeration": "3"})
-        self.assertIn("Cat (animal)", data["notes"])
+        # ipuz display strings are HTML: Wikipedia text is escaped so a reader shows it as written.
+        self.assertEqual(across, {"number": 1, "clue": "Pet with &lt;b&gt;claws&lt;/b&gt; &amp; fur", "enumeration": "3"})
+        self.assertEqual(data["title"], "Cats &amp; &lt;Dogs&gt;")
+        self.assertIn("Cat (animal) (https://en.wikipedia.org/w/index.php?title=Cat&amp;oldid=1)", data["notes"])
+        self.assertIn("Car &amp; Co", data["notes"])
+        self.assertNotIn("<", data["notes"])
         self.assertIn("CC BY-SA", data["copyright"])
         # every number sits on its entry's start cell and the solution spells the answer
         for key, step in (("Across", (0, 1)), ("Down", (1, 0))):

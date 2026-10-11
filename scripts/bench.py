@@ -89,7 +89,8 @@ def run_benchmark(seed: str, args: argparse.Namespace, fixtures: dict) -> dict:
         cache_dir=args.cache_dir,
         wikidata_cache_dir=args.wikidata_cache_dir,
         include_backlinks=not args.no_backlinks,
-        max_links=args.max_links,
+        # A fixture written for a sample of the seed's links (Ancient Rome) is only valid on that sample.
+        max_links=fixtures.get(seed, {}).get("max_links", args.max_links),
         max_backlinks=args.max_backlinks,
         expansion=args.expansion,
         max_two_hop_parents=args.max_two_hop_parents,
