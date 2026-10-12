@@ -1,0 +1,214 @@
+{
+  "comment": "Held-out Gate A fixture: seeds that were never run while the relevance and clue rules were written (first run on 2026-10-12). Same format and rules as gate_a.json; pages are named by their resolved title. central and off_theme were chosen from each seed's link list by subject knowledge, before any pipeline output for these seeds existed. Measure with scripts/bench.py --gate-a-fixture data/benchmarks/held_out.json and the seeds of one language at a time. Do not tune rules on these seeds: a rule that needs one of them as its example belongs in gate_a.json's seeds instead.",
+  "seeds": {
+    "Evolution": {
+      "lang": "en",
+      "central": [
+        "Charles Darwin",
+        "Gregor Mendel",
+        "Ernst Mayr",
+        "Mutation",
+        "Adaptation",
+        "Speciation",
+        "Fossil",
+        "Genetic drift",
+        "Gene flow",
+        "Sexual selection",
+        "Darwin's finches",
+        "Extinction",
+        "Allele",
+        "Phenotype",
+        "Lamarckism"
+      ],
+      "off_theme": [
+        "Associated Press",
+        "BBC",
+        "Hoboken, New Jersey",
+        "Excite (web portal)",
+        "Chichester",
+        "Citric acid",
+        "Graphite",
+        "Cambridge, Massachusetts"
+      ]
+    },
+    "Chess": {
+      "lang": "en",
+      "central": [
+        "Checkmate",
+        "Stalemate",
+        "Castling",
+        "En passant",
+        "Gambit",
+        "Zugzwang",
+        "Garry Kasparov",
+        "Bobby Fischer",
+        "Magnus Carlsen",
+        "Paul Morphy",
+        "Boris Spassky",
+        "Sicilian Defence",
+        "Ruy Lopez",
+        "Shogi",
+        "Elo rating system"
+      ],
+      "off_theme": [
+        "Oxford University Press",
+        "Princeton University Press",
+        "Olympic Games",
+        "Google Play Store",
+        "Los Angeles Times",
+        "World War I",
+        "Northwestern University",
+        "University of Göttingen"
+      ]
+    },
+    "Volcano": {
+      "lang": "en",
+      "central": [
+        "Lava",
+        "Magma",
+        "Caldera",
+        "Volcanic ash",
+        "Pyroclastic flow",
+        "Plate tectonics",
+        "Mount Vesuvius",
+        "Mount Etna",
+        "Mount Pinatubo",
+        "Mauna Loa",
+        "Pompeii",
+        "Geyser",
+        "Tephra",
+        "Ring of Fire",
+        "Cinder cone"
+      ],
+      "off_theme": [
+        "Bridge",
+        "Canal",
+        "Turbine",
+        "Jet aircraft",
+        "Risk management",
+        "Probability theory",
+        "American English",
+        "Princeton University Press"
+      ]
+    },
+    "Cryptography": {
+      "lang": "en",
+      "central": [
+        "Cipher",
+        "Encryption",
+        "Hash function",
+        "Caesar cipher",
+        "Enigma machine",
+        "Claude Shannon",
+        "Whitfield Diffie",
+        "Ron Rivest",
+        "Adi Shamir",
+        "One-time pad",
+        "Cryptanalysis",
+        "Steganography",
+        "Plaintext",
+        "Bletchley Park"
+      ],
+      "off_theme": [
+        "Bill Clinton",
+        "Kazakhstan",
+        "Singapore",
+        "Tunisia",
+        "Belarus",
+        "Sacred geometry",
+        "Numerology",
+        "The Denver Post"
+      ]
+    },
+    "Opera": {
+      "lang": "en",
+      "central": [
+        "Aria",
+        "Libretto",
+        "Overture",
+        "Recitative",
+        "Soprano",
+        "Castrato",
+        "Giuseppe Verdi",
+        "Richard Wagner",
+        "Giacomo Puccini",
+        "Georges Bizet",
+        "La Scala",
+        "Carmen",
+        "La traviata",
+        "Maria Callas",
+        "Rigoletto"
+      ],
+      "off_theme": [
+        "Louvre",
+        "Germanic paganism",
+        "Libel",
+        "Magic (illusion)",
+        "Napoleonic Wars",
+        "Project Gutenberg",
+        "Wayback Machine",
+        "The Independent"
+      ]
+    },
+    "Μαθηματικά": {
+      "lang": "el",
+      "central": [
+        "Άλγεβρα",
+        "Γεωμετρία",
+        "Θεωρία αριθμών",
+        "Ευκλείδης",
+        "Πυθαγόρας",
+        "Ισαάκ Νεύτων",
+        "Θεώρημα",
+        "Μαθηματική απόδειξη",
+        "Αξίωμα",
+        "Εξίσωση",
+        "Πρώτος αριθμός",
+        "Τοπολογία",
+        "Ολοκλήρωμα",
+        "Θεωρία συνόλων",
+        "Κουρτ Γκέντελ"
+      ],
+      "off_theme": [
+        "Κικέρων",
+        "Μάγια",
+        "Οικολογία",
+        "Χριστιανισμός",
+        "Βιολογία",
+        "Βόρεια Αμερική",
+        "Ιατρική",
+        "Wayback Machine"
+      ]
+    },
+    "Φιλοσοφία": {
+      "lang": "el",
+      "central": [
+        "Πλάτων",
+        "Αριστοτέλης",
+        "Σωκράτης",
+        "Ηθική",
+        "Λογική",
+        "Μεταφυσική",
+        "Γνωσιολογία",
+        "Οντολογία",
+        "Ιμμάνουελ Καντ",
+        "Ρενέ Ντεκάρτ",
+        "Φρίντριχ Νίτσε",
+        "Στωικισμός",
+        "Υπαρξισμός",
+        "Ηράκλειτος",
+        "Επίκουρος"
+      ],
+      "off_theme": [
+        "Ζωγραφική",
+        "Γλυπτική",
+        "Χορός",
+        "Χημεία",
+        "Κινηματογράφος",
+        "Ρωσία",
+        "Συρία",
+        "Αρχαιολογία"
+      ]
+    }
+  }
+}

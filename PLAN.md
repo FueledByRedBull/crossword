@@ -75,6 +75,8 @@ The system should optimize for thematic coherence, layout quality, clue quality,
 
 A seed is graded when it has `word_count > 0` and a known `puzzle_status`; Gates C and D fail closed otherwise. The release candidate passes when Gates A, B, C and D pass and `puzzle_ok_rate >= 0.80`.
 
+Held-out seeds: `data/benchmarks/held_out.json` holds the same kind of fixture for seven seeds that no relevance or clue rule was written on. They are measured, not gated and not tuned on: a change to a relevance or clue rule is run on them before it is adopted and must not make them worse (Gate A recall, words, checked letters, and the number of clearly weak clues in their grids). A rule that needs one of them as its example moves that seed to `gate_a.json`, and a new held-out seed replaces it.
+
 ## 4. End-to-End Pipeline
 
 1. `Seed Graph Expansion`:
@@ -272,14 +274,14 @@ Additional notes:
 
 #### Pass 3: Validate
 
-1. Reject clues containing the answer, a content word of it, or a morphological cousin of one (lemma/stem check).
+1. Reject clues containing the answer, a content word of it, or a morphological cousin of one (lemma/stem check). A spelling that differs only by accents, a modifier letter or an apostrophe counts as the same word.
 2. Reject a fill-in that points outside itself: an opening back-reference word, a pronoun with nothing before it to refer to, a demonstrative with a noun not named earlier, "the former", "the following", "doing so", "as noted above", "the term" or "the name" followed directly by its verb, a "his" or "her" that only a pronoun subject explains; in Greek a verb that opens the sentence without a subject and a possessive with no noun before it; and a cut fill-in that lost its finite verb. Reject a fill-in whose blank is one part of a longer proper name, or one item of a list of three or more.
 3. Reject a generic definition: no word that is rare among the pool's lead sentences; the answer's nationality with fewer than two such words; a kind-of-word head noun without its meaning; a vague quantifier opener or "a part of a larger ...". A nationality on a kind-of-word head is a language and does not count as the answer's.
 4. Reject clues below the minimum word count (3 for a definition, 6 for a fill-in) as too vague.
 
 #### Pass 4: Order and Diversity
 
-1. The definition comes first, a person's joined definition included; among fill-ins the seed's sentences win; a definition cut from the second sentence alone comes last.
+1. The definition comes first, a person's joined definition included; among fill-ins whole sentences win, then the seed's, then the sentence that shares the most with the intro of the answer's own page (each shared word weighted by its rarity among the pool's lead sentences); a definition cut from the second sentence alone comes last.
 2. Bucket fill-in clues by their first 3 tokens and keep at most 2 per bucket across the puzzle.
 3. No clue text and no source sentence is used twice.
 
