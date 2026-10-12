@@ -94,7 +94,6 @@ def run_benchmark(seed: str, args: argparse.Namespace, fixtures: dict) -> dict:
         max_two_hop_links=args.max_two_hop_links,
         max_candidates=args.max_candidates,
         keep_threshold=args.keep_threshold,
-        borderline_threshold=args.borderline_threshold,
         lexicon_path=args.lexicon_path,
         candidate_lexicon_weight=args.candidate_lexicon_weight,
         term_lexicon_weight=args.term_lexicon_weight,
@@ -184,7 +183,6 @@ def main() -> None:
     parser.add_argument("--max-two-hop-links", type=int, default=None)
     parser.add_argument("--max-candidates", type=int, default=None)
     parser.add_argument("--keep-threshold", type=float, default=0.2)
-    parser.add_argument("--borderline-threshold", type=float, default=0.1)
     parser.add_argument(
         "--lexicon-path",
         default="data/lexicon/combined_wordfreq.txt",

@@ -1,5 +1,5 @@
 {
-  "comment": "Gate A fixture. Pages are named by their resolved title, as the answer pool names them (the seed links to Roman roads as \"Roman road\" and to Oxford University Press as \"Clarendon Press\"). central = pages a puzzle on the topic should be able to use (chosen from subject knowledge before looking at any pipeline output; each is linked from the seed and is at most 3 words and 15 letters). off_theme = pages linked from the seed but unrelated to the topic. max_links = the link cap scripts/bench.py applies to that seed. Ancient Rome is benchmarked on 200 of its 2,193 links (links[i * len(links) // 200]), so its central pages were chosen from that 200-link sample, the only pages that can reach the pool; its off-theme pages are drawn from the full link list and BBC News, Baltic Assembly and Anglosphere fall outside that sample.",
+  "comment": "Gate A fixture. Pages are named by their resolved title, as the answer pool names them (the seed links to Roman roads as \"Roman road\" and to Oxford University Press as \"Clarendon Press\"). central = pages a puzzle on the topic should be able to use (chosen from subject knowledge before looking at any pipeline output; each is linked from the seed and is at most 3 words and 15 letters). off_theme = pages linked from the seed but unrelated to the topic. max_links = the link cap scripts/bench.py applies to that seed. Ancient Rome is benchmarked on 200 of its 2,193 links (links[i * len(links) // 200]), so its central pages were chosen from that 200-link sample, the only pages that can reach the pool; its off-theme pages are drawn from the full link list and BBC News, Baltic Assembly and Anglosphere fall outside that sample. Evolution, Chess, Volcano, Cryptography, Μαθηματικά and Φιλοσοφία were held-out seeds (held_out.json) until a rule was derived from them on 2026-10-12; their lists were chosen from the link lists before any output existed and carry their language in lang. Μαθηματικά still has one off-theme page in its pool (Βιολογία). A page the seed links to through a redirect is listed under the title the redirect leads to, which can be longer than an answer may be (Μαθηματική απόδειξη); such a page is answered by a shorter name. The file holds English and Greek seeds; scripts/bench.py takes one --lang, so run the seeds of one language together.",
   "seeds": {
     "Thermodynamics": {
       "central": [
@@ -116,6 +116,185 @@
         "Five Eyes",
         "G7",
         "Organization of American States"
+      ]
+    },
+    "Evolution": {
+      "lang": "en",
+      "central": [
+        "Charles Darwin",
+        "Gregor Mendel",
+        "Ernst Mayr",
+        "Mutation",
+        "Adaptation",
+        "Speciation",
+        "Fossil",
+        "Genetic drift",
+        "Gene flow",
+        "Sexual selection",
+        "Darwin's finches",
+        "Extinction",
+        "Allele",
+        "Phenotype",
+        "Lamarckism"
+      ],
+      "off_theme": [
+        "Associated Press",
+        "BBC",
+        "Hoboken, New Jersey",
+        "Excite (web portal)",
+        "Chichester",
+        "Citric acid",
+        "Graphite",
+        "Cambridge, Massachusetts"
+      ]
+    },
+    "Chess": {
+      "lang": "en",
+      "central": [
+        "Checkmate",
+        "Stalemate",
+        "Castling",
+        "En passant",
+        "Gambit",
+        "Zugzwang",
+        "Garry Kasparov",
+        "Bobby Fischer",
+        "Magnus Carlsen",
+        "Paul Morphy",
+        "Boris Spassky",
+        "Sicilian Defence",
+        "Ruy Lopez",
+        "Shogi",
+        "Elo rating system"
+      ],
+      "off_theme": [
+        "Oxford University Press",
+        "Princeton University Press",
+        "Olympic Games",
+        "Google Play Store",
+        "Los Angeles Times",
+        "World War I",
+        "Northwestern University",
+        "University of Göttingen"
+      ]
+    },
+    "Volcano": {
+      "lang": "en",
+      "central": [
+        "Lava",
+        "Magma",
+        "Caldera",
+        "Volcanic ash",
+        "Pyroclastic flow",
+        "Plate tectonics",
+        "Mount Vesuvius",
+        "Mount Etna",
+        "Mount Pinatubo",
+        "Mauna Loa",
+        "Pompeii",
+        "Geyser",
+        "Tephra",
+        "Ring of Fire",
+        "Cinder cone"
+      ],
+      "off_theme": [
+        "Bridge",
+        "Canal",
+        "Turbine",
+        "Jet aircraft",
+        "Risk management",
+        "Probability theory",
+        "American English",
+        "Princeton University Press"
+      ]
+    },
+    "Cryptography": {
+      "lang": "en",
+      "central": [
+        "Cipher",
+        "Encryption",
+        "Hash function",
+        "Caesar cipher",
+        "Enigma machine",
+        "Claude Shannon",
+        "Whitfield Diffie",
+        "Ron Rivest",
+        "Adi Shamir",
+        "One-time pad",
+        "Cryptanalysis",
+        "Steganography",
+        "Plaintext",
+        "Bletchley Park"
+      ],
+      "off_theme": [
+        "Bill Clinton",
+        "Kazakhstan",
+        "Singapore",
+        "Tunisia",
+        "Belarus",
+        "Sacred geometry",
+        "Numerology",
+        "The Denver Post"
+      ]
+    },
+    "Μαθηματικά": {
+      "lang": "el",
+      "central": [
+        "Άλγεβρα",
+        "Γεωμετρία",
+        "Θεωρία αριθμών",
+        "Ευκλείδης",
+        "Πυθαγόρας",
+        "Ισαάκ Νεύτων",
+        "Θεώρημα",
+        "Μαθηματική απόδειξη",
+        "Αξίωμα",
+        "Εξίσωση",
+        "Πρώτος αριθμός",
+        "Τοπολογία",
+        "Ολοκλήρωμα",
+        "Θεωρία συνόλων",
+        "Κουρτ Γκέντελ"
+      ],
+      "off_theme": [
+        "Κικέρων",
+        "Μάγια",
+        "Οικολογία",
+        "Χριστιανισμός",
+        "Βιολογία",
+        "Βόρεια Αμερική",
+        "Ιατρική",
+        "Wayback Machine"
+      ]
+    },
+    "Φιλοσοφία": {
+      "lang": "el",
+      "central": [
+        "Πλάτων",
+        "Αριστοτέλης",
+        "Σωκράτης",
+        "Ηθική",
+        "Λογική",
+        "Μεταφυσική",
+        "Γνωσιολογία",
+        "Οντολογία",
+        "Ιμμάνουελ Καντ",
+        "Ρενέ Ντεκάρτ",
+        "Φρίντριχ Νίτσε",
+        "Στωικισμός",
+        "Υπαρξισμός",
+        "Ηράκλειτος",
+        "Επίκουρος"
+      ],
+      "off_theme": [
+        "Ζωγραφική",
+        "Γλυπτική",
+        "Χορός",
+        "Χημεία",
+        "Κινηματογράφος",
+        "Ρωσία",
+        "Συρία",
+        "Αρχαιολογία"
       ]
     }
   }

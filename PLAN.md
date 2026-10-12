@@ -75,7 +75,7 @@ The system should optimize for thematic coherence, layout quality, clue quality,
 
 A seed is graded when it has `word_count > 0` and a known `puzzle_status`; Gates C and D fail closed otherwise. The release candidate passes when Gates A, B, C and D pass and `puzzle_ok_rate >= 0.80`.
 
-Held-out seeds: `data/benchmarks/held_out.json` holds the same kind of fixture for seven seeds that no relevance or clue rule was written on. They are measured, not gated and not tuned on: a change to a relevance or clue rule is run on them before it is adopted and must not make them worse (Gate A recall, words, checked letters, and the number of clearly weak clues in their grids). A rule that needs one of them as its example moves that seed to `gate_a.json`, and a new held-out seed replaces it.
+Held-out seeds: `data/benchmarks/held_out.json` holds the same kind of fixture for seeds that no relevance or clue rule was derived from. They are measured, not gated and not tuned on: a change to a relevance or clue rule is run on them before it is adopted and must not make them worse (Gate A recall, words, checked letters, and the number of clearly weak clues in their grids). Single grids are noisy (one pool page more or less re-lays a grid), so the comparison is over all of them, not seed by seed. A rule that needs one of them as its example moves that seed to `gate_a.json`, and a new held-out seed replaces it.
 
 ## 4. End-to-End Pipeline
 
@@ -172,6 +172,7 @@ Notes:
 1. Keep depth and backlink as soft features, not hard gates.
 2. Depth penalty only differentiates if 2-hop expansion is enabled.
 3. Retain borderline set for later vocabulary rescue.
+4. Only off-topic pages are `CUT`. An on-topic page under the keep threshold is `BORDERLINE`, whatever its relevance: similarity to the seed text depends on how long and how broad the seed article is, so it orders the pages and no fixed value of it cuts one. A seed with more than 150 on-topic titles loses the rest to the cap on title answers; a seed with fewer keeps them all. `KEEP` (relevance at least the keep threshold) and `BORDERLINE` differ only in step 2 of the rescue ladder below.
 
 #### Outputs
 
@@ -203,7 +204,7 @@ Choose `K` with diminishing returns:
 If `J(K)` plateaus but the vocabulary readiness gate is not satisfied, apply the following steps in order, stopping as soon as the gate passes:
 
 1. Loosen `min_df` to `1` (from adaptive default).
-2. Promote up to 3 `BORDERLINE` candidates into the selected set.
+2. Promote up to 3 `BORDERLINE` candidates into the selected set: the first three on-topic pages under the keep threshold that are not selected yet, in rank order. An unselected `KEEP` page is passed over (known gap: the three best unselected pages by rank would be the consistent choice).
 3. Widen from the selected articles: score the pages linked from at most 6 selected articles whose intro is on topic (an even sample of each one's links, at most 100 new pages), let the best 6 join the selected articles, and let all of them be answers.
 4. Reduce minimum answer length from `4` to `3`.
 5. If all four steps fail: go on with the thin pool when it has at least `min_words` clued answers (`accept_thin_pool`); otherwise emit `puzzle_status: insufficient_vocabulary` and halt gracefully.

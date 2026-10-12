@@ -135,13 +135,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--keep-threshold",
         type=float,
         default=0.2,
-        help="Relevance threshold for KEEP status",
-    )
-    score_parser.add_argument(
-        "--borderline-threshold",
-        type=float,
-        default=0.1,
-        help="Relevance threshold for BORDERLINE status",
+        help="Relevance from which an on-topic page is KEEP instead of BORDERLINE",
     )
     score_parser.add_argument(
         "--lexicon-path",
@@ -235,13 +229,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--keep-threshold",
         type=float,
         default=0.2,
-        help="Relevance threshold for KEEP status",
-    )
-    k_parser.add_argument(
-        "--borderline-threshold",
-        type=float,
-        default=0.1,
-        help="Relevance threshold for BORDERLINE status",
+        help="Relevance from which an on-topic page is KEEP instead of BORDERLINE",
     )
     k_parser.add_argument(
         "--lexicon-path",
@@ -617,7 +605,6 @@ def _build_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("--max-two-hop-links", type=int, default=None)
     generate_parser.add_argument("--max-candidates", type=int, default=None)
     generate_parser.add_argument("--keep-threshold", type=float, default=0.2)
-    generate_parser.add_argument("--borderline-threshold", type=float, default=0.1)
     generate_parser.add_argument(
         "--lexicon-path",
         default="data/lexicon/combined_wordfreq.txt",
@@ -730,7 +717,6 @@ def main() -> None:
             max_two_hop_links=args.max_two_hop_links,
             max_candidates=args.max_candidates,
             keep_threshold=args.keep_threshold,
-            borderline_threshold=args.borderline_threshold,
             lexicon_path=args.lexicon_path,
             lexicon_weight=args.lexicon_weight,
         )
@@ -754,7 +740,6 @@ def main() -> None:
             max_two_hop_links=args.max_two_hop_links,
             max_candidates=args.max_candidates,
             keep_threshold=args.keep_threshold,
-            borderline_threshold=args.borderline_threshold,
             min_k=args.min_k,
             max_k=args.max_k,
             epsilon=args.epsilon,
@@ -883,7 +868,6 @@ def main() -> None:
             max_two_hop_links=args.max_two_hop_links,
             max_candidates=args.max_candidates,
             keep_threshold=args.keep_threshold,
-            borderline_threshold=args.borderline_threshold,
             lexicon_path=args.lexicon_path,
             candidate_lexicon_weight=args.candidate_lexicon_weight,
             term_lexicon_weight=args.term_lexicon_weight,

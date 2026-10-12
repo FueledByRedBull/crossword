@@ -244,28 +244,18 @@ def _rank_candidates(
     )
 
 
-def _candidate_status(
-    group: int, rel: float, depth: int, links_back: bool, keep_threshold: float, borderline_threshold: float
-) -> tuple[str, str]:
-    """The status of a ranked candidate and the reason for it: an off-topic group is cut, the rest go by relevance."""
+def _candidate_status(group: int, rel: float, keep_threshold: float) -> tuple[str, str]:
+    """The status of a ranked candidate and the reason for it: an off-topic page is cut, an on-topic one never is.
+
+    Similarity to the seed text runs low when the seed article is short or broad (most on-topic links of the Greek
+    Mathematics article score under 0.1), so it only ranks the on-topic pages and marks the closest ones KEEP. Among
+    them nothing but the cap on title answers cuts.
+    """
     if group == 2:
-        status = "CUT"
-        reason = "cut_off_topic"
-    elif rel >= keep_threshold:
-        status = "KEEP"
-        reason = "relevance_above_keep_threshold"
-    elif rel >= borderline_threshold:
-        status = "BORDERLINE"
-        reason = "relevance_above_borderline_threshold"
-    else:
-        status = "CUT"
-        if depth == 2:
-            reason = "cut_depth2_low_relevance"
-        elif not links_back:
-            reason = "cut_no_backlink_low_relevance"
-        else:
-            reason = "cut_low_relevance"
-    return status, reason
+        return "CUT", "cut_off_topic"
+    if rel >= keep_threshold:
+        return "KEEP", "relevance_above_keep_threshold"
+    return "BORDERLINE", "on_topic_below_keep_threshold"
 
 
 def _write_scores_csv(scores_path: str | Path, scored_rows: list[dict]) -> None:
@@ -326,7 +316,6 @@ def run_candidate_scoring_stage(
     max_candidates: int | None = None,
     extra_titles: list[str] | None = None,
     keep_threshold: float = 0.2,
-    borderline_threshold: float = 0.1,
     weights: dict[str, float] | None = None,
     lexicon_path: str | Path | None = "data/lexicon/combined_wordfreq.txt",
     lexicon_weight: float = 0.08,
@@ -432,9 +421,7 @@ def run_candidate_scoring_stage(
         rel = rel_scores[idx]
         depth = candidates[idx].get("depth", 1)
         links_back = bool(candidates[idx].get("links_back_to_seed"))
-        status, reason = _candidate_status(
-            group[idx], rel, depth, links_back, keep_threshold, borderline_threshold
-        )
+        status, reason = _candidate_status(group[idx], rel, keep_threshold)
         scored_rows.append(
             {
                 "rank": rank_idx + 1,
@@ -469,7 +456,7 @@ def run_candidate_scoring_stage(
             "weight": lexicon_weight,
             "hits": lexicon_hits,
         },
-        "thresholds": {"keep": keep_threshold, "borderline": borderline_threshold},
+        "thresholds": {"keep": keep_threshold},
         "errors": seed_result.diagnostics.get("errors", []) + errors,
     }
     final_diagnostics = write_json(diagnostics_path, diagnostics)
@@ -503,7 +490,6 @@ def run_k_selection_stage(
     max_two_hop_links: int | None = None,
     max_candidates: int | None = None,
     keep_threshold: float = 0.2,
-    borderline_threshold: float = 0.1,
     min_k: int = 5,
     max_k: int | None = None,
     epsilon: float = 0.01,
@@ -531,7 +517,6 @@ def run_k_selection_stage(
         max_two_hop_links=max_two_hop_links,
         max_candidates=max_candidates,
         keep_threshold=keep_threshold,
-        borderline_threshold=borderline_threshold,
         lexicon_path=lexicon_path,
         lexicon_weight=lexicon_weight,
     )
@@ -636,7 +621,7 @@ def run_k_selection_stage(
         "trace_written": True,
         "selected_written": True,
         "weights": weights,
-        "thresholds": {"keep": keep_threshold, "borderline": borderline_threshold},
+        "thresholds": {"keep": keep_threshold},
         "errors": mapping_errors,
         "notes": [
             "pairwise_similarity_cosine",

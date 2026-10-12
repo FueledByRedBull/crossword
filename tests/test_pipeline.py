@@ -27,11 +27,17 @@ from src.pipeline.clues import _collect_source_backed_clue_candidates, _definiti
 from src.pipeline.common import _fetch_extract_with_revid, _uses_seed_word
 from src.pipeline.generate import _linked_titles
 from src.pipeline.packaging import _layout_candidates
-from src.pipeline.scoring import _effective_min_k_for_size, _inventory_min_k_target, _seed_mentions
+from src.pipeline.scoring import _candidate_status, _effective_min_k_for_size, _inventory_min_k_target, _seed_mentions
 from src.pipeline.titles import _build_title_answer_rows, _is_person, _seed_short_names
 
 
 class PipelineTests(unittest.TestCase):
+    def test_an_on_topic_candidate_is_never_cut_for_low_similarity(self) -> None:
+        # group 0: the intro is on topic; 1: the seed names the page twice; 2: neither.
+        self.assertEqual(_candidate_status(0, 0.25, 0.2), ("KEEP", "relevance_above_keep_threshold"))
+        self.assertEqual(_candidate_status(1, 0.02, 0.2), ("BORDERLINE", "on_topic_below_keep_threshold"))
+        self.assertEqual(_candidate_status(2, 0.9, 0.2), ("CUT", "cut_off_topic"))
+
     def setUp(self) -> None:
         # Stage tests never reach the network; the batched prefetch is checked where it matters.
         for name in ("prefetch_intro_extracts", "prefetch_lead_wikitext"):
@@ -1831,8 +1837,8 @@ class PipelineTests(unittest.TestCase):
             "\n".join(
                 [
                     "rank,title,depth,links_back_to_seed,rel_score,red_score,selection_score,status,reason",
-                    "1,\"Storyville, New Orleans\",1,True,0.2,0.1,0.1,BORDERLINE,relevance_above_borderline_threshold",
-                    "2,\"Music of Washington, D.C.\",1,True,0.2,0.1,0.1,BORDERLINE,relevance_above_borderline_threshold",
+                    "1,\"Storyville, New Orleans\",1,True,0.2,0.1,0.1,BORDERLINE,on_topic_below_keep_threshold",
+                    "2,\"Music of Washington, D.C.\",1,True,0.2,0.1,0.1,BORDERLINE,on_topic_below_keep_threshold",
                     "3,\"Thermodynamics\",1,True,0.9,0.0,0.9,KEEP,relevance_above_keep_threshold",
                 ]
             ),
