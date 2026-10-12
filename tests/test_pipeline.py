@@ -12,18 +12,6 @@ from unittest.mock import MagicMock, patch
 from src.clue_builder import definition_clue, split_sentences
 from src.layout import validate_puzzle
 from src.pipeline import (
-    _build_title_answer_rows,
-    _collect_source_backed_clue_candidates,
-    _effective_min_k_for_size,
-    _fetch_extract_with_revid,
-    _inventory_min_k_target,
-    _is_person,
-    _definition_clue_rows,
-    _layout_candidates,
-    _linked_titles,
-    _uses_seed_word,
-    _seed_mentions,
-    _seed_short_names,
     run_candidate_scoring_stage,
     run_clue_extraction_stage,
     run_generate_pipeline,
@@ -35,17 +23,23 @@ from src.pipeline import (
     run_term_extraction_stage,
     run_vocab_gate_stage,
 )
+from src.pipeline.clues import _collect_source_backed_clue_candidates, _definition_clue_rows
+from src.pipeline.common import _fetch_extract_with_revid, _uses_seed_word
+from src.pipeline.generate import _linked_titles
+from src.pipeline.packaging import _layout_candidates
+from src.pipeline.scoring import _effective_min_k_for_size, _inventory_min_k_target, _seed_mentions
+from src.pipeline.titles import _build_title_answer_rows, _is_person, _seed_short_names
 
 
 class PipelineTests(unittest.TestCase):
     def setUp(self) -> None:
         # Stage tests never reach the network; the batched prefetch is checked where it matters.
         for name in ("prefetch_intro_extracts", "prefetch_lead_wikitext"):
-            patcher = patch(f"src.pipeline.WikiClient.{name}")
+            patcher = patch(f"src.wiki_client.WikiClient.{name}")
             setattr(self, name, patcher.start())
             self.addCleanup(patcher.stop)
         patcher = patch(
-            "src.pipeline.WikiClient.fetch_page_extract_with_revid",
+            "src.wiki_client.WikiClient.fetch_page_extract_with_revid",
             return_value={"extract": "", "revid": None},
         )
         patcher.start()
@@ -60,7 +54,7 @@ class PipelineTests(unittest.TestCase):
         if cache_dir.exists():
             shutil.rmtree(cache_dir, ignore_errors=True)
 
-        with patch("src.pipeline.WikiClient.fetch_links", side_effect=RuntimeError("network blocked")):
+        with patch("src.wiki_client.WikiClient.fetch_links", side_effect=RuntimeError("network blocked")):
             result = run_seed_ingestion_stage(
                 seed_title="Thermodynamics",
                 lang="en",
@@ -83,7 +77,7 @@ class PipelineTests(unittest.TestCase):
         links = [{"title": f"{letter}{n}", "page_id": None, "depth": 1} for letter in "ABCDEFGHIJ" for n in range(10)]
         payload = {"seed_title": "Seed", "seed_page_id": 1, "links": links}
 
-        with patch("src.pipeline.WikiClient.fetch_links", return_value=payload):
+        with patch("src.wiki_client.WikiClient.fetch_links", return_value=payload):
             result = run_seed_ingestion_stage(
                 seed_title="Seed",
                 diagnostics_path=out_dir / "diagnostics_cap.json",
@@ -102,8 +96,8 @@ class PipelineTests(unittest.TestCase):
 
         with (
             tempfile.TemporaryDirectory() as tmp,
-            patch("src.pipeline.WikiClient.fetch_links", return_value=payload),
-            patch("src.pipeline.WikiClient.fetch_page_extract", return_value={"extract": "some text"}),
+            patch("src.wiki_client.WikiClient.fetch_links", return_value=payload),
+            patch("src.wiki_client.WikiClient.fetch_page_extract", return_value={"extract": "some text"}),
         ):
             result = run_seed_ingestion_stage(
                 seed_title="Seed",
@@ -124,9 +118,9 @@ class PipelineTests(unittest.TestCase):
 
         with (
             tempfile.TemporaryDirectory() as tmp,
-            patch("src.pipeline.run_seed_ingestion_stage", return_value=seed_result),
-            patch("src.pipeline.WikiClient.fetch_page_extract", return_value={"extract": "reference text"}),
-            patch("src.pipeline.WikiClient.fetch_lead_wikitext", return_value={"wikitext": ""}),
+            patch("src.pipeline.scoring.run_seed_ingestion_stage", return_value=seed_result),
+            patch("src.wiki_client.WikiClient.fetch_page_extract", return_value={"extract": "reference text"}),
+            patch("src.wiki_client.WikiClient.fetch_lead_wikitext", return_value={"wikitext": ""}),
         ):
             result = run_candidate_scoring_stage(
                 seed_title="Seed",
@@ -189,7 +183,7 @@ class PipelineTests(unittest.TestCase):
         if cache_dir.exists():
             shutil.rmtree(cache_dir, ignore_errors=True)
 
-        with patch("src.pipeline.run_seed_ingestion_stage") as mocked_seed:
+        with patch("src.pipeline.scoring.run_seed_ingestion_stage") as mocked_seed:
             mocked_seed.return_value.diagnostics = {
                 "candidates": [],
                 "errors": ["link_fetch_failed: network blocked"],
@@ -219,7 +213,7 @@ class PipelineTests(unittest.TestCase):
         if cache_dir.exists():
             shutil.rmtree(cache_dir, ignore_errors=True)
 
-        with patch("src.pipeline.run_candidate_scoring_stage") as mocked_score:
+        with patch("src.pipeline.scoring.run_candidate_scoring_stage") as mocked_score:
             mocked_score.return_value.scores = []
             mocked_score.return_value.diagnostics = {"errors": ["link_fetch_failed: network blocked"]}
             result = run_k_selection_stage(
@@ -240,7 +234,7 @@ class PipelineTests(unittest.TestCase):
         out_dir = Path("tests") / "tmp_outputs"
         scoring = SimpleNamespace(scores=[], diagnostics={"errors": []})
 
-        with patch("src.pipeline.run_candidate_scoring_stage") as mocked_score:
+        with patch("src.pipeline.scoring.run_candidate_scoring_stage") as mocked_score:
             result = run_k_selection_stage(
                 seed_title="Thermodynamics",
                 diagnostics_path=out_dir / "diagnostics_k.json",
@@ -280,9 +274,9 @@ class PipelineTests(unittest.TestCase):
             return {"extract": f"{title} reference text"}
 
         with (
-            patch("src.pipeline.run_seed_ingestion_stage", return_value=mocked_seed),
-            patch("src.pipeline.WikiClient.fetch_page_extract", side_effect=fake_extract),
-            patch("src.pipeline.WikiClient.fetch_lead_wikitext", return_value={"wikitext": ""}),
+            patch("src.pipeline.scoring.run_seed_ingestion_stage", return_value=mocked_seed),
+            patch("src.wiki_client.WikiClient.fetch_page_extract", side_effect=fake_extract),
+            patch("src.wiki_client.WikiClient.fetch_lead_wikitext", return_value={"wikitext": ""}),
         ):
             run_candidate_scoring_stage(
                 seed_title="Seed",
@@ -323,16 +317,16 @@ class PipelineTests(unittest.TestCase):
         seed_result = SimpleNamespace(diagnostics={"candidates": candidates, "errors": []})
         seed_text = seed_text or "Hannibal crossed the Alps. Diocletian split the empire; later Diocletian retired."
         with (
-            patch("src.pipeline.run_seed_ingestion_stage", return_value=seed_result),
+            patch("src.pipeline.scoring.run_seed_ingestion_stage", return_value=seed_result),
             patch(
-                "src.pipeline.WikiClient.fetch_page_extract",
+                "src.wiki_client.WikiClient.fetch_page_extract",
                 side_effect=lambda title, intro_only=True: {"title": pages.get(title, title), "extract": intros[title]},
             ),
             patch(
-                "src.pipeline.WikiClient.fetch_page_extract_with_revid",
+                "src.wiki_client.WikiClient.fetch_page_extract_with_revid",
                 return_value={"extract": seed_text, "revid": 3},
             ),
-            patch("src.pipeline.WikiClient.fetch_lead_wikitext", return_value={"wikitext": ""}),
+            patch("src.wiki_client.WikiClient.fetch_lead_wikitext", return_value={"wikitext": ""}),
         ):
             return run_candidate_scoring_stage(
                 seed_title="Ancient Rome",
@@ -410,7 +404,7 @@ class PipelineTests(unittest.TestCase):
             {"C": "boom"},
         )
         errors: list[str] = []
-        with patch("src.pipeline._RESCUE_NEW_PAGES", 6):  # a share of two per parent
+        with patch("src.pipeline.generate._RESCUE_NEW_PAGES", 6):  # a share of two per parent
             titles = _linked_titles(client, ["A", "B", "C"], {"Known"}, errors)
 
         self.assertEqual(titles, ["a1", "a3", "b1"])  # even steps through A; B's a1 is A's already
@@ -444,13 +438,13 @@ class PipelineTests(unittest.TestCase):
             )
             gates = [SimpleNamespace(passed=False)] * 3 + [SimpleNamespace(passed=True)]
             with (
-                patch("src.pipeline.run_term_extraction_stage", return_value=SimpleNamespace(terms=[])) as terms,
-                patch("src.pipeline.evaluate_vocab_gate", side_effect=gates),
+                patch("src.pipeline.generate.run_term_extraction_stage", return_value=SimpleNamespace(terms=[])) as terms,
+                patch("src.pipeline.generate.evaluate_vocab_gate", side_effect=gates),
                 patch(
-                    "src.pipeline.WikiClient.fetch_links_concurrent",
+                    "src.wiki_client.WikiClient.fetch_links_concurrent",
                     return_value=({"On": {"links": [{"title": "Heat"}, {"title": "Cold"}, {"title": "On"}]}}, {}),
                 ) as links,
-                patch("src.pipeline.run_candidate_scoring_stage", return_value=widened) as rescore,
+                patch("src.pipeline.generate.run_candidate_scoring_stage", return_value=widened) as rescore,
             ):
                 result = run_rescue_ladder(
                     seed_title="Seed",
@@ -587,7 +581,7 @@ class PipelineTests(unittest.TestCase):
             term_scores=[0.0, 0.0, 0.0],
         )
 
-        with patch("src.pipeline.run_candidate_scoring_stage", return_value=mocked_scoring):
+        with patch("src.pipeline.scoring.run_candidate_scoring_stage", return_value=mocked_scoring):
             result = run_k_selection_stage(
                 seed_title="Thermodynamics",
                 lang="en",
@@ -660,11 +654,11 @@ class PipelineTests(unittest.TestCase):
 
         with (
             patch(
-                "src.pipeline.WikiClient.fetch_page_extract_with_revid",
+                "src.wiki_client.WikiClient.fetch_page_extract_with_revid",
                 return_value={"title": "Entropy", "extract": "", "revid": None},
             ),
-            patch("src.pipeline.WikiClient.fetch_page_extract", return_value={"extract": ""}),
-            patch("src.pipeline.WikiClient.fetch_lead_wikitext", return_value={"wikitext": "", "revid": None}),
+            patch("src.wiki_client.WikiClient.fetch_page_extract", return_value={"extract": ""}),
+            patch("src.wiki_client.WikiClient.fetch_lead_wikitext", return_value={"wikitext": "", "revid": None}),
         ):
             result = run_clue_extraction_stage(
                 seed_title="Thermodynamics",
@@ -702,12 +696,12 @@ class PipelineTests(unittest.TestCase):
         )
 
         with (
-            patch("src.pipeline.run_seed_ingestion_stage", return_value=mocked_seed),
+            patch("src.pipeline.scoring.run_seed_ingestion_stage", return_value=mocked_seed),
             patch(
-                "src.pipeline.WikiClient.fetch_page_extract",
+                "src.wiki_client.WikiClient.fetch_page_extract",
                 return_value={"extract": "Alpha quoted topic reference text"},
             ),
-            patch("src.pipeline.WikiClient.fetch_lead_wikitext", return_value={"wikitext": ""}),
+            patch("src.wiki_client.WikiClient.fetch_lead_wikitext", return_value={"wikitext": ""}),
         ):
             run_candidate_scoring_stage(
                 seed_title="Seed",
@@ -755,8 +749,8 @@ class PipelineTests(unittest.TestCase):
         )
 
         with (
-            patch("src.pipeline.run_term_extraction_stage", return_value=term_result) as mocked_terms,
-            patch("src.pipeline.run_clue_extraction_stage", return_value=SimpleNamespace(clues=[])) as mocked_clues,
+            patch("src.pipeline.generate.run_term_extraction_stage", return_value=term_result) as mocked_terms,
+            patch("src.pipeline.generate.run_clue_extraction_stage", return_value=SimpleNamespace(clues=[])) as mocked_clues,
         ):
             result = run_rescue_ladder(
                 seed_title="Thermodynamics",
@@ -809,14 +803,14 @@ class PipelineTests(unittest.TestCase):
 
         with (
             patch(
-                "src.pipeline.WikiClient.fetch_page_extract_with_revid",
+                "src.wiki_client.WikiClient.fetch_page_extract_with_revid",
                 return_value={
                     "title": "Entropy",
                     "extract": "Entropy is a measure of disorder in thermodynamics.",
                     "revid": 123,
                 },
             ),
-            patch("src.pipeline.clue_pass_validate", return_value=True),
+            patch("src.pipeline.clues.clue_pass_validate", return_value=True),
         ):
             result = run_clue_extraction_stage(
                 seed_title="Thermodynamics",
@@ -860,9 +854,9 @@ class PipelineTests(unittest.TestCase):
 
         with (
             patch("spacy.load", side_effect=OSError("no model in unit test")),
-            patch("src.pipeline.WikiClient.fetch_page_extract_with_revid", side_effect=with_revid),
-            patch("src.pipeline.WikiClient.fetch_page_extract", side_effect=AssertionError("plain text has no revision")),
-            patch("src.pipeline.WikiClient.fetch_lead_wikitext", side_effect=AssertionError("lead revision is another response")),
+            patch("src.wiki_client.WikiClient.fetch_page_extract_with_revid", side_effect=with_revid),
+            patch("src.wiki_client.WikiClient.fetch_page_extract", side_effect=AssertionError("plain text has no revision")),
+            patch("src.wiki_client.WikiClient.fetch_lead_wikitext", side_effect=AssertionError("lead revision is another response")),
         ):
             result = run_clue_extraction_stage(
                 seed_title=seed_title,
@@ -1058,7 +1052,7 @@ class PipelineTests(unittest.TestCase):
         follow_up = "She was one of the most influential figures in the development of quantum optics."
 
         def run(name: str, first: str):
-            with patch("src.pipeline.is_generic_definition", side_effect=lambda clue, *args, **kwargs: clue.startswith("A noted")):
+            with patch("src.pipeline.clues.is_generic_definition", side_effect=lambda clue, *args, **kwargs: clue.startswith("A noted")):
                 result, _ = self._run_clues_for(name, ["Ana Vale,ANAVALE,Ana Vale,article_title"], {"Ana Vale": f"{first} {follow_up}"})
             return [(row["clue_style"], row["sentence_offset"], row["clue"]) for row in result.clues]
 
@@ -1174,8 +1168,8 @@ class PipelineTests(unittest.TestCase):
                 return "A noted physicist who founded the first laboratory" if "founded" in sentence else None
 
             with (
-                patch("src.pipeline.is_generic_definition", side_effect=lambda clue, *args, **kwargs: "who" not in clue),
-                patch("src.pipeline.who_definition", side_effect=who),
+                patch("src.pipeline.clues.is_generic_definition", side_effect=lambda clue, *args, **kwargs: "who" not in clue),
+                patch("src.pipeline.clues.who_definition", side_effect=who),
             ):
                 result, _ = self._run_clues_for(name, [f"Ana Vale,ANAVALE,Ana Vale,article_title,True,{person}"], {"Ana Vale": text})
             return [(row["clue_style"], row["sentence_offset"], row["clue"]) for row in result.clues]
@@ -1209,7 +1203,7 @@ class PipelineTests(unittest.TestCase):
             "Peter Tait,PETERTAIT,Peter Guthrie Tait,article_title,True,True",  # another name of that person
             "Chicago,CHICAGO,Music of Chicago|Jazz,article_title,True,False",  # the seed's name for a page that is no person
         ]
-        with patch("src.pipeline.is_generic_definition", return_value=False):
+        with patch("src.pipeline.clues.is_generic_definition", return_value=False):
             result, _ = self._run_clues_for("clue_own_name", rows, extracts)
 
         # Chicago is the seed's word, so only a seed sentence may clue it, and this seed has none. Nor has it one
@@ -1330,11 +1324,11 @@ class PipelineTests(unittest.TestCase):
             return {"title": title, "extract": extracts.get(title, ""), "revid": 5}
 
         with (
-            patch("src.pipeline._resolve_nlp_backend", return_value=(None, None, [], None, None)),
-            patch("src.pipeline.WikiClient.fetch_page_extract", side_effect=intro),
-            patch("src.pipeline.WikiClient.fetch_page_extract_with_revid", side_effect=with_revid),
+            patch("src.pipeline.answers._resolve_nlp_backend", return_value=(None, None, [], None, None)),
+            patch("src.wiki_client.WikiClient.fetch_page_extract", side_effect=intro),
+            patch("src.wiki_client.WikiClient.fetch_page_extract_with_revid", side_effect=with_revid),
             patch(
-                "src.pipeline.WikiClient.fetch_lead_wikitext",
+                "src.wiki_client.WikiClient.fetch_lead_wikitext",
                 return_value={"wikitext": "'''Bebop''' by '''Gillespie''' and '''other'''", "revid": 5},
             ),
         ):
@@ -1441,7 +1435,7 @@ class PipelineTests(unittest.TestCase):
 
         self.assertIn(expected, [row["clue"] for row in rows("el")])
         self.assertEqual(rows("en"), [])
-        with patch("src.pipeline.is_generic_definition", return_value=False) as generic:
+        with patch("src.pipeline.clues.is_generic_definition", return_value=False) as generic:
             rows("el")
         self.assertEqual(generic.call_args.kwargs["seed_title"], "Φυσική")
 
@@ -1756,9 +1750,9 @@ class PipelineTests(unittest.TestCase):
             (tmp_dir / "selected.json").write_text(json.dumps({"selected_titles": ["A"]}), encoding="utf-8")
             gate = SimpleNamespace(passed=False, term_count=clued)
             with (
-                patch("src.pipeline.run_term_extraction_stage"),
-                patch("src.pipeline.run_clue_extraction_stage", return_value=SimpleNamespace(clues=[])),
-                patch("src.pipeline.evaluate_vocab_gate", return_value=gate),
+                patch("src.pipeline.generate.run_term_extraction_stage"),
+                patch("src.pipeline.generate.run_clue_extraction_stage", return_value=SimpleNamespace(clues=[])),
+                patch("src.pipeline.generate.evaluate_vocab_gate", return_value=gate),
             ):
                 return run_rescue_ladder(
                     seed_title="Seed",
@@ -1774,9 +1768,9 @@ class PipelineTests(unittest.TestCase):
             thin, too_thin = ladder(Path(tmp), 12), ladder(Path(tmp), 11)
             names = ("candidate_scoring", "k_selection", "term_extraction", "clue_extraction", "vocab_gate", "layout")
             with ExitStack() as stack:
-                rescue = stack.enter_context(patch("src.pipeline.run_rescue_ladder", return_value={"diagnostics": thin}))
+                rescue = stack.enter_context(patch("src.pipeline.generate.run_rescue_ladder", return_value={"diagnostics": thin}))
                 started = {
-                    name: stack.enter_context(patch(f"src.pipeline.run_{name}_stage", return_value=stage))
+                    name: stack.enter_context(patch(f"src.pipeline.generate.run_{name}_stage", return_value=stage))
                     for name in (*names, "packaging")
                 }
                 run_generate_pipeline(seed_title="Seed", output_dir=tmp, gate_min=30, min_words=12, max_len=9)
@@ -1837,10 +1831,10 @@ class PipelineTests(unittest.TestCase):
         )
 
         with (
-            patch("src.pipeline.run_term_extraction_stage", return_value=SimpleNamespace(terms=[])),
-            patch("src.pipeline.evaluate_vocab_gate", return_value=failed_gate),
+            patch("src.pipeline.generate.run_term_extraction_stage", return_value=SimpleNamespace(terms=[])),
+            patch("src.pipeline.generate.evaluate_vocab_gate", return_value=failed_gate),
             patch(
-                "src.pipeline.run_seed_ingestion_stage",
+                "src.pipeline.scoring.run_seed_ingestion_stage",
                 return_value=SimpleNamespace(diagnostics={"candidates": []}),
             ),
         ):
@@ -1908,7 +1902,7 @@ class PipelineTests(unittest.TestCase):
             ),
             5,
         )
-        with patch("src.pipeline._inventory_min_k_target", return_value=17):
+        with patch("src.pipeline.scoring._inventory_min_k_target", return_value=17):
             self.assertEqual(
                 _effective_min_k_for_size(
                     size=15,

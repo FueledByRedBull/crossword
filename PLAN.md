@@ -348,8 +348,8 @@ This is required for reliable CC BY-SA attribution in published outputs.
     - Attribution capture and output validation.
 11. `src/evaluation.py`:
     - Benchmark summaries and release gates.
-12. `src/pipeline.py`:
-    - Stage orchestration.
+12. `src/pipeline/`:
+    - Stage orchestration: one module per stage group (`seed`, `scoring`, `titles`, `answers`, `clues`, `packaging`) and `generate.py` for the end-to-end run.
 13. `cli.py`:
     - User entry point (`generate`, `render`, per-stage commands).
 
