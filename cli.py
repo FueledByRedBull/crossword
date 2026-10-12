@@ -668,16 +668,20 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _report_problems(result: dict, started: float) -> None:
-    """Say on stderr why a run came out failed or thin: its statuses and the first errors the stages recorded."""
+def _report_problems(result: dict, started: float) -> bool:
+    """Say on stderr why a run came out failed or thin: its statuses and the first errors the stages recorded.
+
+    True when the puzzle is complete and ok; errors a stage recorded on the way do not make it false.
+    """
     package = result["package"].diagnostics
     recorded: dict[str, list[str]] = {}
     for path in sorted(Path(result["output_dir"]).glob("diagnostics_*.json")):
         if path.stat().st_mtime >= started:  # an earlier run in the same directory may have left others
             recorded[path.name] = json.loads(path.read_text(encoding="utf-8")).get("errors", [])
     messages = list(dict.fromkeys(message for found in recorded.values() for message in found))
-    if package["fill_status"] == "complete" and package["puzzle_status"] == "ok" and not messages:
-        return
+    usable = package["fill_status"] == "complete" and package["puzzle_status"] == "ok"
+    if usable and not messages:
+        return True
     print(
         f"Problems: fill_status={package['fill_status']}, puzzle_status={package['puzzle_status']}, "
         f"{len(messages)} distinct errors recorded",
@@ -687,6 +691,7 @@ def _report_problems(result: dict, started: float) -> None:
         print(f"Recorded in: {', '.join(name for name, found in recorded.items() if found)}", file=sys.stderr)
     for message in messages[:5]:
         print(f"  {message[:160]}", file=sys.stderr)
+    return usable
 
 
 def main() -> None:
@@ -905,7 +910,8 @@ def main() -> None:
         )
         print(f"Output dir: {result['output_dir']}")
         print(f"Puzzle: {result['package'].puzzle_path}")
-        _report_problems(result, started)
+        if not _report_problems(result, started):
+            sys.exit(1)
     elif args.command == "render":
         with open(args.puzzle, encoding="utf-8") as handle:
             puzzle = json.load(handle)

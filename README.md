@@ -91,7 +91,7 @@ Each entry: `number`, `answer` (normalised uppercase), `display_answer`, `enumer
 
 `puzzle_status` is one of `ok` (valid layout and every entry has a packageable clue), `insufficient_vocabulary`, `insufficient_clues`, `insufficient_quality` (layout failed).
 
-Each stage records what went wrong in the `errors` list of its diagnostics file: a page that could not be fetched, a cache miss in offline mode, a missing spaCy model. When the puzzle is not `complete` and `ok`, or any stage recorded an error, `generate` prints the two statuses, the number of distinct errors, the files that hold them and the first five messages to stderr. The exit code stays 0.
+Each stage records what went wrong in the `errors` list of its diagnostics file: a page that could not be fetched, a cache miss in offline mode, a missing spaCy model. When the puzzle is not `complete` and `ok`, or any stage recorded an error, `generate` prints the two statuses, the number of distinct errors, the files that hold them and the first five messages to stderr. The exit code is 1 when the puzzle is not `complete` and `ok`, and 0 otherwise: errors recorded on the way to a good puzzle do not fail the run.
 
 ## Main Commands
 
