@@ -404,49 +404,6 @@ def extract_terms_spacy(doc, *, source_title: str, lang: str = "en") -> list[Ter
     return terms
 
 
-def extract_terms_nltk(
-    text: str,
-    *,
-    source_title: str,
-    lang: str = "en",
-) -> list[TermCandidate]:
-    if lang != "en" or not text:
-        return []
-    try:
-        import nltk
-    except Exception:
-        return []
-    try:
-        tokens = nltk.word_tokenize(text)
-        tagged = nltk.pos_tag(tokens)
-    except Exception:
-        return []
-
-    terms: list[TermCandidate] = []
-    seen: set[str] = set()
-
-    grammar = r"NP: {<JJ.*>*<NN.*>+}"
-    try:
-        parser = nltk.RegexpParser(grammar)
-        tree = parser.parse(tagged)
-        for subtree in tree.subtrees(filter=lambda t: t.label() == "NP"):
-            candidate = _build_term_candidate(
-                " ".join(word for word, _ in subtree.leaves()),
-                source_title=source_title,
-                source_method="nltk",
-                lead_bold_signal=False,
-                lang=lang,
-            )
-            if candidate is None or candidate.answer in seen:
-                continue
-            seen.add(candidate.answer)
-            terms.append(candidate)
-    except Exception:
-        return terms
-
-    return terms
-
-
 def extract_terms_lead_bold(
     terms: list[str],
     *,

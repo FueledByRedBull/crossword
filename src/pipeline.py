@@ -16,7 +16,6 @@ from .term_extractor import (
     answer_cleanliness_score,
     clueability_score,
     extract_terms_lead_bold,
-    extract_terms_nltk,
     extract_terms_spacy,
     extract_terms_title_tokens,
     GENERIC_GRID_JUNK_EN,
@@ -140,26 +139,6 @@ def _safe_int(value, *, default: int = 0) -> int:
         return default
 
 
-def _infer_clue_class(row: dict) -> str:
-    clue_class = (row.get("clue_class") or "").strip().lower()
-    if clue_class in {"source_backed", "template_fallback", "synthetic_filler"}:
-        return clue_class
-
-    source_method = (row.get("source_method") or "").strip().lower()
-    if source_method == "package_filler_fallback":
-        return "synthetic_filler"
-
-    sentence_offset = _safe_int(row.get("sentence_offset"), default=-1)
-    has_provenance = bool((row.get("revid") or "").strip() or (row.get("oldid_url") or "").strip())
-    if sentence_offset >= 0 and has_provenance:
-        return "source_backed"
-    if sentence_offset == -1:
-        return "template_fallback"
-    if has_provenance:
-        return "source_backed"
-    return "template_fallback"
-
-
 def _is_packageable_clue(clue_row: dict) -> bool:
     text = (clue_row.get("clue") or "").strip()
     return bool(text) and has_packageable_clue_provenance(clue_row)
@@ -256,45 +235,31 @@ def _resolve_nlp_backend(
     nlp_backend: str = "auto",
 ) -> tuple[object | None, str | None, list[str], str | None, str | None]:
     errors: list[str] = []
-    backend = nlp_backend.lower()
-    if backend not in {"auto", "spacy", "nltk"}:
+    if nlp_backend.lower() not in {"auto", "spacy"}:
         errors.append(f"unsupported_nlp_backend:{nlp_backend}")
-        backend = "auto"
 
     nlp = None
     backend_used = None
     spacy_version = None
     spacy_model_version = None
 
-    if backend in {"auto", "spacy"}:
+    try:
+        import spacy
+    except ImportError as exc:  # pragma: no cover
+        errors.append(f"spacy_missing:{exc}")
+        spacy = None
+
+    if spacy is not None:
+        model_name = "en_core_web_sm" if lang == "en" else "el_core_news_sm"
         try:
-            import spacy
-        except ImportError as exc:  # pragma: no cover
-            errors.append(f"spacy_missing:{exc}")
-            spacy = None
+            nlp = spacy.load(model_name)
+            backend_used = "spacy"
+        except OSError as exc:  # pragma: no cover
+            errors.append(f"spacy_model_load_failed:{model_name}:{exc}")
 
-        if spacy is not None:
-            model_name = "en_core_web_sm" if lang == "en" else "el_core_news_sm"
-            try:
-                nlp = spacy.load(model_name)
-                backend_used = "spacy"
-            except Exception as exc:  # pragma: no cover
-                errors.append(f"spacy_model_load_failed:{model_name}:{exc}")
-
-            spacy_version = getattr(spacy, "__version__", None)
-            if nlp is not None:
-                try:
-                    spacy_model_version = nlp.meta.get("version")
-                except Exception:  # pragma: no cover
-                    pass
-
-    if backend_used is None and backend in {"auto", "nltk"}:
-        try:
-            import nltk  # noqa: F401
-
-            backend_used = "nltk"
-        except Exception as exc:  # pragma: no cover
-            errors.append(f"nltk_unavailable:{exc}")
+        spacy_version = getattr(spacy, "__version__", None)
+        if nlp is not None:
+            spacy_model_version = nlp.meta.get("version")
 
     return nlp, backend_used, errors, spacy_version, spacy_model_version
 
@@ -316,8 +281,6 @@ def _extract_answer_inventory(
     term_lists: list[list] = []
     if backend_used == "spacy" and nlp is not None:
         term_lists.append(extract_terms_spacy(nlp(extract), source_title=title, lang=lang))
-    elif backend_used == "nltk":
-        term_lists.append(extract_terms_nltk(extract, source_title=title, lang=lang))
     term_lists.append(extract_terms_lead_bold(lead_bold_terms, source_title=title, lang=lang))
     term_lists.append(extract_terms_title_tokens(title, source_title=title, lang=lang))
     merged = merge_terms(
@@ -331,7 +294,7 @@ def _extract_answer_inventory(
     return {term.normalized_answer for term in merged if term.normalized_answer}
 
 
-def _fetch_extract_with_revid(client: WikiClient, title: str, *, full: bool) -> dict:
+def _fetch_extract_with_revid(errors: list[str], client: WikiClient, title: str, *, full: bool) -> dict:
     """Extract and revision id from one response: the full article if `full` and available, else the intro.
 
     Nothing is paired across responses: a revision id is only the one the text arrived with.
@@ -339,7 +302,8 @@ def _fetch_extract_with_revid(client: WikiClient, title: str, *, full: bool) -> 
     for intro_only in (False, True) if full else (True,):
         try:
             payload = client.fetch_page_extract_with_revid(title, intro_only=intro_only)
-        except Exception:
+        except RuntimeError as exc:
+            errors.append(f"extract_with_revid_failed:{title}:{exc}")
             continue
         if payload.get("extract") and payload.get("revid"):
             return {**payload, "extract": strip_trailing_sections(payload["extract"])}
@@ -350,7 +314,7 @@ def _prefetch(errors: list[str], prefetch, titles: list[str], **kwargs) -> None:
     """Batch-fill the cache; the single-title getters still work if this fails."""
     try:
         prefetch(titles, **kwargs)
-    except Exception as exc:
+    except RuntimeError as exc:
         errors.append(f"prefetch_failed:{exc}")
 
 
@@ -427,7 +391,6 @@ def _build_clue_row(
     normalized_answer: str,
     answer_key_value: str,
     clue_text: str,
-    clue_class: str,
     source_method: str,
     source_page: str,
     revid: int | None,
@@ -442,7 +405,7 @@ def _build_clue_row(
         "normalized_answer": normalized_answer or answer_key_value,
         "clue": clue_text,
         "clue_score": clue_score,
-        "clue_class": clue_class,
+        "clue_class": "source_backed",
         "clue_style": clue_style,
         "source_method": source_method,
         "source_page": source_page,
@@ -538,7 +501,6 @@ def _collect_source_backed_clue_candidates(
                     normalized_answer=normalized_answer,
                     answer_key_value=key,
                     clue_text=clue_text,
-                    clue_class="source_backed",
                     source_method=term_source_method,
                     source_page=source_title,
                     revid=revid,
@@ -615,7 +577,6 @@ def _definition_clue_rows(
                     normalized_answer=normalized_answer,
                     answer_key_value=answer_key_value,
                     clue_text=clue_text,
-                    clue_class="source_backed",
                     source_method=term_source_method,
                     source_page=payload.get("title", title) or title,
                     revid=payload.get("revid"),
@@ -676,14 +637,14 @@ def run_seed_ingestion_stage(
             links = [links[i * len(links) // max_links] for i in range(max_links)]
         resolved_seed_title = links_payload["seed_title"]
         resolved_seed_page_id = links_payload["seed_page_id"]
-    except Exception as exc:  # pragma: no cover - runtime/network path
+    except RuntimeError as exc:  # pragma: no cover - runtime/network path
         errors.append(f"link_fetch_failed: {exc}")
 
     backlinks: set[str] = set()
     if include_backlinks and links:
         try:
             backlinks = client.fetch_backlinks(resolved_seed_title, max_backlinks=max_backlinks)
-        except Exception as exc:  # pragma: no cover - runtime/network path
+        except RuntimeError as exc:  # pragma: no cover - runtime/network path
             errors.append(f"backlink_fetch_failed: {exc}")
 
     expansion_modes = {"one_hop_only", "one_hop_plus_bounded_two_hop"}
@@ -708,7 +669,7 @@ def run_seed_ingestion_stage(
             seed_extract = client.fetch_page_extract(resolved_seed_title, intro_only=True).get(
                 "extract", ""
             )
-        except Exception as exc:  # pragma: no cover - runtime/network path
+        except RuntimeError as exc:  # pragma: no cover - runtime/network path
             seed_extract = ""
             errors.append(f"two_hop_seed_extract_failed:{exc}")
 
@@ -866,10 +827,10 @@ def run_candidate_scoring_stage(
 
     try:
         seed_extract = client.fetch_page_extract(seed_title, intro_only=True).get("extract", "")
-    except Exception as exc:  # pragma: no cover
+    except RuntimeError as exc:  # pragma: no cover
         seed_extract = ""
         errors.append(f"seed_extract_failed: {exc}")
-    seed_text = _fetch_extract_with_revid(client, seed_title, full=True)["extract"]
+    seed_text = _fetch_extract_with_revid(errors, client, seed_title, full=True)["extract"]
 
     nlp, backend_used, backend_errors, _, _ = _resolve_nlp_backend(lang=lang, nlp_backend="auto")
     errors.extend(backend_errors)
@@ -884,13 +845,13 @@ def run_candidate_scoring_stage(
         title = candidate["title"]
         try:
             payload = client.fetch_page_extract(title, intro_only=True)
-        except Exception as exc:  # pragma: no cover
+        except RuntimeError as exc:  # pragma: no cover
             payload = {}
             errors.append(f"candidate_extract_failed:{title}:{exc}")
         extract = payload.get("extract", "")
         try:
             lead_wikitext = client.fetch_lead_wikitext(title).get("wikitext", "")
-        except Exception as exc:  # pragma: no cover
+        except RuntimeError as exc:  # pragma: no cover
             lead_wikitext = ""
             errors.append(f"lead_wikitext_failed:{title}:{exc}")
         titles.append(title)
@@ -1371,7 +1332,7 @@ def _build_title_answer_rows(
     for title, rel_score, intro_on_topic, seed_mentions in [(seed_title, best_rel, True, 10), *scored]:
         try:
             payload = client.fetch_page_extract(title, intro_only=True)
-        except Exception as exc:
+        except RuntimeError as exc:
             errors.append(f"title_answer_extract_failed:{title}:{exc}")
             continue
         # A redirect ("Big bands") is named after the page it leads to.
@@ -1383,7 +1344,7 @@ def _build_title_answer_rows(
         return page[0] == seed_title, page[1] + 0.1 * min(page[3], 10) + (0.5 if page[2] else 0.0)
 
     pages.sort(key=evidence, reverse=True)
-    seed_payload = _fetch_extract_with_revid(client, seed_title, full=True)
+    seed_payload = _fetch_extract_with_revid(errors, client, seed_title, full=True)
 
     def has_seed_fill_in(display: str, normalized: str) -> bool:
         fills = _collect_source_backed_clue_candidates(
@@ -1519,7 +1480,7 @@ def run_term_extraction_stage(
             selected = json.loads(selected_payload)
             selected_artifact = SelectedCandidatesArtifact.from_dict(selected)
             selected_titles = selected_artifact.selected_titles
-        except Exception as exc:  # pragma: no cover
+        except ValueError as exc:  # pragma: no cover
             errors.append(f"selected_parse_failed:{exc}")
             selected_titles = []
     else:
@@ -1555,11 +1516,11 @@ def run_term_extraction_stage(
     for title in selected_titles:
         try:
             intro_extract = client.fetch_page_extract(title, intro_only=True).get("extract", "")
-        except Exception as exc:  # pragma: no cover
+        except RuntimeError as exc:  # pragma: no cover
             intro_extract = ""
             errors.append(f"candidate_extract_failed:{title}:{exc}")
 
-        full_payload = _fetch_extract_with_revid(client, title, full=True)
+        full_payload = _fetch_extract_with_revid(errors, client, title, full=True)
         if not full_payload["extract"]:  # the plain intro serves term extraction, but has no revision id
             full_payload = {"title": title, "extract": intro_extract, "revid": None}
         full_payloads[title] = full_payload
@@ -1567,7 +1528,7 @@ def run_term_extraction_stage(
 
         try:
             lead_wikitext = client.fetch_lead_wikitext(title).get("wikitext", "")
-        except Exception as exc:  # pragma: no cover
+        except RuntimeError as exc:  # pragma: no cover
             lead_wikitext = ""
             errors.append(f"lead_wikitext_failed:{title}:{exc}")
         lead_terms[title] = client.extract_lead_bold_terms(lead_wikitext)
@@ -1577,9 +1538,6 @@ def run_term_extraction_stage(
         for title, extract in extracts.items():
             doc = nlp(extract)
             term_lists.append(extract_terms_spacy(doc, source_title=title, lang=lang))
-    elif backend_used == "nltk":
-        for title, extract in extracts.items():
-            term_lists.append(extract_terms_nltk(extract, source_title=title, lang=lang))
 
     for title, bold_terms in lead_terms.items():
         term_lists.append(extract_terms_lead_bold(bold_terms, source_title=title, lang=lang))
@@ -1669,7 +1627,7 @@ def run_term_extraction_stage(
                         if instance_of & preferred_entity_types:
                             entity_score = 1.0
                             entity_hits += 1
-                except Exception as exc:  # pragma: no cover - network path
+                except RuntimeError as exc:  # pragma: no cover - network path
                     errors.append(f"wikidata_lookup_failed:{term.answer}:{exc}")
                 entity_scores[cache_key] = entity_score
 
@@ -1987,7 +1945,7 @@ def run_rescue_ladder(
 
             payload = json.loads(path.read_text(encoding="utf-8"))
             return payload.get("selected_titles", [])
-        except Exception as exc:  # pragma: no cover
+        except (OSError, ValueError) as exc:  # pragma: no cover
             errors.append(f"selected_parse_failed:{exc}")
             return []
 
@@ -2232,11 +2190,8 @@ def run_clue_extraction_stage(
         model_name = "en_core_web_sm" if lang == "en" else "el_core_news_sm"
         nlp = spacy.load(model_name)
         clue_spacy_version = getattr(spacy, "__version__", None)
-        try:
-            clue_spacy_model_version = nlp.meta.get("version")
-        except Exception:  # pragma: no cover
-            pass
-    except Exception as exc:  # pragma: no cover
+        clue_spacy_model_version = nlp.meta.get("version")
+    except (ImportError, OSError) as exc:  # pragma: no cover
         errors.append(f"clue_spacy_unavailable:{exc}")
 
     import csv
@@ -2262,7 +2217,7 @@ def run_clue_extraction_stage(
     try:
         selected = json.loads(Path(selected_path).read_text(encoding="utf-8"))
         selected_titles = SelectedCandidatesArtifact.from_dict(selected).selected_titles
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
         errors.append(f"selected_unavailable:{exc}")
     full_titles = {seed_title, *selected_titles}
     pool_titles = {title for term in terms for title in term["source_titles"].split("|") if title}
@@ -2272,7 +2227,7 @@ def run_clue_extraction_stage(
 
     def load_source_payload(title: str) -> dict:
         if title not in source_cache:
-            source_cache[title] = _fetch_extract_with_revid(client, title, full=title in full_titles)
+            source_cache[title] = _fetch_extract_with_revid(errors, client, title, full=title in full_titles)
         return source_cache[title]
 
     leads = [
@@ -2416,10 +2371,6 @@ def run_clue_extraction_stage(
             )
 
     provenance_missing = validate_clue_provenance(clues)
-    clue_class_counts: dict[str, int] = {}
-    for row in clues:
-        clue_class = _infer_clue_class(row)
-        clue_class_counts[clue_class] = clue_class_counts.get(clue_class, 0) + 1
     definition_count = sum(1 for row in clues if row["clue_style"] == "definition")
     diagnostics = {
         "stage": "clue_extraction",
@@ -2434,9 +2385,6 @@ def run_clue_extraction_stage(
         "spacy_model_version": clue_spacy_model_version,
         "diversity_rejected_count": diversity_rejected_count,
         "unclued_term_count": len(unique_term_keys - clued_keys),
-        "clue_class_counts": clue_class_counts,
-        "source_backed_clue_count": clue_class_counts.get("source_backed", 0),
-        "template_fallback_clue_count": clue_class_counts.get("template_fallback", 0),
         "provenance_missing_count": len(provenance_missing),
         "provenance_missing": provenance_missing[:10],
         "errors": errors,
@@ -2597,7 +2545,7 @@ def run_packaging_stage(
             selected = SelectedCandidatesArtifact.from_dict(
                 json.loads(Path(selected_path).read_text(encoding="utf-8"))
             )
-        except Exception as exc:  # pragma: no cover
+        except (OSError, ValueError) as exc:  # pragma: no cover
             errors.append(f"selected_parse_failed:{exc}")
     else:
         errors.append("selected_missing")
@@ -2606,7 +2554,7 @@ def run_packaging_stage(
     if Path(grid_path).exists():
         try:
             grid = GridArtifact.from_dict(json.loads(Path(grid_path).read_text(encoding="utf-8")))
-        except Exception as exc:  # pragma: no cover
+        except (OSError, ValueError) as exc:  # pragma: no cover
             errors.append(f"grid_parse_failed:{exc}")
     else:
         errors.append("grid_missing")
@@ -2639,7 +2587,7 @@ def run_packaging_stage(
                 "enumeration": enumeration(display),
                 "clue": clue["clue"],
                 "clue_style": clue.get("clue_style", ""),
-                "clue_class": _infer_clue_class(clue),
+                "clue_class": "source_backed",
                 "row": placement.row,
                 "col": placement.col,
                 "length": len(placement.answer),

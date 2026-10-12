@@ -6,7 +6,6 @@ from src.term_extractor import (
     clueability_score,
     crosswordability_score,
     extract_terms_lead_bold,
-    extract_terms_nltk,
     get_stopwords,
     merge_plural_duplicates,
     merge_terms,
@@ -297,29 +296,6 @@ class MergePluralDuplicatesTests(unittest.TestCase):
     def test_unrelated_s_endings_survive(self) -> None:
         rows = [self._row("JAZZ", 0.5), self._row("BLUES", 0.5), self._row("CLASS", 0.5)]
         self.assertEqual(len(merge_plural_duplicates(rows)), 3)
-
-
-class NltkBackendParityTests(unittest.TestCase):
-    def test_nltk_returns_term_candidates(self) -> None:
-        """nltk backend must return at least one candidate for non-trivial text."""
-        text = "Thermodynamics is a branch of physical science dealing with heat and temperature."
-        try:
-            terms = extract_terms_nltk(text, source_title="Thermodynamics", lang="en")
-        except Exception as exc:
-            self.skipTest(f"nltk unavailable in test environment: {exc}")
-        self.assertIsInstance(terms, list)
-        # If nltk extracted anything, every item must be a TermCandidate.
-        for term in terms:
-            self.assertIsNotNone(term.normalized_answer)
-            self.assertIsInstance(term.lead_bold_signal, bool)
-            self.assertEqual(term.source_method, "nltk")
-
-    def test_spacy_and_nltk_both_find_thermodynamics(self) -> None:
-        """Parity smoke-test: both backends should find the bold term regardless of NLP path."""
-        bold_terms = ["Thermodynamics"]
-        # lead_bold is backend-independent — verify it handles both paths without error.
-        result = extract_terms_lead_bold(bold_terms, source_title="Thermodynamics", lang="en")
-        self.assertTrue(any(t.normalized_answer == "THERMODYNAMICS" for t in result))
 
 
 if __name__ == "__main__":

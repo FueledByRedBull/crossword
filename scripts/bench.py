@@ -14,10 +14,7 @@ if str(ROOT) not in sys.path:
 def _load_json(path: Path) -> dict:
     if not path.exists():
         return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _gate_a_scores(fixture: dict, pool_path: Path) -> dict:
@@ -39,7 +36,7 @@ def _load_nlp(lang: str):
         import spacy
 
         return spacy.load("en_core_web_sm" if lang == "en" else "el_core_news_sm")
-    except Exception:
+    except (ImportError, OSError):  # the pipeline run records the same failure in its terms diagnostics
         return None
 
 
@@ -204,7 +201,7 @@ def main() -> None:
     parser.add_argument("--max-len", type=int, default=15)
     parser.add_argument("--min-alpha-ratio", type=float, default=0.8)
     parser.add_argument("--min-df", type=int, default=2)
-    parser.add_argument("--nlp-backend", choices=["auto", "spacy", "nltk"], default="auto")
+    parser.add_argument("--nlp-backend", choices=["auto", "spacy"], default="auto")
     parser.add_argument("--entity-type-scoring", action="store_true")
     parser.add_argument("--gate-min", type=int, default=30)
     parser.add_argument("--clue-min-words", type=int, default=6)

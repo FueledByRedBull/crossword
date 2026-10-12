@@ -15,6 +15,7 @@ from src.pipeline import (
     _build_title_answer_rows,
     _collect_source_backed_clue_candidates,
     _effective_min_k_for_size,
+    _fetch_extract_with_revid,
     _inventory_min_k_target,
     _is_person,
     _definition_clue_rows,
@@ -139,6 +140,21 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("prefetch_failed:boom", result.diagnostics["errors"])
         self.assertEqual(len(result.scores), 2)
 
+    def test_failed_full_text_is_recorded_and_the_intro_stands_in(self) -> None:
+        def fetch(title, intro_only=True):
+            if not intro_only:
+                raise RuntimeError("network blocked")
+            return {"title": title, "extract": "Jazz is a genre.", "revid": 7}
+
+        client = MagicMock()
+        client.fetch_page_extract_with_revid.side_effect = fetch
+        errors: list[str] = []
+
+        payload = _fetch_extract_with_revid(errors, client, "Jazz", full=True)
+
+        self.assertEqual((payload["extract"], payload["revid"]), ("Jazz is a genre.", 7))
+        self.assertEqual(errors, ["extract_with_revid_failed:Jazz:network blocked"])
+
     def test_seed_stage_rejects_unsupported_lang(self) -> None:
         output_path = Path("tests") / "tmp_outputs" / "diagnostics_lang.json"
         cache_dir = Path("tests") / "tmp_cache_pipeline_lang"
@@ -260,7 +276,7 @@ class PipelineTests(unittest.TestCase):
             diagnostics_path=diagnostics_path,
         )
 
-        def fake_extract(_self, title, intro_only=True):  # noqa: ARG001
+        def fake_extract(title, intro_only=True):  # noqa: ARG001
             return {"extract": f"{title} reference text"}
 
         with (
@@ -750,7 +766,7 @@ class PipelineTests(unittest.TestCase):
                 terms_path=tmp_dir / "answer_candidates.csv",
                 diagnostics_path=diagnostics_path,
                 min_df=3,
-                nlp_backend="nltk",
+                nlp_backend="spacy",
                 entity_type_scoring=True,
                 wikidata_cache_dir="data/cache/wikidata",
                 lexicon_path="data/lexicon/combined_wordfreq.txt",
@@ -763,11 +779,11 @@ class PipelineTests(unittest.TestCase):
         second_call = mocked_terms.call_args_list[1].kwargs
         self.assertEqual(first_call["scores_path"], tmp_dir / "candidate_scores.csv")
         self.assertEqual(first_call["min_df"], 3)
-        self.assertEqual(first_call["nlp_backend"], "nltk")
+        self.assertEqual(first_call["nlp_backend"], "spacy")
         self.assertTrue(first_call["entity_type_scoring"])
         self.assertEqual(first_call["lexicon_weight"], 0.22)
         self.assertEqual(second_call["min_df"], 1)
-        self.assertEqual(second_call["nlp_backend"], "nltk")
+        self.assertEqual(second_call["nlp_backend"], "spacy")
         self.assertEqual(mocked_clues.call_args_list[0].kwargs["selected_path"], selected_path)
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -810,7 +826,7 @@ class PipelineTests(unittest.TestCase):
                 clues_path=clues_path,
             )
 
-        self.assertEqual(result.diagnostics["source_backed_clue_count"], 1)
+        self.assertEqual(result.diagnostics["clue_count"], 1)
         clue_payload = clues_path.read_text(encoding="utf-8")
         self.assertIn("source_backed", clue_payload)
 

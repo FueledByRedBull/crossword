@@ -353,7 +353,7 @@ class WikiClient:
         for title in dict.fromkeys(title for title in titles if title):
             try:
                 payloads[title] = fetch(title)
-            except Exception as exc:
+            except RuntimeError as exc:
                 payloads[title] = empty(title)
                 errors[title] = str(exc)
         return payloads, errors

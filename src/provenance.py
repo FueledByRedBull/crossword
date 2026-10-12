@@ -10,31 +10,14 @@ def build_oldid_url(title: str, revid: int | None, *, lang: str = "en") -> str:
     return f"https://{lang}.wikipedia.org/w/index.php?title={safe_title}&oldid={revid}"
 
 
-def infer_clue_class(clue: dict) -> str:
-    clue_class = str(clue.get("clue_class") or "").strip().lower()
-    if clue_class in {"source_backed", "template_fallback", "synthetic_filler"}:
-        return clue_class
-    source_method = str(clue.get("source_method") or "").strip().lower()
-    if source_method == "package_filler_fallback":
-        return "synthetic_filler"
-    sentence_offset = clue.get("sentence_offset")
-    if sentence_offset not in (None, "", -1, "-1"):
-        return "source_backed"
-    return "template_fallback"
-
-
 def clue_provenance_missing_fields(clue: dict) -> list[str]:
-    clue_class = infer_clue_class(clue)
-    if clue_class == "synthetic_filler":
-        return ["synthetic_filler_not_packageable"]
     required_fields = [
         "source_method",
         "source_page",
         "revid",
         "oldid_url",
+        "sentence_offset",
     ]
-    if clue_class == "source_backed":
-        required_fields.append("sentence_offset")
     missing: list[str] = []
     for field in required_fields:
         value = clue.get(field)

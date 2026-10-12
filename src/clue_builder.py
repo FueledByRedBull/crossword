@@ -1088,11 +1088,7 @@ def is_answer_subject(sentence: str, answer: str, nlp) -> bool:
         return False
     answer_tokens = {token.lower() for token in answer.split()}
     answer_lemmas = lemmatize_text(answer, nlp)
-    try:
-        doc = nlp(sentence)
-    except Exception:
-        return False
-    for token in doc:
+    for token in nlp(sentence):
         if token.dep_ in {"nsubj", "nsubjpass", "csubj", "csubjpass"}:
             token_text = token.text.lower()
             token_lemma = token.lemma_.lower() if token.lemma_ else token_text

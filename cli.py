@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 import sys
+import time
+from pathlib import Path
 
 from src.pipeline import (
     run_candidate_scoring_stage,
@@ -328,7 +330,7 @@ def _build_parser() -> argparse.ArgumentParser:
     term_parser.add_argument("--min-df", type=int, default=2, help="Minimum doc frequency")
     term_parser.add_argument(
         "--nlp-backend",
-        choices=["auto", "spacy", "nltk"],
+        choices=["auto", "spacy"],
         default="auto",
         help="NLP backend for term extraction",
     )
@@ -468,7 +470,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     rescue_parser.add_argument(
         "--nlp-backend",
-        choices=["auto", "spacy", "nltk"],
+        choices=["auto", "spacy"],
         default="auto",
         help="NLP backend for rescue term extraction",
     )
@@ -632,7 +634,7 @@ def _build_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("--max-len", type=int, default=15)
     generate_parser.add_argument("--min-alpha-ratio", type=float, default=0.8)
     generate_parser.add_argument("--min-df", type=int, default=2)
-    generate_parser.add_argument("--nlp-backend", choices=["auto", "spacy", "nltk"], default="auto")
+    generate_parser.add_argument("--nlp-backend", choices=["auto", "spacy"], default="auto")
     generate_parser.add_argument("--entity-type-scoring", action="store_true")
     generate_parser.add_argument("--gate-min", type=int, default=30)
     generate_parser.add_argument("--clue-min-words", type=int, default=6)
@@ -664,6 +666,27 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     return parser
+
+
+def _report_problems(result: dict, started: float) -> None:
+    """Say on stderr why a run came out failed or thin: its statuses and the first errors the stages recorded."""
+    package = result["package"].diagnostics
+    recorded: dict[str, list[str]] = {}
+    for path in sorted(Path(result["output_dir"]).glob("diagnostics_*.json")):
+        if path.stat().st_mtime >= started:  # an earlier run in the same directory may have left others
+            recorded[path.name] = json.loads(path.read_text(encoding="utf-8")).get("errors", [])
+    messages = list(dict.fromkeys(message for found in recorded.values() for message in found))
+    if package["fill_status"] == "complete" and package["puzzle_status"] == "ok" and not messages:
+        return
+    print(
+        f"Problems: fill_status={package['fill_status']}, puzzle_status={package['puzzle_status']}, "
+        f"{len(messages)} distinct errors recorded",
+        file=sys.stderr,
+    )
+    if messages:
+        print(f"Recorded in: {', '.join(name for name, found in recorded.items() if found)}", file=sys.stderr)
+    for message in messages[:5]:
+        print(f"  {message[:160]}", file=sys.stderr)
 
 
 def main() -> None:
@@ -840,6 +863,7 @@ def main() -> None:
     elif args.command == "generate":
         if args.offline:
             os.environ["CROSSWORD_OFFLINE"] = "1"
+        started = time.time()
         result = run_generate_pipeline(
             seed_title=args.seed,
             lang=args.lang,
@@ -881,6 +905,7 @@ def main() -> None:
         )
         print(f"Output dir: {result['output_dir']}")
         print(f"Puzzle: {result['package'].puzzle_path}")
+        _report_problems(result, started)
     elif args.command == "render":
         with open(args.puzzle, encoding="utf-8") as handle:
             puzzle = json.load(handle)

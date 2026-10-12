@@ -24,7 +24,7 @@ The system should optimize for thematic coherence, layout quality, clue quality,
 4. Fetch article content and metadata for seed + candidates.
 5. Compute relevance, redundancy, depth, and backlink-aware selection scores.
 6. Select coherent-yet-diverse articles and derive optimal `K`.
-7. Extract, filter, and score crossword answer candidates using an explicit NLP backend strategy (`spaCy` default, `nltk` fallback).
+7. Extract, filter, and score crossword answer candidates with `spaCy` as the NLP backend (without its model only the lead-bold and title terms remain).
 8. Support a `--lang` flag (`en` default, `el` for Greek) that switches the Wikipedia base URL, spaCy model, alphabet filter, and accent normalization profile.
 9. Generate clues: definition clues from each article's first sentence, with fill-in-the-blank clues from article text as fallback, validated by a strict four-pass pipeline.
 10. Lay out the clued answers in a free-form grid (no templates, no filler words).
@@ -218,11 +218,10 @@ If `J(K)` plateaus but the vocabulary readiness gate is not satisfied, apply the
 #### Extraction
 
 1. Primary backend: `spaCy` noun chunks + entity spans (default for speed/quality balance on Wikipedia prose).
-2. Fallback backend: `nltk` chunker behind a feature flag when `spaCy` models are unavailable.
-3. Wikipedia structural signal:
+2. Wikipedia structural signal:
    - Parse lead-section boldface terms (first-definition convention) and add a high-precision prior.
-4. Merge NLP and structural candidates into a unified pool.
-5. Normalize (case, punctuation, inflection handling).
+3. Merge NLP and structural candidates into a unified pool.
+4. Normalize (case, punctuation, inflection handling).
 
 #### Backend and Signal Policy
 
@@ -236,7 +235,7 @@ Additional notes:
 1. Optional quality profile: upgrade to `en_core_web_md` / `el_core_news_md` when higher recall is needed.
 2. Greek leakage check must rely on spaCy's Greek lemmatizer rather than simple stemming, due to high inflection.
 3. Structural boost: terms found in lead boldface receive a score bonus, not an auto-accept.
-4. Provenance tags on each candidate: `source_method = spacy|nltk|lead_bold|hybrid`.
+4. Provenance tags on each candidate: `source_method = spacy|lead_bold|hybrid`.
 5. Reproducibility requirement:
    - Pin exact `spaCy` and model versions in `requirements.txt`/lock file and log active versions in diagnostics.
 
@@ -336,7 +335,7 @@ This is required for reliable CC BY-SA attribution in published outputs.
 4. `src/k_selector.py`:
    - Objective and marginal stopping logic.
 5. `src/term_extractor.py`:
-   - Candidate term extraction (`spaCy` primary, `nltk` fallback), lead-bold integration, and scoring.
+   - Candidate term extraction (`spaCy`), lead-bold integration, and scoring.
 6. `src/clue_builder.py`:
    - Four-pass clue pipeline (including diversity) and leakage checks.
 7. `src/vocab_gate.py`:
@@ -409,7 +408,7 @@ This is required for reliable CC BY-SA attribution in published outputs.
 12. `diagnostics: dict`
 13. `attribution: list`
 
-Entry record: `number`, `answer`, `display_answer`, `enumeration`, `clue`, `clue_style` (`definition | fill_in_blank`), `clue_class`, `row`, `col`, `length`.
+Entry record: `number`, `answer`, `display_answer`, `enumeration`, `clue`, `clue_style` (`definition | fill_in_blank`), `clue_class` (always `source_backed`), `row`, `col`, `length`.
 
 ## 8. Implementation Backlog
 
@@ -445,12 +444,11 @@ Entry record: `number`, `answer`, `display_answer`, `enumeration`, `clue`, `clue
 
 ### Phase 4: Terms and Clues
 
-1. Implement phrase/entity extraction with `spaCy` default backend.
-2. Add `nltk` fallback mode behind feature flag.
-3. Add lead-bold structural term signal and fusion scoring.
-4. Add entity-type preference and article-frequency floor.
-5. Add answer shape scoring.
-6. Implement four-pass clue pipeline (extract, mask, validate, diversity) with leakage validation.
+1. Implement phrase/entity extraction with the `spaCy` backend.
+2. Add lead-bold structural term signal and fusion scoring.
+3. Add entity-type preference and article-frequency floor.
+4. Add answer shape scoring.
+5. Implement four-pass clue pipeline (extract, mask, validate, diversity) with leakage validation.
 
 ### Phase Gate: Vocabulary Readiness (Before Layout)
 
@@ -489,14 +487,13 @@ Entry record: `number`, `answer`, `display_answer`, `enumeration`, `clue`, `clue
 5. Entity-type preference and frequency-floor filtering.
 6. Answer shape scoring calibration.
 7. Lead-bold extraction correctness from representative pages using `mwparserfromhell`.
-8. Backend parity smoke test (`spaCy` vs `nltk` fallback behavior).
-9. Clue leakage rejection (exact + morphological cousin).
-10. Clue diversity bucketing and cap enforcement.
-11. Layout validity rules (crossing, connectivity, every letter run is one word).
-12. Layout metrics and determinism for a fixed random seed.
-13. Attribution completeness validation.
-14. Cache key stability test for `(endpoint, params_hash)` addressing.
-15. Dependency/version pin check for `spaCy` and model package.
+8. Clue leakage rejection (exact + morphological cousin).
+9. Clue diversity bucketing and cap enforcement.
+10. Layout validity rules (crossing, connectivity, every letter run is one word).
+11. Layout metrics and determinism for a fixed random seed.
+12. Attribution completeness validation.
+13. Cache key stability test for `(endpoint, params_hash)` addressing.
+14. Dependency/version pin check for `spaCy` and model package.
 
 ### Integration Tests
 
@@ -574,7 +571,7 @@ python cli.py generate \
 3. Risk: answer set is thematic but hard to fill.
    - Mitigation: shape penalty, crossing-aware answer scoring, conflict-aware `J(K)`.
 4. Risk: extractor quality variance across domains.
-   - Mitigation: `spaCy` default, `nltk` fallback, lead-bold structural priors, and benchmark-based calibration.
+   - Mitigation: `spaCy`, lead-bold structural priors, and benchmark-based calibration.
 5. Risk: clues are awkward or leaky.
    - Mitigation: four-pass clue pipeline with leakage validation and diversity deduplication.
 6. Risk: attribution gaps discovered late.
@@ -622,7 +619,7 @@ python cli.py generate \
 4. Select and fix benchmark seeds: `Thermodynamics` + one dissimilar domain (`Jazz` or `Ancient Rome`).
 5. Implement semantic scorer with depth/backlink-aware MMR ranking.
 6. Implement `K` optimizer with a conflict-aware objective, plus thin-pool fallbacks.
-7. Implement term extraction (`spaCy` primary, `nltk` fallback) with entity/frequency/shape scoring.
+7. Implement term extraction (`spaCy`) with entity/frequency/shape scoring.
 8. Implement four-pass clue builder (extract, mask, validate, diversity) with leakage checks.
 9. Gate layout start on vocabulary readiness criteria.
 10. Implement the free-form layout (Phase 5) and `render`.

@@ -25,6 +25,9 @@ class ProvenanceTests(unittest.TestCase):
         clues[0]["revid"] = None
         missing = validate_clue_provenance(clues)
         self.assertTrue(missing)
+        clues[0]["revid"] = 1
+        del clues[0]["sentence_offset"]
+        self.assertEqual(validate_clue_provenance(clues), ["0:sentence_offset"])
 
 
 if __name__ == "__main__":
