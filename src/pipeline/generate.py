@@ -197,20 +197,19 @@ def run_rescue_ladder(
     if gate.passed:
         return _finish(True, "loosen_min_df", gate)
 
-    # Promote the next on-topic candidates by rank (up to 3) into the selected set. The step keeps its old name in
-    # the diagnostics.
+    # Promote the next on-topic candidates by rank (up to 3) into the selected set.
     if Path(candidate_scores_path).exists():
         promoted = _next_ranked_titles(candidate_scores_path, selected_titles, errors)
-        steps.append({"action": "promote_borderline", "value": len(promoted)})
+        steps.append({"action": "promote_next_ranked", "value": len(promoted)})
         if promoted:
             selected_titles = selected_titles + promoted
             selected_path = _write_selected(Path(selected_override_path), selected_titles, seed_title, lang)
     else:
-        steps.append({"action": "promote_borderline", "value": 0, "note": "candidate_scores_missing"})
+        steps.append({"action": "promote_next_ranked", "value": 0, "note": "candidate_scores_missing"})
 
     gate = _run_gate(min_df_value=1, min_len_value=min_len)
     if gate.passed:
-        return _finish(True, "promote_borderline", gate)
+        return _finish(True, "promote_next_ranked", gate)
 
     # Two-hop: the pages the on-topic selected articles link to are scored like the seed's own links. The best
     # join the selected articles and all of them can be answers. Without the scoring arguments nothing can be scored.

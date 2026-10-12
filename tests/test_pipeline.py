@@ -1875,7 +1875,7 @@ class PipelineTests(unittest.TestCase):
             )
 
         steps = result["diagnostics"]["steps"]
-        promote_steps = [step for step in steps if step.get("action") == "promote_borderline"]
+        promote_steps = [step for step in steps if step.get("action") == "promote_next_ranked"]
         self.assertTrue(promote_steps)
         self.assertEqual(promote_steps[0]["value"], 3)
         # The off-topic row is skipped, the three KEEP rows are taken in rank order, and the fourth candidate waits.

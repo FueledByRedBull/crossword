@@ -204,7 +204,7 @@ Choose `K` with diminishing returns:
 If `J(K)` plateaus but the vocabulary readiness gate is not satisfied, apply the following steps in order, stopping as soon as the gate passes:
 
 1. Loosen `min_df` to `1` (from adaptive default).
-2. Promote the next 3 on-topic candidates by rank that are not selected yet into the selected set (`promote_borderline` in the diagnostics, the step's old name).
+2. Promote the next 3 on-topic candidates by rank that are not selected yet into the selected set (`promote_next_ranked` in the diagnostics).
 3. Widen from the selected articles: score the pages linked from at most 6 selected articles whose intro is on topic (an even sample of each one's links, at most 100 new pages), let the best 6 join the selected articles, and let all of them be answers.
 4. Reduce minimum answer length from `4` to `3`.
 5. If all four steps fail: go on with the thin pool when it has at least `min_words` clued answers (`accept_thin_pool`); otherwise emit `puzzle_status: insufficient_vocabulary` and halt gracefully.
