@@ -48,6 +48,7 @@ from .clue_builder import (
     lead_word_counts,
     split_sentences,
     strip_trailing_sections,
+    who_definition,
 )
 from .provenance import build_oldid_url, has_packageable_clue_provenance, validate_clue_provenance
 from .wikidata_client import WikidataClient
@@ -479,12 +480,14 @@ def _collect_source_backed_clue_candidates(
     nlp: object | None,
     allow_fragments: bool = True,
     full_name: str | None = None,
+    person: bool = False,
 ) -> list[dict]:
     """Fill-in candidates, complete sentences first, then the seed article's before other pages'.
 
     A fragment is a window that is not a whole sentence and not a single clause-boundary cut; the
     term stage still counts them as support, a clue never uses one. With `full_name` the answer is a
     surname and the blank may stand for the whole name: "hired ____ as" from "hired Wayne Shorter as".
+    The answer of a `person` is a name: a sentence with it in lower case ("a shorter set") is no candidate.
     """
     key = _answer_key(answer, normalized_answer, lang=lang)
     if not key:
@@ -502,7 +505,9 @@ def _collect_source_backed_clue_candidates(
         for sentence_offset, candidate_sentence in enumerate(split_sentences(extract)):
             if named is not None:  # another person's name ("Alice Coltrane") stays, and still spoils the blank
                 candidate_sentence = named.sub(answer, candidate_sentence)
-            if not pattern.search(candidate_sentence):
+            if not pattern.search(candidate_sentence) or (
+                person and not all(match.group()[0].isupper() for match in pattern.finditer(candidate_sentence))
+            ):
                 continue
             # Headings and link lists are glued to a sentence by line breaks; the clue is the line with the answer.
             candidate_sentence = max(
@@ -560,12 +565,16 @@ def _definition_clue_rows(
     lead_counts: Counter[str],
     pool_size: int,
     seed_title: str,
+    person: bool = False,
 ) -> list[dict]:
     """Clue an article-title answer with its own article's lead sentence, subject removed.
 
     The second, longer cut is there for generic definitions ("An American physicist"): it may
-    reach the relative clause that says who the person was. A definition that stays generic is dropped.
-    When none is left, the second sentence is tried ("He was one of the most influential figures in jazz piano.").
+    reach the relative clause that says who the person was. A definition that stays generic is dropped; for a
+    `person` the generic one is joined with what the second or third sentence says they did ("An English
+    physicist who studied the nature of heat"), and that is as good as a first-sentence definition.
+    When none is left, the second sentence is tried ("He was one of the most influential figures in jazz piano."):
+    a `follow_up` row, the last resort after the fill-ins.
     """
     sentences = split_sentences(payload.get("extract", ""))
     rows: list[dict] = []
@@ -573,31 +582,50 @@ def _definition_clue_rows(
     for offset, cut in enumerate((definition_clue, follow_up_definition)):
         if rows or offset >= len(sentences):
             break
-        texts: list[str] = []
+        texts: list[tuple[str, int]] = []  # (clue, the sentence it comes from)
+        generic: dict[int, str] = {}  # the valid but generic cuts, by their word limit
         for max_words in (16, MAX_CLUE_WORDS):
             clue_text = cut(sentences[offset], answer=answer, max_words=max_words, nlp=nlp, lang=lang)
             if (
                 clue_text
-                and clue_text not in texts
+                and clue_text not in [text for text, _ in texts]
                 and clue_pass_validate(clue_text, answer, min_words=3, nlp=nlp, lang=lang)
-                and not is_generic_definition(clue_text, lead_counts, pool_size, nlp, seed_title=seed_title)
             ):
-                texts.append(clue_text)
+                if is_generic_definition(clue_text, lead_counts, pool_size, nlp, seed_title=seed_title):
+                    generic[max_words] = clue_text
+                else:
+                    texts.append((clue_text, offset))
+        if person and offset == 0 and generic and not texts:
+            for later, sentence in enumerate(sentences[1:3], 1):
+                for max_words, head in generic.items():
+                    clue_text = who_definition(head, sentence, answer, max_words=max_words, nlp=nlp, lang=lang)
+                    if (
+                        clue_text
+                        and clue_pass_validate(clue_text, answer, min_words=3, nlp=nlp, lang=lang)
+                        and not is_generic_definition(clue_text, lead_counts, pool_size, nlp, seed_title=seed_title)
+                    ):
+                        texts = [(clue_text, later)]
+                        break
+                if texts:
+                    break
         rows = [
-            _build_clue_row(
-                answer=answer,
-                normalized_answer=normalized_answer,
-                answer_key_value=answer_key_value,
-                clue_text=clue_text,
-                clue_class="source_backed",
-                source_method=term_source_method,
-                source_page=payload.get("title", title) or title,
-                revid=payload.get("revid"),
-                sentence_offset=offset,
-                lang=lang,
-                clue_style="definition",
-            )
-            for clue_text in texts
+            {
+                **_build_clue_row(
+                    answer=answer,
+                    normalized_answer=normalized_answer,
+                    answer_key_value=answer_key_value,
+                    clue_text=clue_text,
+                    clue_class="source_backed",
+                    source_method=term_source_method,
+                    source_page=payload.get("title", title) or title,
+                    revid=payload.get("revid"),
+                    sentence_offset=source,
+                    lang=lang,
+                    clue_style="definition",
+                ),
+                "follow_up": cut is follow_up_definition,
+            }
+            for clue_text, source in texts
         ]
     return rows
 
@@ -1219,13 +1247,33 @@ _MAX_ANSWER_POOL = 200
 _SEE_OTHER_ARTICLE = re.compile(r"Για [^\n]* δείτε")
 
 
-# A page about a person opens with life dates or "born" in a parenthesis: "(1840 – 1926)", "(born 1946)",
-# "(138–78 BC)".
-_LIFE_DATES = re.compile(r"\(.*?(?:\bborn\b|\d[^()]*[\u2013\u2014][^()]*\d|\d-\d)")
+# A page about a person opens with life dates, "born" or "fl." in a parenthesis: "(1840 – 1926)", "(born 1946)",
+# "(138–78 BC)", "(fl. 259–269)". A war or a period has dates too, but none that span a life:
+# "(149–146 BC)", "(1350 – 1620)".
+_PARENTHESIS = re.compile(r"\((?:[^()]|\([^()]*\))*\)")
+_YEAR = re.compile(r"(?<!\d)((?:AD|CE) ?)?(\d{1,4})(?!\d)(?: ?(BCE?|[\u03c0\u03bc]\. ?\u03a7))?")
+
+
+def _life_span(dates: str) -> int:
+    """Years from the earliest to the latest year of a parenthesis: 60 for "(138–78 BC)", 86 for "(1840 – 1926)"."""
+    years, bc = [], False
+    for ad, number, era in reversed(_YEAR.findall(dates)):  # a year with no era takes the next one's
+        if ad or era:
+            bc = era[:1] in ("B", "\u03c0")
+        if ad or era or int(number) > 31:  # a smaller number is a day
+            years.append(-int(number) if bc else int(number))
+    return max(years) - min(years) if years else 0
 
 
 def _is_person(text: str, *, lang: str) -> bool:
-    return bool(_LIFE_DATES.search(lead_subject(text[:600], lang=lang)))
+    subject = lead_subject(text[:600], lang=lang)
+    parentheses = _PARENTHESIS.findall(subject)
+    if any(re.search(r"\b(?:born|fl)\b", dates) for dates in parentheses):
+        return True
+    # A war can last a life too, but no person opens on an article: "The Samnite Wars (343–290 BC)".
+    return not subject.startswith(("The ", "A ", "An ")) and any(
+        15 <= _life_span(dates) <= 110 for dates in parentheses
+    )
 
 
 def _seed_short_names(
@@ -1233,10 +1281,13 @@ def _seed_short_names(
 ) -> dict[str, tuple[str, str, int, bool]]:
     """Pages the seed calls by the last word of their title: page title -> (display, normalized, mentions, person).
 
-    A person by the surname: "Monet" for "Claude Monet" when the seed names it alone at least twice. Of several
-    people with one surname, the one whose full name the seed uses more often than all the others' together
-    takes it; with no such person ("Williams") nobody does. Only a Greek person is named this way, and only by
-    the title's own form: the seed writes other pages in an ending of its own.
+    A person by the surname: "Monet" for "Claude Monet" when the seed names it alone at least twice, or when the
+    person's own page does after its first sentence ("Kelvin" for "Lord Kelvin"). `mentions` counts the seed's.
+    A surname after a lower-case word is none ("Vincent van Gogh", "Cato the Younger"), nor is a word of the seed
+    title, and one only the page uses never takes another page's title ("Kelvin", the unit). Of several people
+    with one surname, the one whose full name the seed uses more often than all the others' together takes it;
+    with no such person ("Williams") nobody does. Only a Greek person is named this way, and only by the title's
+    own form: the seed writes other pages in an ending of its own.
 
     Any other page by a word the seed uses as a proper name, capitalised in mid-sentence and alone at least twice:
     "Chicago" for "Music of Chicago", not "Rhythm" for "I Got Rhythm". The seed's sentence is its only clue, so
@@ -1246,21 +1297,27 @@ def _seed_short_names(
     people: dict[str, list[tuple[str, tuple[str, str]]]] = {}
     others: dict[str, list[tuple[str, tuple[str, str]]]] = {}
     for title, intro in intros.items():
-        pair = title_short_name(title, lang=lang)
+        person = _is_person(intro, lang=lang)
+        pair = title_short_name(title, lang=lang, person=person)
         if pair and title != seed_title:
-            (people if _is_person(intro, lang=lang) else others).setdefault(pair[1], []).append((title, pair))
+            (people if person else others).setdefault(pair[1], []).append((title, pair))
+    titled = {pair[1] for title in intros if (pair := title_to_answer(title, lang=lang))}
     names = {}
     for rivals in people.values():
         phrases = {title: _TITLE_DISAMBIGUATOR.sub("", title).strip() for title, _ in rivals}
         named = {title: len(answer_pattern(phrase).findall(seed_text)) for title, phrase in phrases.items()}
         for title, pair in rivals:
-            if len(rivals) == 1 or 2 * named[title] > sum(named.values()):
-                mentions = _name_mentions(pair[0], seed_text, part_of=(phrases[title],))
-                if mentions >= 2:
-                    names[title] = (*pair, mentions, True)
+            if (len(rivals) > 1 and 2 * named[title] <= sum(named.values())) or phrases[title].split()[-2].islower():
+                continue
+            if pair[0].casefold() in seed_title.casefold().split():  # a word of the seed title is not free
+                continue
+            mentions = _name_mentions(pair[0], seed_text, part_of=(phrases[title],))
+            own = " ".join(split_sentences(intros[title])[1:])
+            if mentions >= 2 or (pair[1] not in titled and _name_mentions(pair[0], own, part_of=(phrases[title],))):
+                names[title] = (*pair, mentions, True)
     if lang != "en":  # a Greek page that is no person keeps its title: the seed writes its inflected form
         return names
-    taken = set(people) | {pair[1] for title in intros if (pair := title_to_answer(title, lang=lang))}
+    taken = set(people) | titled
     for normalized, pages in others.items():
         title, pair = pages[0]
         if len(pages) > 1 or normalized in taken or _shared_words(pair[0]) & _shared_words(seed_title):
@@ -1352,8 +1409,9 @@ def _build_title_answer_rows(
         has_seed_fill_in=has_seed_fill_in,
     )
     for page in pages:
-        if page[4] in short_names:
-            page[3] = short_names[page[4]][2]  # the mentions of the answer itself
+        if page[4] in short_names and short_names[page[4]][2] >= 2:
+            # The seed's mentions of the answer itself; a surname only the page uses keeps the page's count.
+            page[3] = short_names[page[4]][2]
     # The cap keeps the titles with the most evidence, in the order the answers are scored by (minus the penalty).
     pages.sort(key=evidence, reverse=True)
 
@@ -2247,8 +2305,8 @@ def run_clue_extraction_stage(
             load_source_payload(title)
         page = source_titles[0] if term["source_method"] == "article_title" and source_titles else ""
         own_title = _TITLE_DISAMBIGUATOR.sub("", page).strip()
-        last_word = bool(page) and (title_short_name(page, lang=lang) or ("",))[0] == answer
         person = term["page_is_person"] == "True"
+        last_word = bool(page) and (title_short_name(page, lang=lang, person=person) or ("",))[0] == answer
         # A disambiguated page, or one that sends to another article for its other meaning, whose intro is off topic
         # ("Sicily (theme)") may be another sense of the seed's word: no definition, and its own text clues nothing.
         other_sense = (
@@ -2275,6 +2333,7 @@ def run_clue_extraction_stage(
             nlp=nlp,
             allow_fragments=False,
             full_name=own_title if last_word and person else None,
+            person=person,
         )
         if page:
             # A page defines its own name only: its title, or any name of the person it is about ("Monet", "Peter
@@ -2294,12 +2353,13 @@ def run_clue_extraction_stage(
                     lead_counts=lead_counts,
                     pool_size=len(leads),
                     seed_title=seed_title,
+                    person=person,
                 )
             # A follow-up (the second sentence) is for an answer nothing else clues: it comes after the fill-ins.
             candidates = (
-                [row for row in definitions if row["sentence_offset"] == 0]
+                [row for row in definitions if not row["follow_up"]]
                 + candidates
-                + [row for row in definitions if row["sentence_offset"] == 1]
+                + [row for row in definitions if row["follow_up"]]
             )
 
         for row in candidates:
@@ -2405,6 +2465,12 @@ def _shared_words(display: str) -> set[str]:
     return {word for word in words if len(word) >= 4}
 
 
+# People may fill at most this share of the layout candidates, unless too few other answers are clued: short
+# surnames place easily, and a grid of 23 painters out of 26 entries is a list, not a themed puzzle. With a
+# third of the candidates they still make up to 60% of a grid; with half, 70%.
+_MAX_PEOPLE_SHARE = 1 / 3
+
+
 def _layout_candidates(
     term_rows: list[dict],
     clue_rows: list[dict],
@@ -2412,29 +2478,40 @@ def _layout_candidates(
     lang: str,
     limit: int,
 ) -> list[tuple[str, float]]:
-    """Packageable answers by descending answer_score, skipping any that repeats a word already taken."""
+    """Packageable answers by descending answer_score, skipping any that repeats a word already taken.
+
+    People take at most `_MAX_PEOPLE_SHARE` of the `limit`; when the other answers run out, they fill what is left.
+    """
     clued = {
         _answer_key(row.get("answer", ""), row.get("normalized_answer", ""), lang=lang)
         for row in clue_rows
         if _is_packageable_clue(row)
     }
     ranked = sorted(term_rows, key=lambda row: -_safe_float(row.get("answer_score")))
-    picked: list[tuple[str, float]] = []
-    taken: set[str] = set()
-    words: set[str] = set()
-    for row in ranked:
-        key = _answer_key(row.get("answer", ""), row.get("normalized_answer", ""), lang=lang)
-        if key not in clued or key in taken:
-            continue
-        row_words = _shared_words(row.get("answer", ""))
-        if row_words & words:
-            continue
-        taken.add(key)
-        words |= row_words
-        picked.append((key, _safe_float(row.get("answer_score"))))
-        if len(picked) >= limit:
-            break
-    return picked
+
+    def pick(max_people: int) -> tuple[list[tuple[str, float]], int]:
+        picked: list[tuple[str, float]] = []
+        taken: set[str] = set()
+        words: set[str] = set()
+        people = 0
+        for row in ranked:
+            key = _answer_key(row.get("answer", ""), row.get("normalized_answer", ""), lang=lang)
+            person = row.get("page_is_person") == "True"
+            if key not in clued or key in taken or (person and people >= max_people):
+                continue
+            row_words = _shared_words(row.get("answer", ""))
+            if row_words & words:
+                continue
+            taken.add(key)
+            words |= row_words
+            people += person
+            picked.append((key, _safe_float(row.get("answer_score"))))
+            if len(picked) >= limit:
+                break
+        return picked, people
+
+    picked, people = pick(int(limit * _MAX_PEOPLE_SHARE))
+    return picked if len(picked) >= limit else pick(limit - (len(picked) - people))[0]
 
 
 def run_layout_stage(

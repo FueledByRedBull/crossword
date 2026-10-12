@@ -18,6 +18,7 @@ from src.clue_builder import (
     split_sentences,
     strip_trailing_sections,
     trim_clause,
+    who_definition,
 )
 
 
@@ -271,6 +272,24 @@ class LeakageTests(unittest.TestCase):
         if nlp is None:
             self.skipTest("spaCy model not available")
         self._check(nlp)
+
+    def test_the_same_short_content_word_leaks_but_function_words_do_not(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        for clue, answer in (
+            ("It consists of the visual and plastic arts originating from France", "French art"),
+            ("A theoretical gas composed of many randomly moving point particles", "Ideal gas"),
+            ("A new city in the south", "New Orleans"),
+            ("A big noise in a school of fish", "Big band"),
+        ):
+            self.assertTrue(has_morphological_leakage(clue, answer, nlp), (clue, answer))
+        for model in (None, nlp):
+            for clue, answer in (
+                ("The bird of the field and of the sky", "The Magpie"),
+                ("A town on the river in the north and of the plain", "School of Paris"),
+            ):
+                self.assertFalse(has_morphological_leakage(clue, answer, model), (clue, answer))
 
     def test_every_token_of_multi_word_answer_counts(self) -> None:
         self.assertTrue(has_morphological_leakage("The Davis quintet", "Miles Davis", None))
@@ -631,6 +650,19 @@ class GenericDefinitionTests(unittest.TestCase):
         self.assertTrue(self._generic("jazz", clue))
         self.assertFalse(self._generic("jazz", clue, nlp))
 
+    def test_a_nationality_on_a_kind_of_word_names_a_language(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        counts = Counter({
+            **self.COMMON, "english": 3, "common": 1, "title": 4, "series": 20, "paintings": 30, "claude": 20,
+            "monet": 20, "impressionist": 50, "painter": 57,
+        })
+        haystacks = "The common English title for a series of impressionist paintings by Claude Monet"
+        self.assertFalse(is_generic_definition(haystacks, counts, 150, nlp, seed_title="Impressionism"))
+        # The answer's own nationality still asks for a second informative word.
+        self.assertTrue(is_generic_definition("A common English painter", counts, 150, nlp, seed_title="Impressionism"))
+
     def test_a_vague_quantifier_opens_a_generic_definition(self) -> None:
         for clue in (
             "Any of many different quantities",
@@ -638,12 +670,15 @@ class GenericDefinitionTests(unittest.TestCase):
             "Various small birds",
             "A wide range of physical processes",
             "A large group of musicians",
+            "A separate part of a larger system",
+            "The component of a bigger machine",
         ):
             self.assertTrue(self._generic("quantum", clue), clue)
         # What follows the group pins it down.
         for clue in (
             "A group of young French artists active in Paris from 1888 until 1900",
             "A large group of Germanic peoples first reported by Julius Caesar in the 1st century BC",
+            "A part of the larger Hellenistic world",
         ):
             self.assertFalse(self._generic("impressionism", clue), clue)
         for clue in (
@@ -736,6 +771,7 @@ class FillInOpeningTests(unittest.TestCase):
             "Hence, no real heat engine could realize the ____'s reversibility and was condemned to be less efficient.",
             "Therefore, even at ____, atoms and molecules retain some vibrational motion.",
             "However, AllMusic separates it from ____ because of R&B's stronger gospel influences.",
+            "Rather like ____'s statement is that of George Uhlenbeck and G. W. Ford for irreversible phenomena.",
             "Αυτό είναι το ____ του συστήματος.",
             "Και η ____ μεταφέρεται από το ένα σώμα στο άλλο.",
             "Πρόκειται για την ____ του συστήματος.",
@@ -823,6 +859,45 @@ class FillInReferenceTests(unittest.TestCase):
         clue = "Because of this, it is often important to distinguish between heterogeneous ____ and homogeneous ____."
         self.assertTrue(self._passes(clue))
         self.assertFalse(self._passes(clue, nlp))
+
+    def test_a_his_or_her_with_a_pronoun_subject_and_nobody_named_is_a_back_reference(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        clue = "On his 1961 tour of ____, he was booed, but persevered, signing with the new Impulse!"
+        self.assertFalse(self._passes(clue, nlp))
+        self.assertTrue(self._passes(clue))  # the rule needs the tagger
+        for kept in (
+            "In his 1905 paper, Einstein proposed the ____ of light.",
+            "In her memoir, ____ describes the years in Paris.",
+            "Coltrane recorded ____ with his quartet, and he toured.",
+        ):
+            with self.subTest(clue=kept):
+                self.assertTrue(self._passes(kept, nlp))
+
+    def test_the_term_that_an_earlier_sentence_named_is_a_back_reference(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        for clue in (
+            "Originally, the term was confined to light ____.",
+            'The term is sometimes also used as synonymous with "____" and is defined as such in some dictionaries.',
+            "In 1910 the name has been given to ____ by many authors.",
+        ):
+            with self.subTest(clue=clue):
+                self.assertFalse(self._passes(clue, nlp))
+                self.assertTrue(self._passes(clue))  # the rule needs the tagger
+        for clue in (
+            'The term "jazz" was first used for the music of ____ in Chicago.',
+            "Here the term ____ was used for the music of New Orleans.",
+            "The name of the band was ____ until 1960.",
+            "The Goth sub-culture continued the tradition, echoing the name and reputation of the ____ outsider Goths.",
+        ):
+            with self.subTest(clue=clue):
+                self.assertTrue(self._passes(clue, nlp))
+        # The tagger takes "entropy" for a verb; the sentence still says which word.
+        clue = "I have designedly coined the word entropy to be similar to '____', ..."
+        self.assertTrue(clue_pass_validate(clue, "Energy", min_words=3, nlp=nlp, require_blank=True))
 
     def test_greek_fill_ins_that_lean_on_an_earlier_sentence_are_rejected(self) -> None:
         for clue in (
@@ -1214,6 +1289,60 @@ class DefinitionCutTests(unittest.TestCase):
         )
         self.assertEqual(definition_clue(gell_mann, answer="Murray Gell-Mann", nlp=nlp), "An American theoretical physicist")
 
+    def test_a_cut_does_not_end_on_a_time_noun_that_waits_for_its_complement(self) -> None:
+        laine = (
+            'John Joseph "Papa Jack" Laine was an American musician and a pioneering band leader in New Orleans '
+            "in the years from the Spanish\u2013American War to World War I."
+        )
+        self.assertEqual(definition_clue(laine), "An American musician and a pioneering band leader in New Orleans")
+        # A complete phrase stays.
+        for tail, expected in (
+            ("in the years 1914 to 1918 and also later in other cities.", "in the years 1914 to 1918"),
+            ("in the 1880s and also later in other cities abroad.", "in the 1880s"),
+        ):
+            self.assertEqual(
+                definition_clue(f"Laine was an American bandleader who worked in New Orleans {tail}"),
+                f"An American bandleader who worked in New Orleans {expected}",
+            )
+        self.assertEqual(
+            definition_clue("Laine was an American bandleader of the 19th century who also later played in other cities abroad."),
+            "An American bandleader of the 19th century who also later played in other cities abroad",
+        )
+
+    SYNTHETISM = (
+        "Synthetism is a term used by Post-Impressionist artists like Paul Gauguin, Émile Bernard and Louis Anquetin "
+        "to distinguish their work stylistically from Impressionism."
+    )
+
+    def test_examples_in_the_middle_are_dropped_when_the_cut_would_stop_inside_them(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        self.assertEqual(
+            definition_clue(self.SYNTHETISM, nlp=nlp),
+            "A term used by Post-Impressionist artists to distinguish their work stylistically from Impressionism",
+        )
+        # Without a parser the cut stops inside the list.
+        self.assertEqual(definition_clue(self.SYNTHETISM), "A term used by Post-Impressionist artists like Paul Gauguin")
+
+    def test_examples_the_cut_does_not_split_stay_and_an_open_list_is_no_phrase(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        bound = (
+            "A bound state is a composite of two or more fundamental building blocks, such as particles, atoms, or "
+            "bodies, that behaves as a single object and in which energy is required to split them."
+        )
+        self.assertEqual(
+            definition_clue(bound, nlp=nlp),
+            "A composite of two or more fundamental building blocks, such as particles, atoms, or bodies",
+        )
+        ai = (
+            "Artificial intelligence is the capability of computational systems to perform tasks typically associated "
+            "with human intelligence, such as learning, reasoning, problem-solving, perception, and decision-making."
+        )
+        self.assertIsNone(definition_clue(ai, max_words=18, nlp=nlp))
+
 
 class FollowUpDefinitionTests(unittest.TestCase):
     PIANO = (
@@ -1283,6 +1412,237 @@ class FollowUpDefinitionTests(unittest.TestCase):
         self.assertIsNone(follow_up_definition("Ο Ράνκιν μελέτησε τη θερμοδυναμική και ήταν καθηγητής.", "Ουίλιαμ Ράνκιν", lang="el"))
         # English does not drop its subject.
         self.assertIsNone(follow_up_definition("Was an American pianist and bandleader.", "Herbie Hancock"))
+
+
+class ItDefinitionTests(unittest.TestCase):
+    NLP = _load_nlp()
+    TEMPERATURE = (
+        "In classical thermodynamics and kinetic theory, temperature reflects the average kinetic energy of the "
+        "particles in a system, providing a quantitative measure of how energy is distributed among microscopic "
+        "degrees of freedom."
+    )
+    EQUITES = "The equites constituted the second of the property/social-based classes of ancient Rome, ranking below the senatorial class."
+
+    def setUp(self) -> None:
+        if self.NLP is None:
+            self.skipTest("spaCy model not available")
+
+    def _define(self, lead: str, answer: str, **kwargs) -> str | None:
+        return definition_clue(lead, answer=answer, nlp=self.NLP, **kwargs)
+
+    def test_a_main_verb_with_the_answer_as_its_subject_gives_it_or_they(self) -> None:
+        for lead, answer, expected in (
+            (self.TEMPERATURE, "Temperature", "It reflects the average kinetic energy of the particles in a system"),
+            (
+                "Temperature quantitatively expresses the attribute of hotness or coldness.",
+                "Temperature",
+                "It quantitatively expresses the attribute of hotness or coldness",
+            ),
+            (
+                "In physics, coherence expresses the potential for two waves to interfere.",
+                "Coherence",
+                "It expresses the potential for two waves to interfere",
+            ),
+            (
+                self.EQUITES,
+                "Equites",
+                "They constituted the second of the property/social-based classes of ancient Rome, ranking below the senatorial class",
+            ),
+        ):
+            with self.subTest(answer=answer):
+                self.assertEqual(self._define(lead, answer, max_words=18), expected)
+
+    def test_a_long_predicate_is_cut_at_a_clean_boundary(self) -> None:
+        self.assertEqual(
+            self._define(self.EQUITES, "Equites", max_words=12),
+            "They constituted the second of the property/social-based classes of ancient Rome",
+        )
+        self.assertIsNone(self._define(self.TEMPERATURE, "Temperature", max_words=8))
+
+    def test_a_subject_that_is_more_than_the_answer_is_refused(self) -> None:
+        for lead, answer in (
+            (
+                "Research concerning the relationship between the thermodynamic quantity entropy and both the origin "
+                "and evolution of life began around the turn of the 20th century.",
+                "Entropy and life",
+            ),
+            ("The mathematical concept of a Hilbert space generalizes the notion of Euclidean space.", "Hilbert space"),
+            ("In music, the term swing has two main uses.", "Swing time"),
+            ("Curia in ancient Rome referred to one of the original groupings of the citizenry.", "Curia"),
+            ("The Clausius theorem, also known as the Clausius inequality, states that the inequality holds.", "Clausius theorem"),
+        ):
+            with self.subTest(answer=answer):
+                self.assertIsNone(self._define(lead, answer, max_words=18))
+
+    def test_a_sentence_with_a_copula_is_defined_through_it_as_before(self) -> None:
+        bebop = "Bebop is a style of jazz that developed in the 1940s."
+        self.assertEqual(self._define(bebop, "Bebop"), "A style of jazz that developed in the 1940s")
+        self.assertEqual(definition_clue(bebop, answer="Bebop"), "A style of jazz that developed in the 1940s")
+        # The copula path refuses this one, and "was" is no main verb for "It".
+        best_known = "Hancock was best known for his work with Miles Davis and the Headhunters."
+        self.assertIsNone(self._define(best_known, "Herbie Hancock"))
+
+    def test_have_and_an_object_that_only_counts_are_refused(self) -> None:
+        for lead, answer in (
+            ("Sport in Italy has a long tradition.", "Sport in Italy"),
+            ("Adaptation has three related meanings.", "Adaptation"),
+            ("Christian humanism refers to two related concepts.", "Christian humanism"),
+            ("Music of New Orleans assumes various styles of music which have often borrowed from earlier traditions.", "Music of New Orleans"),
+        ):
+            with self.subTest(answer=answer):
+                self.assertIsNone(self._define(lead, answer, max_words=18))
+        # A date range or a named object still says what the thing is.
+        self.assertEqual(
+            self._define("The Kitos War took place from 116 to 118.", "Kitos War"), "It took place from 116 to 118"
+        )
+
+    def test_it_needs_the_parser_the_answer_and_english(self) -> None:
+        lead = "Temperature quantitatively expresses the attribute of hotness or coldness."
+        self.assertIsNone(definition_clue(lead, answer="Temperature"))
+        self.assertIsNone(definition_clue(lead, nlp=self.NLP))
+        self.assertIsNone(definition_clue(lead, answer="Temperature", nlp=self.NLP, lang="el"))
+
+
+class WhoDefinitionTests(unittest.TestCase):
+    NLP = _load_nlp()
+    JOULE = "Joule studied the nature of heat, and discovered its relationship to mechanical work."
+
+    def setUp(self) -> None:
+        if self.NLP is None:
+            self.skipTest("spaCy model not available")
+
+    def _who(self, head: str, sentence: str, answer: str, **kwargs) -> str | None:
+        return who_definition(head, sentence, answer, nlp=self.NLP, **kwargs)
+
+    def test_the_head_and_a_sentence_about_the_person_make_one_definition(self) -> None:
+        head = "An English physicist, mathematician and brewer"
+        self.assertEqual(
+            self._who(head, self.JOULE, "James Joule"),
+            "An English physicist who studied the nature of heat and discovered its relationship to mechanical work",
+        )
+        # An adverb between the subject and the verb stays: "never" would change the meaning.
+        self.assertEqual(
+            self._who("An American jazz pianist and composer", "He never recorded for a major label.", "Bud Powell"),
+            "An American jazz pianist and composer who never recorded for a major label",
+        )
+
+    def test_the_head_is_cut_back_to_its_first_item_only_when_the_predicate_needs_the_room(self) -> None:
+        head = "An American jazz musician, bandleader, and composer"
+        sentence = "He started his career with trumpeter Donald Byrd's group."
+        self.assertEqual(
+            self._who(head, sentence, "Herbie Hancock"),
+            "An American jazz musician, bandleader, and composer who started his career with trumpeter Donald Byrd's group",
+        )
+        self.assertEqual(
+            self._who(head, sentence, "Herbie Hancock", max_words=14),
+            "An American jazz musician who started his career with trumpeter Donald Byrd's group",
+        )
+
+    def test_a_long_predicate_is_cut_where_an_adjunct_ends_never_inside_a_complement(self) -> None:
+        feynman = (
+            "He shared the 1965 Nobel Prize in Physics with Julian Schwinger and Shin'ichirō Tomonaga "
+            '"for their fundamental work in quantum electrodynamics".'
+        )
+        self.assertEqual(
+            self._who("An American theoretical physicist", feynman, "Richard Feynman"),
+            "An American theoretical physicist who shared the 1965 Nobel Prize in Physics",
+        )
+        davis = "He is among the most influential and acclaimed figures in the history of jazz and 20th-century music."
+        self.assertIsNone(self._who("An American trumpeter, bandleader and composer", davis, "Miles Davis"))
+        titles = (
+            "He is noted for Chemin en été, La dispersion des Acadiens, L'arrivée de Champlain à Québec, "
+            "and Les Noces de Cana."
+        )
+        self.assertIsNone(self._who("A French-Canadian Impressionist painter", titles, "Henri Beau", max_words=12))
+
+    def test_another_subject_is_refused(self) -> None:
+        head = "An American jazz pianist and composer"
+        for sentence in (
+            "Hancock's mother was a teacher of the piano at the local school.",
+            "The album was released in 1962.",
+            "It was released in 1962.",
+        ):
+            with self.subTest(sentence=sentence):
+                self.assertIsNone(self._who(head, sentence, "Herbie Hancock"))
+
+    def test_a_clause_with_a_subject_of_its_own_is_left_out(self) -> None:
+        sentence = "He joined the band in 1940, and his influence crossed genres."
+        self.assertEqual(
+            self._who("An American jazz pianist and composer", sentence, "Bud Powell"),
+            "An American jazz pianist and composer who joined the band in 1940",
+        )
+
+    def test_a_head_that_is_no_plain_occupation_or_a_vague_object_is_refused(self) -> None:
+        planck = "Planck made many contributions to theoretical physics, primarily as the originator of quantum theory."
+        for head, sentence in (
+            ("A British historian specializing in ancient Rome", "He studied at University College London."),
+            ("A German theoretical physicist", planck),
+        ):
+            with self.subTest(head=head):
+                self.assertIsNone(self._who(head, sentence, "Max Planck"))
+
+    def test_a_head_that_is_no_plain_list_gives_its_first_item(self) -> None:
+        morisot = "In 1864, Morisot exhibited for the first time in the highly esteemed Paris Salon, listed as a student of Corot."
+        self.assertEqual(
+            self._who("A French painter, printmaker and a member of the circle of painters in Paris", morisot, "Berthe Morisot"),
+            "A French painter who exhibited for the first time in the highly esteemed Paris Salon",
+        )
+        self.assertEqual(
+            self._who("A French engineer and physicist, one of the founders of thermodynamics", "He studied heat engines.", "Émile Clapeyron"),
+            "A French engineer and physicist who studied heat engines",
+        )
+        # No comma, no first item.
+        self.assertIsNone(self._who("A British historian specializing in ancient Rome", "He studied at University College London.", "Tim Cornell"))
+
+    def test_one_opening_phrase_is_left_out_unless_the_rest_leans_on_it(self) -> None:
+        getz = (
+            'Playing primarily the tenor saxophone, Getz was known as "The Sound" because of his warm, lyrical tone, '
+            "with his prime influence being the wispy, mellow timbre of his idol, Lester Young."
+        )
+        self.assertEqual(
+            self._who("An American jazz saxophonist", getz, "Stan Getz"),
+            'An American jazz saxophonist who was known as "The Sound" because of his warm, lyrical tone',
+        )
+        self.assertEqual(
+            self._who("A German-American physicist", "For most of his career, Bethe was a professor at Cornell University.", "Hans Bethe"),
+            "A German-American physicist who was a professor at Cornell University",
+        )
+        head = "An American jazz pianist"
+        for sentence in (
+            "Since the early 1970s, he has also been a group leader and solo performer in jazz.",  # "also"
+            "After the war, Powell worked with other bandleaders in New York.",  # "other"
+            "In 1950, Powell recorded it with a trio.",  # "it"
+            "Later, Powell joined the band of Cootie Williams.",  # the opening points back
+            "When he left the band, Powell joined Cootie Williams.",  # a clause of its own
+            "A pioneer of bebop, Powell's application of complex phrasing influenced his contemporaries.",  # another subject
+        ):
+            with self.subTest(sentence=sentence):
+                self.assertIsNone(self._who(head, sentence, "Bud Powell"))
+
+    def test_a_sequencing_adverb_or_a_birthplace_is_refused(self) -> None:
+        head = "An American jazz musician, bandleader, and composer"
+        for sentence in (
+            "He then moved to the U.S.",
+            "She soon moved to New York City.",
+            "He moved afterwards to Paris.",
+            "He subsequently left the band.",
+            "She was born in Allegheny, Pennsylvania, but lived most of her adult life in France.",
+            "Hancock was later born in Chicago.",
+        ):
+            with self.subTest(sentence=sentence):
+                self.assertIsNone(self._who(head, sentence, "Herbie Hancock"))
+        # "later" and "also" read on their own.
+        self.assertEqual(
+            self._who(head, "He later joined Miles Davis's quintet.", "Herbie Hancock"),
+            f"{head} who later joined Miles Davis's quintet",
+        )
+        self.assertEqual(
+            self._who(head, "He also played the piano.", "Herbie Hancock"), f"{head} who also played the piano"
+        )
+
+    def test_it_needs_the_parser_and_english(self) -> None:
+        self.assertIsNone(who_definition("An English physicist", self.JOULE, "James Joule"))
+        self.assertIsNone(self._who("An English physicist", self.JOULE, "James Joule", lang="el"))
 
 
 GREEK_LEADS = {

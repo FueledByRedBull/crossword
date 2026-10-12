@@ -239,6 +239,12 @@ class TitleToAnswerTests(unittest.TestCase):
         # One word, a lower-case last word, fewer than 4 or more than 9 letters, a list: no short name.
         for title in ("Monet", "Ideal gas", "Napoleon III", "Erwin Schrödinger", "List of paintings by Claude Monet"):
             self.assertIsNone(title_short_name(title), title)
+        # A person is named by 3 to 15 letters, but never by a regnal number.
+        self.assertEqual(title_short_name("Erwin Schrödinger", person=True), ("Schrödinger", "SCHRODINGER"))
+        self.assertEqual(title_short_name("Kid Ory", person=True), ("Ory", "ORY"))
+        self.assertIsNone(title_short_name("Kid Ory"))
+        self.assertIsNone(title_short_name("Sun Ra", person=True))
+        self.assertIsNone(title_short_name("Napoleon III", person=True))
 
     def test_rejects_generic_single_word_titles(self) -> None:
         self.assertIsNone(title_to_answer("Time"))

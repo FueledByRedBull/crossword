@@ -13,8 +13,10 @@ from src.clue_builder import definition_clue, split_sentences
 from src.layout import validate_puzzle
 from src.pipeline import (
     _build_title_answer_rows,
+    _collect_source_backed_clue_candidates,
     _effective_min_k_for_size,
     _inventory_min_k_target,
+    _is_person,
     _definition_clue_rows,
     _layout_candidates,
     _linked_titles,
@@ -1124,6 +1126,51 @@ class PipelineTests(unittest.TestCase):
             [("In 1964 the quintet hired ____ as its new saxophonist.", "Jazz")],
         )
 
+    def test_a_fill_in_for_a_person_never_blanks_a_common_word(self) -> None:
+        text = "A shorter set suited Shorter well. The band hired Shorter as its saxophonist in 1964."
+
+        def fills(person: bool) -> list[str]:
+            return [
+                row["clue"]
+                for row in _collect_source_backed_clue_candidates(
+                    answer="Shorter",
+                    normalized_answer="SHORTER",
+                    source_titles=["Jazz"],
+                    source_payloads={"Jazz": {"title": "Jazz", "extract": text, "revid": 1}},
+                    seed_title="Jazz",
+                    term_source_method="article_title",
+                    lang="en",
+                    min_words=4,
+                    max_words=12,
+                    nlp=None,
+                    person=person,
+                )
+            ]
+
+        self.assertEqual(len(fills(person=False)), 2)
+        self.assertEqual(fills(person=True), ["The band hired ____ as its saxophonist in 1964."])
+
+    def test_clue_stage_joins_a_generic_definition_of_a_person_with_what_a_later_sentence_says(self) -> None:
+        text = "Ana Vale was a noted physicist and teacher in Kyoto. She was born in Osaka. Vale founded the first laboratory."
+
+        def run(name: str, person: str):
+            def who(head, sentence, answer, **kwargs):
+                return "A noted physicist who founded the first laboratory" if "founded" in sentence else None
+
+            with (
+                patch("src.pipeline.is_generic_definition", side_effect=lambda clue, *args, **kwargs: "who" not in clue),
+                patch("src.pipeline.who_definition", side_effect=who),
+            ):
+                result, _ = self._run_clues_for(name, [f"Ana Vale,ANAVALE,Ana Vale,article_title,True,{person}"], {"Ana Vale": text})
+            return [(row["clue_style"], row["sentence_offset"], row["clue"]) for row in result.clues]
+
+        # The third sentence is the source, and the definition comes before the valid fill-in of the first one.
+        self.assertEqual(
+            run("clue_who", "True"), [("definition", 2, "A noted physicist who founded the first laboratory")]
+        )
+        # A page that is no person has no "who".
+        self.assertEqual(run("clue_who_no_person", "False")[0][:2], ("fill_in_blank", 0))
+
     def test_clue_stage_defines_an_answer_only_by_a_page_that_bears_its_name(self) -> None:
         extracts = {
             "Subatomic particle": "A subatomic particle is a particle smaller than an atom in every model.",
@@ -1462,6 +1509,82 @@ class PipelineTests(unittest.TestCase):
         unnamed = {row["answer"] for row in self.title_pool("Impressionism", rows, intros, cap=30)}  # a seed that names none
         self.assertEqual((("Claude Monet" in unnamed), ("Renoir" in unnamed), ("Chicago" in unnamed)), (True, False, False))
 
+    def test_a_person_page_that_spans_a_life_is_a_person_and_a_war_or_period_is_not(self) -> None:
+        for lead in (
+            "Claude Monet (14 November 1840 – 5 December 1926) was a painter.",
+            "James Watt (; 30 January 1736 (19 January 1736 OS) – 25 August 1819) was an inventor.",
+            "Pompey (29 September 106 – 28 September 48 BC) was a general.",
+            "Gaius Marius (157–86 BC) was a general.",
+            "Augustus (23 September 63 BC – 19 August AD 14) was the first emperor.",
+            "Archie Shepp (born May 24, 1937) is a saxophonist.",
+            "Postumus (fl. 259–269) was an emperor.",
+        ):
+            self.assertTrue(_is_person(lead, lang="en"), lead)
+        for lead in (
+            "The Third Punic War (149–146 BC) was a war.",
+            "The Samnite Wars (343–290 BC) were three wars.",
+            "The Napoleonic Wars (1803–1815) were a series of wars.",
+            "Aegean art (2800–1100 BC) is the art of the Aegean.",
+            "Renaissance art (1350 – 1620) is the art of the Renaissance.",
+            "Graduate Texts in Mathematics (GTM) (ISSN 0072-5285) is a series.",
+        ):
+            self.assertFalse(_is_person(lead, lang="en"), lead)
+        self.assertTrue(_is_person("Ο Πυθαγόρας (~580 π.Χ. - 496 π.Χ.) ήταν φιλόσοφος.", lang="el"))
+        self.assertFalse(_is_person("Ο Μεσαίωνας (476-1492 μ.Χ) ήταν περίοδος.", lang="el"))
+
+    def test_a_person_is_answered_by_the_surname_the_seed_or_the_page_itself_uses(self) -> None:
+        def short_names(intros: dict[str, str], seed_text: str = "Heat is energy.") -> dict:
+            return _seed_short_names(
+                intros, "Thermodynamics", seed_text, lang="en", has_seed_fill_in=lambda display, normalized: True
+            )
+
+        kelvin = "Lord Kelvin (1824 – 1907) was a physicist. Kelvin proposed the scale. He died in 1907."
+        # The page's own intro names the surname alone after its first sentence; the seed need not.
+        self.assertEqual(short_names({"Lord Kelvin": kelvin}), {"Lord Kelvin": ("Kelvin", "KELVIN", 0, True)})
+        # The first sentence is the full name; "Kelvin scale" next to a name is part of it.
+        once = "Lord Kelvin (1824 – 1907) was a physicist. He used the Absolute Kelvin Scale."
+        self.assertEqual(short_names({"Lord Kelvin": once}), {})
+        # Another page's own title keeps the word: "Kelvin" the unit.
+        self.assertEqual(short_names({"Lord Kelvin": kelvin, "Kelvin (unit)": "The kelvin is a unit."}), {})
+        # A surname after a lower-case word is none, whoever uses it.
+        for title in ("Louis de Broglie", "Cato the Younger"):
+            last = title.split()[-1]
+            intro = f"{title} (1892 – 1987) was a physicist. {last} proposed waves. {last} won."
+            self.assertEqual(short_names({title: intro}, f"{last} and {last} agreed."), {}, title)
+        # A war that spans a life is no person: it keeps its title.
+        wars = "The Samnite Wars (343–290 BC) were three wars. Wars followed. Wars ended."
+        self.assertEqual(short_names({"Samnite Wars": wars}), {})
+        # A person's surname may have 3 to 15 letters, unless it is a word of the seed title.
+        ory = "Kid Ory (1886 – 1973) was a trombonist. Ory led a band."
+        heisenberg = "Werner Heisenberg (1901 – 1976) was a physicist. Heisenberg wrote."
+        self.assertEqual(
+            short_names({"Kid Ory": ory, "Werner Heisenberg": heisenberg}),
+            {"Kid Ory": ("Ory", "ORY", 0, True), "Werner Heisenberg": ("Heisenberg", "HEISENBERG", 0, True)},
+        )
+        self.assertEqual(
+            _seed_short_names({"Kid Ory": ory}, "Ory music", "Ory played.", lang="en", has_seed_fill_in=lambda d, n: True), {}
+        )
+        # Two people share a surname: the one the seed names in full more often than the other takes it.
+        williams = {
+            "Tony Williams (drummer)": "Tony Williams (1945 – 1997) was a drummer. Williams played.",
+            "Mary Lou Williams": "Mary Lou Williams (1910 – 1981) was a pianist. Williams played.",
+        }
+        self.assertEqual(short_names(williams), {})
+        self.assertEqual(
+            short_names(williams, "Tony Williams and Tony Williams played; Mary Lou Williams listened."),
+            {"Tony Williams (drummer)": ("Williams", "WILLIAMS", 0, True)},
+        )
+
+    def test_a_surname_only_the_page_uses_keeps_the_pages_seed_mentions(self) -> None:
+        rows = ["1,Lord Kelvin,1,True,0.5,0.0,0.5,False,5,KEEP,x"]
+        intros = {
+            "Thermodynamics": "Thermodynamics is a branch of physics.",
+            "Lord Kelvin": "Lord Kelvin (1824 – 1907) was a physicist. Kelvin proposed the scale.",
+        }
+        pool = self.title_pool("Thermodynamics", rows, intros, seed_text="Lord Kelvin wrote. Lord Kelvin proved.")
+        # 1.0 + 0.5 relevance + 0.1 for each of the five mentions of the page, not for the none of "Kelvin".
+        self.assertEqual({row["answer"]: row["answer_score"] for row in pool}["Kelvin"], 2.0)
+
     def test_greek_person_pages_answer_by_the_surname_the_seed_writes_but_other_pages_keep_their_title(self) -> None:
         intros = {
             "Γιοχάνες Κέπλερ": "Ο Γιοχάνες Κέπλερ (1571 \u2013 1630) ήταν Γερμανός αστρονόμος.",
@@ -1483,6 +1606,11 @@ class PipelineTests(unittest.TestCase):
         # Two stand-alone mentions in the title's own form; the full name does not count. "του Νεύτωνα" is another
         # form, one mention is too few, an epithet is never named alone, and a page that is no person keeps its title.
         self.assertEqual(names, {"Γιοχάνες Κέπλερ": ("Κέπλερ", "ΚΕΠΛΕΡ", 2, True)})
+
+        # The person's own page names the surname alone after its first sentence: the seed need not.
+        nernst = {"Βάλτερ Νερνστ": "Ο Βάλτερ Νερνστ (1864 – 1941) ήταν Γερμανός χημικός. Ο Νερνστ διατύπωσε το θεώρημα."}
+        names = _seed_short_names(nernst, "Θερμοδυναμική", "Η θερμότητα.", lang="el", has_seed_fill_in=lambda d, n: True)
+        self.assertEqual(names, {"Βάλτερ Νερνστ": ("Νερνστ", "ΝΕΡΝΣΤ", 0, True)})
 
     def test_title_pool_admits_only_the_kept_titles_scoring_found_on_topic(self) -> None:
         rows = [
@@ -1873,6 +2001,23 @@ class LayoutAndPackagingTests(unittest.TestCase):
         self.assertEqual(picked[0], ("HEAT", 0.9))
         capped = _layout_candidates(terms, clues, lang="en", limit=3)
         self.assertEqual([key for key, _ in capped], ["HEAT", "JAZZ", "CARNOTCYCLE"])
+
+    def test_layout_candidates_give_people_at_most_their_share_unless_nothing_else_is_clued(self) -> None:
+        # four people outrank three works; the 4-candidate list is a third people at most
+        rows = [("Ann Aa", "ANNAA", 0.9, "True"), ("Bob Bb", "BOBBB", 0.8, "True"), ("Cy Cc", "CYCC", 0.7, "True"),
+                ("Dee Dd", "DEEDD", 0.6, "True"), ("Fugue", "FUGUE", 0.5, ""), ("Opera", "OPERA", 0.4, ""),
+                ("Salon", "SALON", 0.3, "")]
+        terms = [
+            {"answer": a, "normalized_answer": n, "answer_score": str(score), "page_is_person": person}
+            for a, n, score, person in rows
+        ]
+        clues = [dict(zip(CLUE_HEADER, _clue_row(a, n, revid="7"))) for a, n, _, _ in rows]
+
+        picked = [key for key, _ in _layout_candidates(terms, clues, lang="en", limit=4)]
+        self.assertEqual(picked, ["ANNAA", "FUGUE", "OPERA", "SALON"])
+        # Without enough other answers the people fill the list as before.
+        picked = [key for key, _ in _layout_candidates(terms[:5], clues[:5], lang="en", limit=4)]
+        self.assertEqual(picked, ["ANNAA", "BOBBB", "CYCC", "FUGUE"])
 
     def test_layout_fill_status_and_generated_puzzle_validity(self) -> None:
         words = [

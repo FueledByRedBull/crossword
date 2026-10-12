@@ -44,16 +44,16 @@ class GenerateIntegrationTests(unittest.TestCase):
                     self.assertEqual(puzzle["puzzle_status"], "ok")
                     self.assertEqual(validate_puzzle(puzzle), [])
 
-                    # Floors frozen from the full run of 2026-10-11 on the refreshed cache (weakest seed in brackets).
+                    # Floors frozen from the full run of 2026-10-12 on the refreshed cache (weakest seed in brackets).
                     layout = puzzle["layout"]
-                    self.assertGreaterEqual(layout["word_count"], 17)  # [19]
-                    self.assertGreaterEqual(layout["mean_crossings_per_word"], 2.1)  # [2.32]
-                    self.assertGreaterEqual(layout["two_plus_crossings_ratio"], 0.6)  # [0.74]
-                    self.assertGreaterEqual(layout["checked_letter_ratio"], 0.17)  # [0.190]
+                    self.assertGreaterEqual(layout["word_count"], 20)  # [22]
+                    self.assertGreaterEqual(layout["mean_crossings_per_word"], 2.1)  # [2.30]
+                    self.assertGreaterEqual(layout["two_plus_crossings_ratio"], 0.7)  # [0.82]
+                    self.assertGreaterEqual(layout["checked_letter_ratio"], 0.2)  # [0.239]
 
                     entries = puzzle["across_entries"] + puzzle["down_entries"]
                     definitions = [entry for entry in entries if entry["clue_style"] == "definition"]
-                    self.assertGreaterEqual(len(definitions) / len(entries), 0.5)  # [0.53]
+                    self.assertGreaterEqual(len(definitions) / len(entries), 0.5)  # [0.63]
                     for entry in entries:
                         self.assertLessEqual(len([w for w in entry["clue"].split() if w != "..."]), MAX_CLUE_WORDS, entry)
                         self.assertFalse(entry["clue"].startswith("..."), entry)
