@@ -4,7 +4,7 @@ Generate a free-form thematic crossword from a Wikipedia seed article, with defi
 
 ## Requirements
 
-- Python 3.10 to 3.12 (tested on 3.12). The pinned `spacy==3.8.2` has no wheels for Python 3.13, so `pip install -r requirements.txt` fails there.
+- Python 3.10 to 3.13 (tested on 3.12 and 3.13). The pinned `mwparserfromhell==0.7.2` has no wheels for Python 3.14, which is untested.
 
 ## Install
 
