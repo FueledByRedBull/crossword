@@ -172,11 +172,11 @@ Notes:
 1. Keep depth and backlink as soft features, not hard gates.
 2. Depth penalty only differentiates if 2-hop expansion is enabled.
 3. The on-topic candidates that are not selected stay available for the vocabulary rescue.
-4. Only off-topic pages are `CUT`. An on-topic page under the keep threshold is `BORDERLINE`, whatever its relevance: similarity to the seed text depends on how long and how broad the seed article is, so it orders the pages and no fixed value of it cuts one. A seed with more than 150 on-topic titles loses the rest to the cap on title answers; a seed with fewer keeps them all. `KEEP` (relevance at least the keep threshold) and `BORDERLINE` are labels: nothing downstream treats them differently.
+4. Only off-topic pages are `CUT`. An on-topic page is `KEEP`, whatever its relevance: similarity to the seed text depends on how long and how broad the seed article is, so it orders the pages and no fixed value of it cuts one. A seed with more than 150 on-topic titles loses the rest to the cap on title answers; a seed with fewer keeps them all.
 
 #### Outputs
 
-1. Ranked candidates with reason codes (`KEEP`, `BORDERLINE`, `CUT`).
+1. Ranked candidates with reason codes (`KEEP` for on topic, `CUT` for off topic).
 2. Drift diagnostics table for explainability.
 
 ### 5.3 Step 3: Crossword-Aware K Optimization
@@ -204,7 +204,7 @@ Choose `K` with diminishing returns:
 If `J(K)` plateaus but the vocabulary readiness gate is not satisfied, apply the following steps in order, stopping as soon as the gate passes:
 
 1. Loosen `min_df` to `1` (from adaptive default).
-2. Promote the next 3 on-topic candidates by rank that are not selected yet into the selected set (`promote_borderline` in the diagnostics, from when only `BORDERLINE` candidates were promoted and a better-ranked `KEEP` page was passed over).
+2. Promote the next 3 on-topic candidates by rank that are not selected yet into the selected set (`promote_borderline` in the diagnostics, the step's old name).
 3. Widen from the selected articles: score the pages linked from at most 6 selected articles whose intro is on topic (an even sample of each one's links, at most 100 new pages), let the best 6 join the selected articles, and let all of them be answers.
 4. Reduce minimum answer length from `4` to `3`.
 5. If all four steps fail: go on with the thin pool when it has at least `min_words` clued answers (`accept_thin_pool`); otherwise emit `puzzle_status: insufficient_vocabulary` and halt gracefully.
@@ -367,7 +367,7 @@ This is required for reliable CC BY-SA attribution in published outputs.
 5. `rel_score: float`
 6. `red_score: float`
 7. `selection_score: float`
-8. `status: keep|borderline|cut`
+8. `status: keep|cut`
 9. `reason: str`
 
 ### Answer Candidate Record
@@ -436,7 +436,7 @@ Entry record: `number`, `answer`, `display_answer`, `enumeration`, `clue`, `clue
 
 1. Implement TF-IDF + cosine.
 2. Implement MMR with depth penalty and backlink bonus.
-3. Produce explainable keep/borderline/cut diagnostics.
+3. Produce explainable keep/cut diagnostics.
 
 ### Phase 3: K Optimization
 
@@ -580,7 +580,7 @@ python cli.py generate \
 6. Risk: attribution gaps discovered late.
    - Mitigation: capture revid/span metadata at extraction time and enforce output validation.
 7. Risk: `J(K)` plateaus before sufficient vocabulary is available.
-   - Mitigation: four-step rescue ladder (loosen min_df -> promote borderline -> widen from selected articles -> shorten min length) before failing gracefully.
+   - Mitigation: four-step rescue ladder (loosen min_df -> promote the next candidates by rank -> widen from selected articles -> shorten min length) before failing gracefully.
 8. Risk: Greek accent variants break layout intersection matching.
    - Mitigation: strip diacritics at normalization time for the grid; retain accented form only in display and clue text.
 9. Risk: overfitting selection/weights to a single STEM seed.

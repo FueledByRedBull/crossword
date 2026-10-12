@@ -34,9 +34,9 @@ from src.pipeline.titles import _build_title_answer_rows, _is_person, _seed_shor
 class PipelineTests(unittest.TestCase):
     def test_an_on_topic_candidate_is_never_cut_for_low_similarity(self) -> None:
         # group 0: the intro is on topic; 1: the seed names the page twice; 2: neither.
-        self.assertEqual(_candidate_status(0, 0.25, 0.2), ("KEEP", "relevance_above_keep_threshold"))
-        self.assertEqual(_candidate_status(1, 0.02, 0.2), ("BORDERLINE", "on_topic_below_keep_threshold"))
-        self.assertEqual(_candidate_status(2, 0.9, 0.2), ("CUT", "cut_off_topic"))
+        self.assertEqual(_candidate_status(0), ("KEEP", "on_topic"))
+        self.assertEqual(_candidate_status(1), ("KEEP", "on_topic"))
+        self.assertEqual(_candidate_status(2), ("CUT", "cut_off_topic"))
 
     def setUp(self) -> None:
         # Stage tests never reach the network; the batched prefetch is checked where it matters.
@@ -1649,7 +1649,7 @@ class PipelineTests(unittest.TestCase):
         rows = [
             "1,Thermostat,1,True,0.5,0.0,0.5,False,0,CUT,cut_off_topic",
             "2,Fan,1,True,0.4,0.0,0.4,False,1,CUT,cut_off_topic",
-            "3,Entropy,1,False,0.4,0.0,0.4,False,2,BORDERLINE,x",
+            "3,Entropy,1,False,0.4,0.0,0.4,False,2,KEEP,x",
             "4,Roman,1,True,0.4,0.0,0.4,False,0,CUT,cut_off_topic",
         ]
         intros = {
@@ -1700,7 +1700,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_title_pool_cap_keeps_the_titles_with_the_most_evidence_not_the_highest_tfidf(self) -> None:
         rows = [
-            "1,Alpha,1,True,0.9,0.0,0.9,False,0,BORDERLINE,x",
+            "1,Alpha,1,True,0.9,0.0,0.9,False,0,KEEP,x",
             "2,Bravo,1,True,0.3,0.0,0.3,False,37,KEEP,x",
             "3,Gamma,1,True,0.5,0.0,0.5,False,5,KEEP,x",
         ]
@@ -1837,11 +1837,11 @@ class PipelineTests(unittest.TestCase):
             "\n".join(
                 [
                     "rank,title,depth,links_back_to_seed,rel_score,red_score,selection_score,status,reason",
-                    "1,\"Storyville, New Orleans\",1,True,0.2,0.1,0.1,BORDERLINE,on_topic_below_keep_threshold",
+                    "1,\"Storyville, New Orleans\",1,True,0.2,0.1,0.1,KEEP,on_topic",
                     "2,\"Associated Press\",1,True,0.3,0.1,0.2,CUT,cut_off_topic",
-                    "3,\"Heat\",1,True,0.9,0.0,0.9,KEEP,relevance_above_keep_threshold",
-                    "4,\"Music of Washington, D.C.\",1,True,0.2,0.1,0.1,BORDERLINE,on_topic_below_keep_threshold",
-                    "5,\"Entropy\",1,True,0.8,0.0,0.8,KEEP,relevance_above_keep_threshold",
+                    "3,\"Heat\",1,True,0.9,0.0,0.9,KEEP,on_topic",
+                    "4,\"Music of Washington, D.C.\",1,True,0.2,0.1,0.1,KEEP,on_topic",
+                    "5,\"Entropy\",1,True,0.8,0.0,0.8,KEEP,on_topic",
                 ]
             ),
             encoding="utf-8",
@@ -1878,7 +1878,7 @@ class PipelineTests(unittest.TestCase):
         promote_steps = [step for step in steps if step.get("action") == "promote_borderline"]
         self.assertTrue(promote_steps)
         self.assertEqual(promote_steps[0]["value"], 3)
-        # The off-topic row is skipped, a KEEP row is taken like a BORDERLINE one, and the fourth candidate waits.
+        # The off-topic row is skipped, the three KEEP rows are taken in rank order, and the fourth candidate waits.
         self.assertEqual(
             json.loads(selected_override_path.read_text(encoding="utf-8"))["selected_titles"],
             ["InitialTitle", "Storyville, New Orleans", "Heat", "Music of Washington, D.C."],

@@ -138,7 +138,7 @@ def _build_title_answer_rows(
                 _safe_float(row.get("rel_score")),
                 (row.get("intro_on_topic") or "").strip().lower() == "true",
                 _safe_int(row.get("seed_mentions")),
-                (row.get("status") or "").strip().upper() in {"KEEP", "BORDERLINE"},
+                (row.get("status") or "").strip().upper() == "KEEP",
             )
             for row in csv.DictReader(handle)
         ]

@@ -75,7 +75,7 @@ def _next_ranked_titles(candidate_scores_path: str | Path, selected_titles: list
             status = (row.get("status") or "").strip().upper()
             if not title:
                 continue
-            if status in {"KEEP", "BORDERLINE"} and title not in selected_titles and title not in promoted:
+            if status == "KEEP" and title not in selected_titles and title not in promoted:
                 promoted.append(title)
             if len(promoted) >= 3:
                 break
@@ -197,8 +197,8 @@ def run_rescue_ladder(
     if gate.passed:
         return _finish(True, "loosen_min_df", gate)
 
-    # Promote the next on-topic candidates by rank (up to 3) into the selected set. The step keeps the name it had
-    # when only BORDERLINE candidates were promoted.
+    # Promote the next on-topic candidates by rank (up to 3) into the selected set. The step keeps its old name in
+    # the diagnostics.
     if Path(candidate_scores_path).exists():
         promoted = _next_ranked_titles(candidate_scores_path, selected_titles, errors)
         steps.append({"action": "promote_borderline", "value": len(promoted)})
@@ -259,7 +259,6 @@ def run_generate_pipeline(
     max_two_hop_parents: int | None = None,
     max_two_hop_links: int | None = None,
     max_candidates: int | None = None,
-    keep_threshold: float = 0.2,
     candidate_weights: dict[str, float] | None = None,
     k_weights: dict[str, float] | None = None,
     lexicon_path: str | Path | None = "data/lexicon/combined_wordfreq.txt",
@@ -306,7 +305,6 @@ def run_generate_pipeline(
         "max_two_hop_parents": max_two_hop_parents,
         "max_two_hop_links": max_two_hop_links,
         "max_candidates": max_candidates,
-        "keep_threshold": keep_threshold,
         "weights": candidate_weights,
         "lexicon_path": lexicon_path,
         "lexicon_weight": candidate_lexicon_weight,
@@ -333,7 +331,6 @@ def run_generate_pipeline(
         max_two_hop_parents=max_two_hop_parents,
         max_two_hop_links=max_two_hop_links,
         max_candidates=max_candidates,
-        keep_threshold=keep_threshold,
         min_k=min_k,
         max_k=max_k,
         epsilon=epsilon,

@@ -132,12 +132,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip backlink annotation for candidates",
     )
     score_parser.add_argument(
-        "--keep-threshold",
-        type=float,
-        default=0.2,
-        help="Relevance from which an on-topic page is labelled KEEP instead of BORDERLINE (nothing else depends on it)",
-    )
-    score_parser.add_argument(
         "--lexicon-path",
         default="data/lexicon/combined_wordfreq.txt",
         help="Optional external lexicon file (word[,score])",
@@ -224,12 +218,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-backlinks",
         action="store_true",
         help="Skip backlink annotation for candidates",
-    )
-    k_parser.add_argument(
-        "--keep-threshold",
-        type=float,
-        default=0.2,
-        help="Relevance from which an on-topic page is labelled KEEP instead of BORDERLINE (nothing else depends on it)",
     )
     k_parser.add_argument(
         "--lexicon-path",
@@ -604,7 +592,6 @@ def _build_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("--max-two-hop-parents", type=int, default=None)
     generate_parser.add_argument("--max-two-hop-links", type=int, default=None)
     generate_parser.add_argument("--max-candidates", type=int, default=None)
-    generate_parser.add_argument("--keep-threshold", type=float, default=0.2)
     generate_parser.add_argument(
         "--lexicon-path",
         default="data/lexicon/combined_wordfreq.txt",
@@ -716,7 +703,6 @@ def main() -> None:
             max_two_hop_parents=args.max_two_hop_parents,
             max_two_hop_links=args.max_two_hop_links,
             max_candidates=args.max_candidates,
-            keep_threshold=args.keep_threshold,
             lexicon_path=args.lexicon_path,
             lexicon_weight=args.lexicon_weight,
         )
@@ -739,7 +725,6 @@ def main() -> None:
             max_two_hop_parents=args.max_two_hop_parents,
             max_two_hop_links=args.max_two_hop_links,
             max_candidates=args.max_candidates,
-            keep_threshold=args.keep_threshold,
             min_k=args.min_k,
             max_k=args.max_k,
             epsilon=args.epsilon,
@@ -867,7 +852,6 @@ def main() -> None:
             max_two_hop_parents=args.max_two_hop_parents,
             max_two_hop_links=args.max_two_hop_links,
             max_candidates=args.max_candidates,
-            keep_threshold=args.keep_threshold,
             lexicon_path=args.lexicon_path,
             candidate_lexicon_weight=args.candidate_lexicon_weight,
             term_lexicon_weight=args.term_lexicon_weight,
