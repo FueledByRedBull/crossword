@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from bisect import bisect_right
 from collections import Counter
 from typing import NamedTuple
@@ -1097,12 +1098,23 @@ def is_answer_subject(sentence: str, answer: str, nlp) -> bool:
     return False
 
 
+def _bare_words(text: str) -> list[str]:
+    """Words spelt with a modifier letter, an apostrophe or a combining mark, without it: "Hawaiʻi" and "Hawai'i" give "hawaii"."""
+    words = []
+    for raw in text.split():
+        letters = [ch for ch in strip_diacritics(raw.lower()) if unicodedata.category(ch) not in {"Lm", "Sk"} and ch not in "'’‘"]
+        if len(letters) < len(raw):
+            words += "".join(ch if ch.isalnum() else " " for ch in letters).split()
+    return words
+
+
 def _content_lemmas(text: str, nlp, lang: str) -> set[str]:
+    stopwords = get_stopwords(lang)
     if nlp is None:
-        stopwords = get_stopwords(lang)
         tokens = [(word, word.upper() in stopwords) for word in tokenize(text, lang=lang)]
     else:
         tokens = [(strip_diacritics(token.lemma_.lower()), token.is_stop) for token in nlp(text) if token.is_alpha]
+    tokens += [(word, word.upper() in stopwords) for word in _bare_words(text)]
     # Greek lemmas differ in gender and ending (φυσική / φυσικός): compare their stems.
     trim = _WORDS[lang].stem_trim
     return {

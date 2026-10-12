@@ -294,6 +294,20 @@ class LeakageTests(unittest.TestCase):
     def test_every_token_of_multi_word_answer_counts(self) -> None:
         self.assertTrue(has_morphological_leakage("The Davis quintet", "Miles Davis", None))
 
+    def test_modifier_letters_and_apostrophes_do_not_hide_the_answer(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        for clue, answer in (
+            ("Hawaiʻi, sometimes written ____, is the largest island in the United States, "
+             "located in the state of ____.", "Hawaii"),
+            ("O’Neill wrote plays about a troubled family", "O'Neill"),
+        ):
+            self.assertFalse(clue_pass_validate(clue, answer, min_words=3, nlp=nlp), (clue, answer))
+        self.assertTrue(
+            clue_pass_validate("Eugene O’Hara wrote a play about a family", "O'Neill", min_words=3, nlp=nlp)
+        )
+
 
 class DefinitionClueTests(unittest.TestCase):
     def test_strips_subject_and_copula(self) -> None:
