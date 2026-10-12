@@ -171,8 +171,8 @@ Notes:
 
 1. Keep depth and backlink as soft features, not hard gates.
 2. Depth penalty only differentiates if 2-hop expansion is enabled.
-3. Retain borderline set for later vocabulary rescue.
-4. Only off-topic pages are `CUT`. An on-topic page under the keep threshold is `BORDERLINE`, whatever its relevance: similarity to the seed text depends on how long and how broad the seed article is, so it orders the pages and no fixed value of it cuts one. A seed with more than 150 on-topic titles loses the rest to the cap on title answers; a seed with fewer keeps them all. `KEEP` (relevance at least the keep threshold) and `BORDERLINE` differ only in step 2 of the rescue ladder below.
+3. The on-topic candidates that are not selected stay available for the vocabulary rescue.
+4. Only off-topic pages are `CUT`. An on-topic page under the keep threshold is `BORDERLINE`, whatever its relevance: similarity to the seed text depends on how long and how broad the seed article is, so it orders the pages and no fixed value of it cuts one. A seed with more than 150 on-topic titles loses the rest to the cap on title answers; a seed with fewer keeps them all. `KEEP` (relevance at least the keep threshold) and `BORDERLINE` are labels: nothing downstream treats them differently.
 
 #### Outputs
 
@@ -204,7 +204,7 @@ Choose `K` with diminishing returns:
 If `J(K)` plateaus but the vocabulary readiness gate is not satisfied, apply the following steps in order, stopping as soon as the gate passes:
 
 1. Loosen `min_df` to `1` (from adaptive default).
-2. Promote up to 3 `BORDERLINE` candidates into the selected set: the first three on-topic pages under the keep threshold that are not selected yet, in rank order. An unselected `KEEP` page is passed over (known gap: the three best unselected pages by rank would be the consistent choice).
+2. Promote the next 3 on-topic candidates by rank that are not selected yet into the selected set (`promote_borderline` in the diagnostics, from when only `BORDERLINE` candidates were promoted and a better-ranked `KEEP` page was passed over).
 3. Widen from the selected articles: score the pages linked from at most 6 selected articles whose intro is on topic (an even sample of each one's links, at most 100 new pages), let the best 6 join the selected articles, and let all of them be answers.
 4. Reduce minimum answer length from `4` to `3`.
 5. If all four steps fail: go on with the thin pool when it has at least `min_words` clued answers (`accept_thin_pool`); otherwise emit `puzzle_status: insufficient_vocabulary` and halt gracefully.

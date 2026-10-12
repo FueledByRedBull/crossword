@@ -135,7 +135,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--keep-threshold",
         type=float,
         default=0.2,
-        help="Relevance from which an on-topic page is KEEP instead of BORDERLINE",
+        help="Relevance from which an on-topic page is labelled KEEP instead of BORDERLINE (nothing else depends on it)",
     )
     score_parser.add_argument(
         "--lexicon-path",
@@ -229,7 +229,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--keep-threshold",
         type=float,
         default=0.2,
-        help="Relevance from which an on-topic page is KEEP instead of BORDERLINE",
+        help="Relevance from which an on-topic page is labelled KEEP instead of BORDERLINE (nothing else depends on it)",
     )
     k_parser.add_argument(
         "--lexicon-path",

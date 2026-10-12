@@ -1809,7 +1809,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual([accepted[0]["min_required"], accepted[1]["gate_min"], accepted[2]["gate_min"]], [12, 12, 12])
         self.assertEqual((rescue.call_count, without_rescue), (1, 30))
 
-    def test_rescue_ladder_promotes_borderline_from_csv(self) -> None:
+    def test_rescue_ladder_promotes_the_next_on_topic_candidates_by_rank(self) -> None:
         tmp_dir = Path("tests") / "tmp_outputs" / "rescue_csv"
         selected_path = tmp_dir / "selected_candidates.json"
         candidate_scores_path = tmp_dir / "candidate_scores.csv"
@@ -1838,8 +1838,10 @@ class PipelineTests(unittest.TestCase):
                 [
                     "rank,title,depth,links_back_to_seed,rel_score,red_score,selection_score,status,reason",
                     "1,\"Storyville, New Orleans\",1,True,0.2,0.1,0.1,BORDERLINE,on_topic_below_keep_threshold",
-                    "2,\"Music of Washington, D.C.\",1,True,0.2,0.1,0.1,BORDERLINE,on_topic_below_keep_threshold",
-                    "3,\"Thermodynamics\",1,True,0.9,0.0,0.9,KEEP,relevance_above_keep_threshold",
+                    "2,\"Associated Press\",1,True,0.3,0.1,0.2,CUT,cut_off_topic",
+                    "3,\"Heat\",1,True,0.9,0.0,0.9,KEEP,relevance_above_keep_threshold",
+                    "4,\"Music of Washington, D.C.\",1,True,0.2,0.1,0.1,BORDERLINE,on_topic_below_keep_threshold",
+                    "5,\"Entropy\",1,True,0.8,0.0,0.8,KEEP,relevance_above_keep_threshold",
                 ]
             ),
             encoding="utf-8",
@@ -1875,7 +1877,12 @@ class PipelineTests(unittest.TestCase):
         steps = result["diagnostics"]["steps"]
         promote_steps = [step for step in steps if step.get("action") == "promote_borderline"]
         self.assertTrue(promote_steps)
-        self.assertEqual(promote_steps[0]["value"], 2)
+        self.assertEqual(promote_steps[0]["value"], 3)
+        # The off-topic row is skipped, a KEEP row is taken like a BORDERLINE one, and the fourth candidate waits.
+        self.assertEqual(
+            json.loads(selected_override_path.read_text(encoding="utf-8"))["selected_titles"],
+            ["InitialTitle", "Storyville, New Orleans", "Heat", "Music of Washington, D.C."],
+        )
 
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

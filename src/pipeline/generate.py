@@ -61,11 +61,11 @@ def _write_selected(path: Path, titles: list[str], seed_title: str, lang: str) -
     return write_json(path, payload)
 
 
-def _borderline_titles(candidate_scores_path: str | Path, selected_titles: list[str], errors: list[str]) -> list[str]:
-    """Up to 3 borderline candidates of the scores CSV that are not selected yet."""
+def _next_ranked_titles(candidate_scores_path: str | Path, selected_titles: list[str], errors: list[str]) -> list[str]:
+    """The 3 best-ranked on-topic candidates of the scores CSV (its rows are in rank order) that are not selected yet."""
     import csv
 
-    borderline = []
+    promoted = []
     with Path(candidate_scores_path).open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         if not reader.fieldnames:
@@ -75,11 +75,11 @@ def _borderline_titles(candidate_scores_path: str | Path, selected_titles: list[
             status = (row.get("status") or "").strip().upper()
             if not title:
                 continue
-            if status == "BORDERLINE" and title not in selected_titles and title not in borderline:
-                borderline.append(title)
-            if len(borderline) >= 3:
+            if status in {"KEEP", "BORDERLINE"} and title not in selected_titles and title not in promoted:
+                promoted.append(title)
+            if len(promoted) >= 3:
                 break
-    return borderline
+    return promoted
 
 
 def _widening_titles(
@@ -197,12 +197,13 @@ def run_rescue_ladder(
     if gate.passed:
         return _finish(True, "loosen_min_df", gate)
 
-    # Promote borderline candidates (up to 3) into the selected set.
+    # Promote the next on-topic candidates by rank (up to 3) into the selected set. The step keeps the name it had
+    # when only BORDERLINE candidates were promoted.
     if Path(candidate_scores_path).exists():
-        borderline = _borderline_titles(candidate_scores_path, selected_titles, errors)
-        steps.append({"action": "promote_borderline", "value": len(borderline)})
-        if borderline:
-            selected_titles = selected_titles + borderline
+        promoted = _next_ranked_titles(candidate_scores_path, selected_titles, errors)
+        steps.append({"action": "promote_borderline", "value": len(promoted)})
+        if promoted:
+            selected_titles = selected_titles + promoted
             selected_path = _write_selected(Path(selected_override_path), selected_titles, seed_title, lang)
     else:
         steps.append({"action": "promote_borderline", "value": 0, "note": "candidate_scores_missing"})
