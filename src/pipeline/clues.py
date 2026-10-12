@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from collections import Counter
 from collections.abc import Callable
@@ -8,9 +9,11 @@ from pathlib import Path
 from ..cache import DiskCache
 from ..artifact_models import SelectedCandidatesArtifact
 from ..diagnostics import write_json
-from ..term_extractor import _TITLE_DISAMBIGUATOR, title_short_name
+from ..term_extractor import _TITLE_DISAMBIGUATOR, get_stopwords, title_short_name
 from ..clue_builder import (
+    _WORD,
     MAX_CLUE_WORDS,
+    _fold,
     answer_pattern,
     clue_pass_mask_trim,
     clue_pass_validate,
@@ -59,13 +62,30 @@ def _build_clue_row(
     }
 
 
-def _clue_candidate_rank(row: dict, seed_title: str) -> tuple[bool, bool, float, int, int, str]:
+def _intro_weights(payload: dict, answer: str, lead_counts: Counter[str], pool_size: int, lang: str) -> dict[str, float]:
+    """The rarity weight of each content word in the intro of the answer's own page (a full extract's intro ends at its first section title)."""
+    intro = " ".join(split_sentences(payload.get("extract", "").split("\n\n\n")[0]))
+    stopwords = get_stopwords(lang)
+    return {
+        word: math.log((pool_size + 1) / (lead_counts[word] + 1))
+        for word in set(_WORD.findall(intro.lower())) - set(_WORD.findall(answer.lower()))
+        if _fold(word).upper() not in stopwords
+    }
+
+
+def _aboutness(clue_text: str, intro_weights: dict[str, float]) -> float:
+    """How much of the intro the clue repeats: the summed rarity of its distinct words that the intro has too."""
+    return round(sum(intro_weights.get(word, 0.0) for word in set(_WORD.findall(clue_text.lower()))), 6)
+
+
+def _clue_candidate_rank(row: dict, seed_title: str, intro_weights: dict[str, float]) -> tuple[bool, bool, float, float, int, int, str]:
     clue_text = str(row.get("clue") or "")
     sentence_offset = _safe_int(row.get("sentence_offset"), default=9999)
     masked_length_score = -abs(len(clue_text.split()) - 9)
     return (
         not clue_text.startswith("...") and not clue_text.endswith("..."),
         row.get("source_page") == seed_title,
+        _aboutness(clue_text, intro_weights),
         _safe_float(row.get("clue_score"), default=0.0),
         masked_length_score,
         -sentence_offset,
@@ -88,8 +108,12 @@ def _collect_source_backed_clue_candidates(
     allow_fragments: bool = True,
     full_name: str | None = None,
     person: bool = False,
+    intro_weights: dict[str, float] | None = None,
 ) -> list[dict]:
     """Fill-in candidates, complete sentences first, then the seed article's before other pages'.
+
+    Among those, the sentence that repeats more of the answer's own intro (`intro_weights`) comes first: "owe their useful
+    properties to conservation of ____" says more about "Angular momentum" than "a consequence of the ____ of the orbital".
 
     A fragment is a window that is not a whole sentence and not a single clause-boundary cut; the
     term stage still counts them as support, a clue never uses one. With `full_name` the answer is a
@@ -154,7 +178,7 @@ def _collect_source_backed_clue_candidates(
                 )
             )
 
-    candidates.sort(key=lambda row: _clue_candidate_rank(row, seed_title), reverse=True)
+    candidates.sort(key=lambda row: _clue_candidate_rank(row, seed_title, intro_weights or {}), reverse=True)
     return candidates
 
 
@@ -468,6 +492,10 @@ def run_clue_extraction_stage(
         seed_only = last_word and not person
         if seed_only:
             load_source_payload(seed_title)
+        # The intro of an off-topic page is about another sense of the word: nothing ranks by it.
+        intro_weights = (
+            _intro_weights(source_cache[page], answer, lead_counts, len(leads), lang) if page and not other_sense else {}
+        )
         candidates = _collect_source_backed_clue_candidates(
             answer=answer,
             normalized_answer=normalized_answer,
@@ -482,6 +510,7 @@ def run_clue_extraction_stage(
             allow_fragments=False,
             full_name=own_title if last_word and person else None,
             person=person,
+            intro_weights=intro_weights,
         )
         if page:
             # A page defines its own name only: its title, or any name of the person it is about ("Monet", "Peter

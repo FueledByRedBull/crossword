@@ -1231,6 +1231,23 @@ class PipelineTests(unittest.TestCase):
         # Bebop's sentence is the closer fit to nine words; the seed's wins because both are complete sentences.
         self.assertEqual([(row["source_page"], row["revid"]) for row in result.clues], [("Jazz", 88)])
 
+    def test_clue_stage_prefers_what_the_answers_intro_repeats_to_nine_words_and_keeps_that_order_without_a_page(self) -> None:
+        extracts = {
+            "Tempo": "Tempo is the speed of a musical piece, measured in beats per minute.",
+            "Bebop": "Bebop is a style of jazz that arose in the 1940s.",
+            "Swing": "Swing is a dance and a style of big band music.",
+            "Jazz": "Many fans enjoyed the pace at the old club. A faster pace means more beats per minute in the music.",
+        }
+        pool = ["Bebop,BEBOP,Bebop,article_title,True", "Swing,SWING,Swing,article_title,True"]
+        with_page, _ = self._run_clues_for("clue_about", ["Pace,PACE,Tempo|Jazz,article_title,True", *pool], extracts)
+        without_page, _ = self._run_clues_for("clue_no_page", ["Pace,PACE,Jazz,spacy", *pool], extracts)
+
+        def pace_clue(result) -> str:
+            return next(row["clue"] for row in result.clues if row["answer"] == "Pace")
+
+        self.assertEqual(pace_clue(with_page), "A faster ____ means more beats per minute in the music.")
+        self.assertEqual(pace_clue(without_page), "Many fans enjoyed the ____ at the old club.")
+
     def test_vocab_gate_counts_distinct_clued_answers(self) -> None:
         tmp_dir = Path("tests") / "tmp_outputs" / "gate_clued"
         if tmp_dir.exists():
