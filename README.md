@@ -51,10 +51,12 @@ Across
 
 ```powershell
 py -3 cli.py export --puzzle outputs\run_thermo\puzzle.json --format html --output outputs\run_thermo\puzzle.html --solution
+py -3 cli.py export --puzzle outputs\run_thermo\puzzle.json --format html --solvable --output outputs\run_thermo\solve.html
 py -3 cli.py export --puzzle outputs\run_thermo\puzzle.json --format ipuz --output outputs\run_thermo\puzzle.ipuz
 ```
 
 - `html` writes one self-contained printable page: the numbered grid, the clues with enumerations, and a Sources list linking each article revision (`oldid`) under CC BY-SA 4.0. `--solution` adds the solved grid on its own page.
+- `html --solvable` writes a page to solve in a browser instead: one self-contained file with no external request that opens straight from disk, laid out for a desktop or a phone screen (it cannot be combined with `--solution` or `--format ipuz`). You solve with the keyboard or a touch keyboard; nothing is checked until you ask, and Check, Reveal and Clear work on a letter, a word or the whole grid. A timer starts at the first letter and stops at a complete, correct grid, progress is kept in the browser's `localStorage`, and the sources sit in a closed block because their titles give away answers.
 - `ipuz` writes an [ipuz](http://www.ipuz.org/) crossword cropped to the letters' bounding box, with the solution, enumerations and the Wikipedia sources in `copyright` and `notes`.
 
 ## How It Works
@@ -94,7 +96,7 @@ Each stage records what went wrong in the `errors` list of its diagnostics file:
 
 - `py -3 cli.py generate ...` full end-to-end pipeline
 - `py -3 cli.py render --puzzle <path>` print a puzzle as text
-- `py -3 cli.py export --puzzle <path> --format ipuz|html --output <path>` write an `.ipuz` file or a printable HTML page
+- `py -3 cli.py export --puzzle <path> --format ipuz|html [--solvable] --output <path>` write an `.ipuz` file, a printable HTML page or, with `--solvable`, an HTML page to solve in a browser
 - `py -3 cli.py <stage> ...` single pipeline stages (`seed`, `rank`, `select-k`, `terms`, `vocab-gate`, `clues`, `rescue`, `layout`, `package`; see `--help`)
 - `py -3 scripts/bench.py ...` multi-seed benchmark runner
 - `py -3 scripts/tune_weights.py ...` weight grid search

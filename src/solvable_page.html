@@ -1,0 +1,860 @@
+<!DOCTYPE html>
+<!-- Template of export_solvable_html (src/export.py): the uppercase words between two at-signs are filled in by Python. Nothing here is loaded from elsewhere. -->
+<html lang="@LANG@">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>@TITLE@</title>
+<style>
+:root {
+    color-scheme: light dark;
+    --page: #fbfaf6;
+    --ink: #141414;
+    --muted: #55504a;
+    --grid-line: #141414;
+    --cell: #fff;
+    --word: #dde7f4;
+    --current: #ffd96a;
+    --wrong: #a30f0f;
+    --revealed: #1c4e92;
+    --focus: #0b57d0;
+    --box: #cdc8bb;
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --page: #17181b;
+        --ink: #ebe8e1;
+        --muted: #b4b0a7;
+        --grid-line: #a9a59c;
+        --cell: #1f2125;
+        --word: #2a3a52;
+        --current: #5c4a0e;
+        --wrong: #ffb3b3;
+        --revealed: #9cc3ff;
+        --focus: #8ab4ff;
+        --box: #3a3c41;
+    }
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+    margin: 0 auto;
+    max-width: 1180px;
+    padding: 16px;
+    background: var(--page);
+    color: var(--ink);
+    font: 16px/1.4 Georgia, "Times New Roman", serif;
+}
+h1 { font-size: 1.9rem; line-height: 1.15; margin: 0.2rem 0; }
+h2 {
+    font: 700 0.85rem/1.4 system-ui, sans-serif;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin: 0 0 0.3rem;
+}
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+
+button {
+    font: 14px/1.2 system-ui, "Segoe UI", sans-serif;
+    min-height: 34px;
+    padding: 0.3rem 0.6rem;
+    border: 1px solid var(--grid-line);
+    border-radius: 3px;
+    background: var(--cell);
+    color: var(--ink);
+    cursor: pointer;
+    touch-action: manipulation;
+}
+button:hover:not(:disabled) { background: var(--word); }
+button:disabled { color: var(--muted); border-color: var(--box); cursor: default; }
+
+/* Title, timer and the Check / Reveal / Clear buttons. */
+.top {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.3rem 1rem;
+    margin-bottom: 0.6rem;
+}
+.tools {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem 1.1rem;
+    font: 14px system-ui, sans-serif;
+}
+.group { display: inline-flex; align-items: center; gap: 0.25rem; }
+.group b { font-weight: 600; margin-right: 0.3rem; }
+#time { font-variant-numeric: tabular-nums; font-weight: 600; margin-right: 0.4rem; }
+#message { font-weight: 600; margin: 0.6rem 0 0; }
+
+/* Grid on the left, clue lists on the right; stacked on a narrow screen (see below). */
+.layout {
+    display: grid;
+    grid-template-columns: minmax(0, 640px) minmax(0, 1fr);
+    gap: 1.5rem;
+    margin-top: 0.8rem;
+}
+.clue-bar {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    padding: 0.4rem 0;
+    background: var(--page);
+    border-bottom: 1px solid var(--box);
+}
+.help { margin: 0; font: 13px/1.4 system-ui, sans-serif; color: var(--muted); }
+
+/* The grid is as wide as its box allows, at most 48px per cell. Sizes in cqw follow the box, so
+   letters and numbers scale with the cells; the letters never drop below 16px (iOS zooms smaller inputs). */
+.grid-box {
+    container-type: inline-size;
+    width: min(100%, calc(var(--columns) * 48px));
+    margin: 0.9rem 0;
+}
+.grid {
+    display: grid;
+    grid-template-columns: repeat(var(--columns), 1fr);
+    padding: 0 1px 1px 0;
+    font: 700 max(16px, calc(55cqw / var(--columns))) system-ui, "Segoe UI", Arial, sans-serif;
+    touch-action: manipulation;
+}
+/* Neighbouring cells overlap by one border so lines are 1px; blanks are empty divs that only take space. */
+.grid > div { aspect-ratio: 1; margin: 0 -1px -1px 0; }
+.cell {
+    position: relative;
+    border: 1px solid var(--grid-line);
+    background: var(--cell);
+    -webkit-tap-highlight-color: transparent;
+}
+.cell input {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0.2em 0 0;
+    border: 0;
+    border-radius: 0;
+    outline: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: center;
+    text-transform: uppercase;
+    caret-color: transparent;
+    appearance: none;
+    -webkit-appearance: none;
+}
+.cell input::selection { background: transparent; }
+.number {
+    position: absolute;
+    top: 1px;
+    left: 2px;
+    font: 400 max(7px, calc(24cqw / var(--columns)))/1 system-ui, sans-serif;
+    color: var(--muted);
+    pointer-events: none;
+    user-select: none;
+}
+.in-word { background: var(--word); }
+.current { background: var(--current); }
+.current .number { color: var(--ink); }
+.cell:focus-within { outline: 3px solid var(--focus); outline-offset: -3px; z-index: 1; }
+
+/* Wrong and revealed letters differ by a corner sign as well as by colour. */
+.wrong input { color: var(--wrong); }
+.wrong::after {
+    content: "\00d7";
+    position: absolute;
+    right: 2px;
+    bottom: 0;
+    font: 700 max(10px, calc(30cqw / var(--columns)))/1 system-ui;
+    color: var(--wrong);
+    pointer-events: none;
+}
+.revealed input { color: var(--revealed); }
+.revealed::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    right: 0;
+    border-top: max(5px, calc(24cqw / var(--columns))) solid var(--revealed);
+    border-left: max(5px, calc(24cqw / var(--columns))) solid transparent;
+    pointer-events: none;
+}
+
+/* On a wide screen the two clue lists share the column and scroll inside their own boxes. */
+.side {
+    display: grid;
+    grid-template-rows: 1fr 1fr;
+    gap: 1rem;
+    position: sticky;
+    top: 1rem;
+    height: calc(100vh - 2rem);
+    min-height: 0;
+}
+.side section { display: flex; flex-direction: column; min-height: 0; }
+.clue-list {
+    flex: 1;
+    overflow: auto;
+    position: relative; /* the script scrolls by offsetTop, measured from this box */
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    border: 1px solid var(--box);
+}
+.clue {
+    display: grid;
+    grid-template-columns: 2.4ch 1fr;
+    gap: 0.4rem;
+    width: 100%;
+    min-height: 0;
+    padding: 0.35rem 0.6rem;
+    border: 0;
+    border-left: 4px solid transparent;
+    border-radius: 0;
+    background: none;
+    text-align: left;
+    font: inherit;
+    line-height: 1.35;
+}
+.clue[aria-current] { background: var(--word); border-left-color: var(--ink); }
+.enumeration { color: var(--muted); white-space: nowrap; }
+
+footer { margin-top: 1.5rem; font: 13px/1.5 system-ui, sans-serif; color: var(--muted); }
+footer a { color: inherit; }
+footer ul { columns: 2 260px; margin: 0.4rem 0; }
+
+@media (max-width: 859px) {
+    h1 { font-size: 1.5rem; }
+    .layout { grid-template-columns: minmax(0, 1fr); }
+    .side { display: block; position: static; height: auto; }
+    .side section { display: block; margin-bottom: 1rem; }
+    .clue-list { overflow: visible; }
+}
+@media (prefers-reduced-motion: reduce) {
+    * { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+}
+
+/* Print: the empty grid, the clues and the attribution. */
+@media print {
+    body { max-width: none; padding: 0; background: #fff; color: #000; }
+    .tools, .top .group, .clue-bar, .help, #message, #paused { display: none !important; }
+    #main[hidden] { display: block !important; } /* printing while paused still prints the puzzle */
+    .layout { display: block; }
+    .side { position: static; height: auto; display: grid; grid-template-columns: 1fr 1fr; }
+    .clue-list { overflow: visible; border: 0; }
+    .clue { break-inside: avoid; padding: 0.1rem 0.3rem; }
+    .clue[aria-current] { background: none; border-left-color: transparent; }
+    .cell { background: #fff !important; outline: 0 !important; }
+    .cell input { color: transparent !important; -webkit-text-fill-color: transparent; }
+    .cell::before, .cell::after { display: none !important; }
+    .number { color: #000 !important; }
+    footer { color: #000; }
+}
+</style>
+</head>
+<body>
+<header class="top">
+    <h1>@TITLE@</h1>
+    <span class="group">@TIMER@</span>
+</header>
+<div class="tools" id="tools">@TOOLS@</div>
+<p id="message" role="status"></p>
+<p id="paused" hidden></p>
+<main class="layout" id="main">
+    <div>
+        <div class="clue-bar" id="clue-bar"><b></b> <span></span></div>
+        <div class="grid-box" style="--columns: @COLUMNS@">
+            <div class="grid" id="grid" role="group" aria-label="@TITLE@">@CELLS@</div>
+        </div>
+        <p class="help">@HELP@</p>
+    </div>
+    <div class="side">@CLUES@</div>
+</main>
+<footer>
+    <p>@ATTRIBUTION@</p>
+    @SOURCES@
+</footer>
+<script type="application/json" id="data">@DATA@</script>
+<script>
+(function () {
+    "use strict";
+
+    const ACROSS = 0;
+    const DOWN = 1;
+
+    // ---- Data from the puzzle ------------------------------------------------------------------
+
+    const data = JSON.parse(document.getElementById("data").textContent);
+    const labels = data.labels;
+    const columns = data.columns;
+    // One letter per cell in reading order, "." where the grid has no cell. Encoded against spoilers
+    // in the page source, not against anyone who wants to decode it.
+    const solution = [...JSON.parse(atob(data.solution)).join("")];
+    // {direction, number, cells}: across words first, then down, the order of the clue lists.
+    const words = data.words;
+
+    const gridElement = document.getElementById("grid");
+    const cellElements = [...gridElement.children];
+    const inputs = cellElements.map((cellElement) => cellElement.querySelector("input")); // null on a blank
+    const letterCells = solution.map((_, cell) => cell).filter((cell) => inputs[cell]);
+    const clueButtons = [...document.querySelectorAll(".clue")];
+    const clueBar = document.getElementById("clue-bar");
+    const timeElement = document.getElementById("time");
+    const messageElement = document.getElementById("message");
+    const pauseButton = document.getElementById("pause");
+    const actionButtons = [...document.querySelectorAll("[data-action]")];
+    const sourcesElement = document.getElementById("sources");
+
+    // wordOfCell[cell][direction] is the index into `words` of the word through that cell, or -1.
+    const wordOfCell = solution.map(() => [-1, -1]);
+    words.forEach((word, index) => {
+        word.cells.forEach((cell) => {
+            wordOfCell[cell][word.direction] = index;
+        });
+    });
+
+    // ---- Progress, kept in localStorage ------------------------------------------------------
+
+    const WRONG = "w"; // marks as stored: Check found the letter wrong
+    const REVEALED = "r"; // Reveal filled the letter in
+
+    function newProgress() {
+        return {
+            letters: {}, // cell -> capital letter
+            marks: {}, // cell -> WRONG or REVEALED; a mark lasts until the letter changes
+            elapsedMs: 0,
+            started: false, // the first letter has been typed: the timer runs
+            usedCheck: false,
+            usedReveal: false,
+            finished: false, // complete and correct
+        };
+    }
+
+    function loadProgress() {
+        const progress = newProgress();
+        try {
+            const stored = JSON.parse(localStorage.getItem(data.storageKey));
+            if (!stored || !stored.v || !stored.m) {
+                return progress;
+            }
+            for (const cell of letterCells) {
+                const letter = stored.v[cell];
+                if (typeof letter !== "string" || [...letter].length !== 1) {
+                    continue;
+                }
+                progress.letters[cell] = letter;
+                if (stored.m[cell] === WRONG || stored.m[cell] === REVEALED) {
+                    progress.marks[cell] = stored.m[cell];
+                }
+            }
+            progress.elapsedMs = Number(stored.t) || 0;
+            progress.started = Boolean(stored.go);
+            progress.usedCheck = Boolean(stored.c);
+            progress.usedReveal = Boolean(stored.r);
+            progress.finished = Boolean(stored.done);
+        } catch (error) {
+            // Storage unavailable or damaged: start empty.
+        }
+        return progress;
+    }
+
+    function saveProgress() {
+        // The stored field names are those of the pages exported earlier: they still load their progress.
+        const stored = {
+            v: progress.letters,
+            m: progress.marks,
+            t: progress.elapsedMs,
+            go: progress.started,
+            c: progress.usedCheck,
+            r: progress.usedReveal,
+            done: progress.finished,
+        };
+        try {
+            localStorage.setItem(data.storageKey, JSON.stringify(stored));
+        } catch (error) {
+            // Storage unavailable or full: the puzzle still works, it just is not remembered.
+        }
+    }
+
+    let progress = loadProgress();
+
+    // ---- Timer -------------------------------------------------------------------------------------
+
+    let paused = false;
+    let timerHandle = null;
+    let lastTickAt = 0;
+
+    function formatTime(milliseconds) {
+        const totalSeconds = Math.floor(milliseconds / 1000);
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const seconds = String(totalSeconds % 60).padStart(2, "0");
+        if (hours) {
+            return `${hours}:${String(minutes).padStart(2, "0")}:${seconds}`;
+        }
+        return `${minutes}:${seconds}`;
+    }
+
+    // The timer runs from the first letter typed until the grid is finished, and not while paused.
+    function startTimer() {
+        if (!progress.started || progress.finished || paused || timerHandle) {
+            return;
+        }
+        lastTickAt = Date.now();
+        timerHandle = setInterval(tick, 1000);
+    }
+
+    function tick() {
+        const now = Date.now();
+        progress.elapsedMs += now - lastTickAt;
+        lastTickAt = now;
+        timeElement.textContent = formatTime(progress.elapsedMs);
+        saveProgress();
+    }
+
+    function stopTimer() {
+        if (!timerHandle) {
+            return;
+        }
+        progress.elapsedMs += Date.now() - lastTickAt;
+        clearInterval(timerHandle);
+        timerHandle = null;
+    }
+
+    // ---- Selection and drawing ---------------------------------------------------------------
+
+    let currentCell = words[0].cells[0];
+    let direction = words[0].direction;
+
+    function currentWordIndex() {
+        return wordOfCell[currentCell][direction];
+    }
+
+    function currentWord() {
+        return words[currentWordIndex()];
+    }
+
+    // The cell `offset` places along the current word from the current one; undefined past either end.
+    function cellInWord(offset) {
+        const cells = currentWord().cells;
+        return cells[cells.indexOf(currentCell) + offset];
+    }
+
+    // Selects a cell and its word without moving focus. A cell in one word only keeps that word's direction.
+    function selectCell(cell, wantedDirection = direction) {
+        currentCell = cell;
+        direction = wordOfCell[cell][wantedDirection] >= 0 ? wantedDirection : 1 - wantedDirection;
+        render();
+    }
+
+    function focusCell(cell, wantedDirection) {
+        selectCell(cell, wantedDirection);
+        const input = inputs[currentCell];
+        input.focus({ preventScroll: true });
+        input.select(); // the next letter typed replaces this one
+    }
+
+    // Selects a clue's word at its first empty cell, or at its first cell when it is full.
+    function goToWord(index) {
+        const word = words[(index + words.length) % words.length];
+        const firstEmpty = word.cells.find((cell) => !progress.letters[cell]);
+        focusCell(firstEmpty ?? word.cells[0], word.direction);
+    }
+
+    function render() {
+        const wordIndex = currentWordIndex();
+        renderCells(words[wordIndex].cells);
+        renderClues(wordIndex);
+        renderControls();
+    }
+
+    function renderCells(wordCells) {
+        cellElements.forEach((cellElement, cell) => {
+            const input = inputs[cell];
+            if (!input) {
+                return;
+            }
+            const letter = progress.letters[cell] || "";
+            cellElement.classList.toggle("in-word", wordCells.includes(cell));
+            cellElement.classList.toggle("current", cell === currentCell);
+            cellElement.classList.toggle("wrong", progress.marks[cell] === WRONG);
+            cellElement.classList.toggle("revealed", progress.marks[cell] === REVEALED);
+            if (input.value !== letter) {
+                input.value = letter;
+            }
+            input.tabIndex = cell === currentCell ? 0 : -1; // one tab stop: the selected cell
+            input.readOnly = progress.finished;
+        });
+    }
+
+    function renderClues(wordIndex) {
+        clueButtons.forEach((button, index) => {
+            if (index === wordIndex) {
+                button.setAttribute("aria-current", "true");
+            } else {
+                button.removeAttribute("aria-current");
+            }
+        });
+        const button = clueButtons[wordIndex];
+        const directionLabel = words[wordIndex].direction === DOWN ? labels.down : labels.across;
+        clueBar.children[0].textContent = `${button.querySelector(".clue-number").textContent} ${directionLabel}`;
+        clueBar.children[1].textContent =
+            `${button.querySelector(".clue-text").textContent} ${button.querySelector(".enumeration").textContent}`;
+        scrollIntoOwnList(button);
+    }
+
+    // Scrolls the clue's own list, never the page, so that the clue is visible.
+    function scrollIntoOwnList(button) {
+        const list = button.closest("ol");
+        const top = button.offsetTop;
+        const bottom = top + button.offsetHeight;
+        if (top < list.scrollTop || bottom > list.scrollTop + list.clientHeight) {
+            list.scrollTop = top - (list.clientHeight - button.offsetHeight) / 2;
+        }
+    }
+
+    // A finished grid is locked: only Clear grid still works.
+    function renderControls() {
+        for (const button of actionButtons) {
+            const isClearGrid = button.dataset.action === "clear" && button.dataset.scope === "grid";
+            button.disabled = progress.finished && !isClearGrid;
+        }
+        pauseButton.disabled = progress.finished;
+        timeElement.textContent = formatTime(progress.elapsedMs);
+        messageElement.textContent = progress.finished ? completionMessage() : "";
+    }
+
+    function completionMessage() {
+        return labels.done
+            .replace("{time}", formatTime(progress.elapsedMs))
+            .replace("{check}", progress.usedCheck ? labels.used : labels.unused)
+            .replace("{reveal}", progress.usedReveal ? labels.used : labels.unused);
+    }
+
+    // The clue bar is as tall as the longest clue needs, so the grid does not move when another clue is selected.
+    function reserveClueBarHeight() {
+        if (paused) {
+            return;
+        }
+        clueBar.style.minHeight = "";
+        let tallest = 0;
+        for (const button of clueButtons) {
+            clueBar.children[1].textContent = button.textContent;
+            tallest = Math.max(tallest, clueBar.offsetHeight);
+        }
+        clueBar.style.minHeight = `${tallest}px`;
+        render();
+    }
+
+    // ---- Editing -------------------------------------------------------------------------------------
+
+    // Typed or pasted text becomes capitals without accents ("ά" gives "Α", "ς" gives "Σ", "é" gives "E");
+    // what is not a letter is dropped.
+    function normaliseLetters(text) {
+        return [...text]
+            .map((character) => character.normalize("NFD").replace(/\p{M}/gu, "").toUpperCase())
+            .filter((character) => /^\p{L}/u.test(character))
+            .map((character) => [...character][0]);
+    }
+
+    const edits = {
+        check(cells) {
+            progress.usedCheck = true;
+            for (const cell of cells) {
+                if (progress.letters[cell] && progress.letters[cell] !== solution[cell]) {
+                    progress.marks[cell] = WRONG;
+                }
+            }
+        },
+        reveal(cells) {
+            progress.usedReveal = true;
+            for (const cell of cells) {
+                progress.letters[cell] = solution[cell];
+                progress.marks[cell] = REVEALED;
+            }
+        },
+        clear(cells) {
+            for (const cell of cells) {
+                delete progress.letters[cell];
+                delete progress.marks[cell];
+            }
+        },
+    };
+
+    function applyEdit(name, cells) {
+        edits[name](cells);
+        finishEdit();
+    }
+
+    function finishEdit() {
+        const complete = letterCells.every((cell) => progress.letters[cell] === solution[cell]);
+        if (complete && !progress.finished) {
+            progress.finished = true;
+            stopTimer();
+        }
+        saveProgress();
+        focusCell(currentCell);
+    }
+
+    function setLetter(cell, letter) {
+        if (progress.letters[cell] !== letter) {
+            progress.letters[cell] = letter;
+            delete progress.marks[cell]; // a changed letter loses its mark
+        }
+        if (!progress.started) {
+            progress.started = true;
+            startTimer();
+        }
+    }
+
+    // Each letter fills the current cell, overwriting, and moves on; the last cell of a word stays selected.
+    function typeText(text) {
+        if (progress.finished) {
+            return;
+        }
+        for (const letter of normaliseLetters(text)) {
+            setLetter(currentCell, letter);
+            const next = cellInWord(1);
+            if (next !== undefined) {
+                currentCell = next;
+            }
+        }
+        finishEdit();
+    }
+
+    // Clears the current cell; when it is empty already, steps back and clears that one.
+    function backspace() {
+        if (progress.finished) {
+            return;
+        }
+        if (!progress.letters[currentCell]) {
+            const previous = cellInWord(-1);
+            if (previous === undefined) {
+                return;
+            }
+            currentCell = previous;
+        }
+        applyEdit("clear", [currentCell]);
+    }
+
+    function deleteInPlace() {
+        if (!progress.finished) {
+            applyEdit("clear", [currentCell]);
+        }
+    }
+
+    function isInsideGrid(row, column) {
+        return row >= 0 && row < data.rows && column >= 0 && column < columns;
+    }
+
+    // An arrow across the current direction first turns the word; otherwise it moves to the nearest
+    // letter cell that way, jumping over blanks.
+    function moveByArrow(key) {
+        const arrowDirection = key === "ArrowLeft" || key === "ArrowRight" ? ACROSS : DOWN;
+        const step = key === "ArrowLeft" || key === "ArrowUp" ? -1 : 1;
+        if (arrowDirection !== direction && wordOfCell[currentCell][arrowDirection] >= 0) {
+            focusCell(currentCell, arrowDirection);
+            return;
+        }
+        let row = Math.floor(currentCell / columns);
+        let column = currentCell % columns;
+        do {
+            if (arrowDirection === DOWN) {
+                row += step;
+            } else {
+                column += step;
+            }
+        } while (isInsideGrid(row, column) && !inputs[row * columns + column]);
+        if (isInsideGrid(row, column)) {
+            focusCell(row * columns + column, arrowDirection);
+        }
+    }
+
+    // ---- Events ---------------------------------------------------------------------------------------
+
+    function handleKeydown(event) {
+        if (event.ctrlKey || event.metaKey || event.altKey || event.isComposing) {
+            return;
+        }
+        const key = event.key;
+        let handled = true;
+        if (key === "Backspace") {
+            backspace();
+        } else if (key === "Delete") {
+            deleteInPlace();
+        } else if (key.startsWith("Arrow")) {
+            moveByArrow(key);
+        } else if (key === " ") {
+            focusCell(currentCell, 1 - direction);
+        } else if (key === "Tab" || key === "Enter") {
+            goToWord(currentWordIndex() + (event.shiftKey ? -1 : 1));
+        } else if (key === "Home") {
+            focusCell(currentWord().cells[0]);
+        } else if (key === "End") {
+            focusCell(currentWord().cells.at(-1));
+        } else if (key === "Escape") {
+            // Tab belongs to the clues, so this is the way out of the grid to the buttons.
+            document.querySelector(".tools button").focus();
+        } else {
+            handled = false; // letters arrive as beforeinput below
+        }
+        if (handled) {
+            event.preventDefault();
+        }
+    }
+
+    // Virtual keyboards send no useful keydown. A letter arrives as a cancelable beforeinput, or, in the
+    // middle of a composition, only as an input event, handled further down.
+    function handleBeforeInput(event) {
+        if (!event.cancelable) {
+            return;
+        }
+        if (event.inputType === "insertText") {
+            event.preventDefault();
+            typeText(event.data || "");
+        } else if (event.inputType === "deleteContentBackward") {
+            event.preventDefault();
+            backspace();
+        } else if (event.inputType === "deleteContentForward") {
+            event.preventDefault();
+            deleteInPlace();
+        }
+    }
+
+    function handleInput(event) {
+        const input = event.target;
+        const before = progress.letters[currentCell] || "";
+        let typed = input.value;
+        input.value = before; // the page decides what the cell shows
+        if (before && typed.length > 1) {
+            // The old letter was not selected: keep only what was added to it.
+            if (typed.startsWith(before)) {
+                typed = typed.slice(before.length);
+            } else if (typed.endsWith(before)) {
+                typed = typed.slice(0, -before.length);
+            }
+        }
+        const inputType = event.inputType || "";
+        if (inputType === "deleteContentBackward") {
+            backspace();
+        } else if (!inputType.startsWith("delete")) {
+            typeText(typed);
+        }
+    }
+
+    // A click on the selected cell turns the word. The cell that was selected is noted before the
+    // pointer gives focus to the clicked one.
+    let cellSelectedBeforePointer = -1;
+
+    gridElement.addEventListener("pointerdown", () => {
+        cellSelectedBeforePointer = currentCell;
+    });
+
+    gridElement.addEventListener("focusin", (event) => {
+        const cell = cellElements.indexOf(event.target.parentNode);
+        if (cell >= 0 && cell !== currentCell) {
+            selectCell(cell);
+        }
+    });
+
+    gridElement.addEventListener("click", (event) => {
+        const cell = cellElements.indexOf(event.target.parentNode);
+        if (cell < 0) {
+            return;
+        }
+        if (cell === cellSelectedBeforePointer) {
+            focusCell(cell, 1 - direction);
+        } else {
+            event.target.select();
+        }
+    });
+
+    gridElement.addEventListener("keydown", handleKeydown);
+    gridElement.addEventListener("beforeinput", handleBeforeInput);
+    gridElement.addEventListener("input", handleInput);
+
+    document.querySelector(".side").addEventListener("click", (event) => {
+        const button = event.target.closest(".clue");
+        if (!button) {
+            return;
+        }
+        goToWord(Number(button.dataset.word));
+        gridElement.scrollIntoView({ block: "nearest" }); // on a narrow screen the grid is above the lists
+    });
+
+    function resetPuzzle() {
+        stopTimer();
+        progress = newProgress();
+        try {
+            localStorage.removeItem(data.storageKey);
+        } catch (error) {
+            // Nothing stored, or no storage.
+        }
+        focusCell(words[0].cells[0], words[0].direction);
+    }
+
+    document.getElementById("tools").addEventListener("click", (event) => {
+        const button = event.target.closest("[data-action]");
+        if (!button) {
+            return;
+        }
+        const action = button.dataset.action;
+        const scope = button.dataset.scope;
+        if (scope === "grid" && action !== "check") {
+            const question = action === "clear" ? labels.ask_clear : labels.ask_reveal;
+            if (!confirm(question)) {
+                focusCell(currentCell);
+                return;
+            }
+        }
+        if (action === "clear" && scope === "grid") {
+            resetPuzzle();
+        } else if (scope === "letter") {
+            applyEdit(action, [currentCell]);
+        } else if (scope === "word") {
+            applyEdit(action, currentWord().cells);
+        } else {
+            applyEdit(action, letterCells);
+        }
+    });
+
+    // Pausing hides the grid and the clues, so the time cannot be used to study them.
+    pauseButton.addEventListener("click", () => {
+        paused = !paused;
+        if (paused) {
+            stopTimer();
+        } else {
+            startTimer();
+        }
+        document.getElementById("main").hidden = paused;
+        document.getElementById("paused").hidden = !paused;
+        document.getElementById("paused").textContent = labels.paused;
+        pauseButton.textContent = paused ? labels.resume : labels.pause;
+        if (!paused) {
+            reserveClueBarHeight();
+            focusCell(currentCell);
+        }
+    });
+
+    // The sources are in a closed block on screen; a printed page shows them.
+    let sourcesWereOpen = false;
+    window.addEventListener("beforeprint", () => {
+        sourcesWereOpen = sourcesElement.open;
+        sourcesElement.open = true;
+    });
+    window.addEventListener("afterprint", () => {
+        sourcesElement.open = sourcesWereOpen;
+    });
+
+    window.addEventListener("resize", reserveClueBarHeight);
+    selectCell(currentCell, direction);
+    reserveClueBarHeight();
+    startTimer();
+})();
+</script>
+</body>
+</html>

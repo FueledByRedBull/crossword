@@ -30,7 +30,7 @@ The system should optimize for thematic coherence, layout quality, clue quality,
 10. Lay out the clued answers in a free-form grid (no templates, no filler words).
 11. Render a puzzle as text (`py -3 cli.py render --puzzle <path>`).
 12. Emit puzzle, diagnostics, and attribution/provenance artifacts.
-13. Export a puzzle as an ipuz file or a printable HTML page (`py -3 cli.py export --puzzle <path> --format ipuz|html --output <path>`).
+13. Export a puzzle as an ipuz file, a printable HTML page or a self-contained HTML page to solve in a browser (`py -3 cli.py export --puzzle <path> --format ipuz|html [--solvable] --output <path>`).
 
 ### Non-Functional Requirements
 
@@ -348,7 +348,7 @@ This is required for reliable CC BY-SA attribution in published outputs.
    - Free-form layout search (Rust program), its call, validity checks, layout metrics.
 9. `src/render.py`:
    - Text rendering of `puzzle.json`.
-   - `src/export.py` writes it as ipuz or printable HTML.
+   - `src/export.py` writes it as ipuz, printable HTML or a solvable HTML page (`src/solvable_page.html` is that page's template).
 10. `src/provenance.py`:
     - Attribution capture and output validation.
 11. `src/evaluation.py`:

@@ -19,7 +19,7 @@ from src.pipeline import (
     run_packaging_stage,
     run_generate_pipeline,
 )
-from src.export import export_html, export_ipuz
+from src.export import export_html, export_ipuz, export_solvable_html
 from src.render import render_puzzle_text
 
 
@@ -628,7 +628,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     export_parser = subparsers.add_parser(
         "export",
-        help="Export a puzzle.json as .ipuz or a printable HTML page",
+        help="Export a puzzle.json as .ipuz, a printable HTML page or an HTML page to solve in a browser",
     )
     export_parser.add_argument("--puzzle", required=True, help="Path to puzzle JSON")
     export_parser.add_argument("--format", required=True, choices=["ipuz", "html"], help="Output format")
@@ -636,7 +636,12 @@ def _build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument(
         "--solution",
         action="store_true",
-        help="HTML only: add the solved grid on its own page (ipuz always carries it)",
+        help="HTML only: add the solved grid on its own page (ipuz always carries it); not with --solvable",
+    )
+    export_parser.add_argument(
+        "--solvable",
+        action="store_true",
+        help="HTML only: write a page to solve in a browser (keyboard, check, reveal, timer) instead of the printable one",
     )
 
     return parser
@@ -671,6 +676,11 @@ def _report_problems(result: dict, started: float) -> bool:
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
+    if args.command == "export" and args.solvable:
+        if args.format != "html":
+            parser.error("export: --solvable needs --format html")
+        if args.solution:
+            parser.error("export: --solution belongs to the printable page and cannot be used with --solvable")
 
     if args.command == "seed":
         result = run_seed_ingestion_stage(
@@ -889,7 +899,12 @@ def main() -> None:
     elif args.command == "export":
         with open(args.puzzle, encoding="utf-8") as handle:
             puzzle = json.load(handle)
-        text = export_ipuz(puzzle) if args.format == "ipuz" else export_html(puzzle, args.solution)
+        if args.format == "ipuz":
+            text = export_ipuz(puzzle)
+        elif args.solvable:
+            text = export_solvable_html(puzzle)
+        else:
+            text = export_html(puzzle, args.solution)
         with open(args.output, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
         print(f"Wrote {args.output}")
