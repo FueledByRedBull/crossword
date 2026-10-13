@@ -280,7 +280,8 @@ def build_layout(
 
     low, high = ordered[-1][1], ordered[0][1]
     spread = high - low
-    scores = [((s - low) / spread if spread else 1.0) ** 2 for _, s in ordered]
+    unit = [(s - low) / spread if spread else 1.0 for _, s in ordered]
+    scores = [u * u for u in unit]  # not `** 2`: that calls the platform's pow
     limit = max(max_words, 1) if max_words is not None else 0  # the first word is always placed
     steps = max(restarts, 1) * _STEPS_PER_RESTART
     return _to_layout(_search([w for w, _ in ordered], scores, size, random_seed, steps, limit), size)

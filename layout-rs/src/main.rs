@@ -16,8 +16,9 @@
 //! row and col are the word's first cell, shifted so the layout's top row and left column are 0.
 //!
 //! Malformed input prints a message to stderr and exits with status 2. The output depends only on
-//! the input (nothing here iterates a hash map), and the generator is built in, so a seed gives the
-//! same layout on every run.
+//! the input (nothing here iterates a hash map), and the generator and the logarithm are built in
+//! from exact IEEE 754 operations only (no libm), so a seed gives the same layout on every run and
+//! every platform.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -160,6 +161,23 @@ impl Rng {
         items.truncate(k);
         items
     }
+}
+
+/// Natural logarithm of x in (0, 1], from `+ - * /` only: libm's `ln` may differ in the last bit
+/// between platforms, and the accept test below would then follow different paths. Doubles x into
+/// [1/sqrt 2, 1], then ln x = 2 atanh(s), s = (x - 1) / (x + 1) <= 0.172, summed as a series.
+fn ln_exact(mut x: f64) -> f64 {
+    let mut doublings = 0.0;
+    while x < std::f64::consts::FRAC_1_SQRT_2 {
+        x *= 2.0;
+        doublings += 1.0;
+    }
+    let s = (x - 1.0) / (x + 1.0);
+    let mut series = 0.0;
+    for j in (0..=10).rev() {
+        series = series * (s * s) + 1.0 / (2 * j + 1) as f64;
+    }
+    2.0 * s * series - doublings * std::f64::consts::LN_2
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -624,7 +642,7 @@ impl<'a> Search<'a> {
             }
             let added = self.refill();
             let trial = self.board.value();
-            if trial >= value + temperature * (1.0 - self.rng.unit()).ln() {
+            if trial >= value + temperature * ln_exact(1.0 - self.rng.unit()) {
                 value = trial;
                 if value > best_value {
                     best_value = value;
@@ -873,6 +891,20 @@ mod tests {
             text.push_str(&format!("{}\t{word}\n", 1.0 - i as f64 / 100.0));
         }
         text
+    }
+
+    #[test]
+    fn ln_exact_matches_ln() {
+        let mut rng = Rng::new(1);
+        let mut inputs = vec![1.0, 0.5, 0.7, 0.999_999_999_999, 1.0 / (1u64 << 53) as f64];
+        inputs.extend((0..100_000).map(|_| 1.0 - rng.unit()));
+        for x in inputs {
+            let (got, want) = (ln_exact(x), x.ln());
+            assert!(
+                (got - want).abs() <= 1e-15 * want.abs().max(1e-3),
+                "{x}: {got} vs {want}"
+            );
+        }
     }
 
     #[test]
