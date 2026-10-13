@@ -92,7 +92,8 @@ Held-out seeds: `data/benchmarks/held_out.json` holds the same kind of fixture f
    - Add candidates until crossword-aware marginal utility plateaus.
 5. `Term Extraction + Filtering`:
    - Take answers primarily from the titles of the most relevant linked articles, then from extracted noun phrases/entities, and apply quality filters.
-   - Answer a person's page by the surname when the seed article uses it on its own at least twice or the person's own page does after its first sentence (`MONET` for "Claude Monet", `KELVIN` for "Lord Kelvin"; 3 to 15 letters; not after a lower-case title word as in "Vincent van Gogh"; in Greek only in the title's own form). A page is a person's when its opening parenthesis says "born" or gives years that span a life.
+   - Answer a person's page by the surname (`MONET` for "Claude Monet", `KELVIN` for "Lord Kelvin"; 3 to 15 letters; in Greek only in the title's own form). The title stays whole when the surname follows a lower-case word or a name particle ("Vincent van Gogh", "Giuseppe De Nittis"), is a word of the seed title, is another page's title (unless the seed uses it alone twice), is shared by rival people, or is not what the person's own page calls them (another word of the title, or its last two, is used more); and, when no text uses the surname alone, when the lead is in Chinese, Japanese or Korean script or gives a birth name that shares no word with the title ("Man Ray"). A page is a person's when its opening parenthesis says "born" or "fl." or gives years that span a life, or, in Greek, when the lead opens on "Ο" or "Η" and says "γεννήθηκε", "γεννημένος", "γεννημένη", "γενν." or "γεν." with a date.
+   - A selected redirect gives no second answer for the page it leads to when that page's title already is one.
    - Answer any other page by the last word of its title when the seed article uses that word on its own as a name at least twice (`CARTHAGE` for "Ancient Carthage"). A word that ends two or more non-person titles ("Empire") is nobody's name.
 6. `Clue Generation`:
    - Definition clue from the article's first sentence; fill-in-the-blank as fallback.
@@ -172,11 +173,12 @@ Notes:
 1. Keep depth and backlink as soft features, not hard gates.
 2. Depth penalty only differentiates if 2-hop expansion is enabled.
 3. The on-topic candidates that are not selected stay available for the vocabulary rescue.
-4. Only off-topic pages are `CUT`. An on-topic page is `KEEP`, whatever its relevance: similarity to the seed text depends on how long and how broad the seed article is, so it orders the pages and no fixed value of it cuts one. A seed with more than 150 on-topic titles loses the rest to the cap on title answers; a seed with fewer keeps them all.
+4. Only off-topic and sensitive pages are `CUT`. An on-topic page is `KEEP`, whatever its relevance: similarity to the seed text depends on how long and how broad the seed article is, so it orders the pages and no fixed value of it cuts one. A seed with more than 150 on-topic titles loses the rest to the cap on title answers; a seed with fewer keeps them all.
+5. A page whose title or first sentence uses a word of the sensitive-content list (sexual content, sexual abuse and exploitation; `src/text_normalize.py`) is `CUT` with the reason `cut_sensitive`, ranks last and is left out of the selection altogether; a term or a clue text that uses one is dropped; a seed whose own title uses one turns the filter off. It is a keyword list: it cannot see a page that avoids the words and it blocks a page that merely holds one. The upgrade is to cut on each candidate's Wikipedia categories.
 
 #### Outputs
 
-1. Ranked candidates with reason codes (`KEEP` for on topic, `CUT` for off topic).
+1. Ranked candidates with reason codes (`KEEP` for on topic, `CUT` for off topic or sensitive).
 2. Drift diagnostics table for explainability.
 
 ### 5.3 Step 3: Crossword-Aware K Optimization
@@ -205,7 +207,7 @@ If `J(K)` plateaus but the vocabulary readiness gate is not satisfied, apply the
 
 1. Loosen `min_df` to `1` (from adaptive default).
 2. Promote the next 3 on-topic candidates by rank that are not selected yet into the selected set (`promote_next_ranked` in the diagnostics).
-3. Widen from the pages that link to the seed (`widen_from_backlinks`): score the ones not scored yet as one-hop pages (an even sample of at most 300; those whose first sentence uses a seed word rank first and are the ones selected and used as clue sources, the others that mention it can still be answers), let the best 6 not cut join the selected articles (further ones replace selected articles that were cut), and let all of them be answers.
+3. Widen from the pages that link to the seed (`widen_from_backlinks`): score the ones not scored yet as one-hop pages (an even sample of at most 300; those whose first sentence uses a seed word rank first and are the ones selected and used as clue sources; the others that use it in a later sentence can still be answers, unless the only use is another form of the word that the tagger calls an adverb), let the best 6 not cut join the selected articles (further ones replace selected articles that were cut), and let all of them be answers.
 4. Widen from the selected articles: score the pages linked from at most 6 selected articles whose intro is on topic (an even sample of each one's links, at most 100 new pages), let the best 6 join the selected articles (further ones replace selected articles that were cut), and let all of them be answers.
 5. Reduce minimum answer length from `4` to `3`.
 6. If all five steps fail: go on with the thin pool when it has at least `min_words` clued answers (`accept_thin_pool`); otherwise emit `puzzle_status: insufficient_vocabulary` and halt gracefully.
@@ -266,7 +268,7 @@ Additional notes:
 
 #### Pass 1: Extract
 
-1. Definition: the first sentence of the answer's own article with the subject removed, cut only at a clean boundary, never after a bare "the years" or "the period" that the sentence goes on to complete; an example phrase in mid-sentence ("like A, B and C") is left out when the cut would stop inside it. A lead whose main verb is no copula gives "It ..." or "They ..." with its predicate. A person's generic first definition is joined with the predicate of the second or third sentence ("An English physicist who studied the nature of heat"). A page defines only its own name: its title, or a name of the person it is about. A redirect's name and a short name of a page that is not about a person take fill-ins only. A page that may be another sense of the seed's word (a disambiguated title, or an intro that opens by sending the reader to another article, with an off-topic intro) gets no definition and its own text clues nothing. When the first sentence gives no usable definition, the second is cut the same way if its subject is a pronoun or the answer's name ("He was one of ..."); it is used only when no fill-in exists.
+1. Definition: the first sentence of the answer's own article with the subject removed, cut only at a clean boundary, never after a bare "the years" or "the period" that the sentence goes on to complete; an example phrase in mid-sentence ("like A, B and C") is left out when the cut would stop inside it. A lead whose main verb is no copula gives "It ..." or "They ..." with its predicate. A person's generic first definition is joined with the predicate of the second or third sentence ("An English physicist who studied the nature of heat"). A page defines only its own name: its title, or a name of the person it is about. A redirect's name and a short name of a page that is not about a person take fill-ins only. A page that may be another sense of the seed's word (a disambiguated title, or an intro that opens by sending the reader to another article, with an off-topic intro) gets no definition and its own text clues nothing. When the first sentence gives no usable definition, the second is cut the same way if its subject is a pronoun or the answer's name ("He was one of ..."); it is used only when no fill-in exists. A person answered by the surname whose first-sentence definition is generic only for having too few informative words, and whom nothing else clues, gets that definition followed by the given names and a blank ("An American jazz drummer (Art ____)"). In Greek the tags at the two ends of a definition are corrected first: a word tagged as a preposition that is none, or as an adverb or verb in -ος or -ης that is no participle, is a noun.
 2. Fill-in-the-blank: sentences that contain the answer, taken only from the seed article, the answer's own page, or a selected article whose intro is on topic. A short name of a page that is not about a person takes them from the seed alone; for a person's surname the blank may stand for the full name, and the name must be capitalised wherever the sentence has it.
 
 #### Pass 2: Mask + Trim
@@ -283,7 +285,7 @@ Additional notes:
 
 #### Pass 4: Order and Diversity
 
-1. The definition comes first, a person's joined definition included; among fill-ins whole sentences win, then the seed's, then the sentence that shares the most with the intro of the answer's own page (each shared word weighted by its rarity among the pool's lead sentences); a definition cut from the second sentence alone comes last.
+1. The definition comes first, a person's joined definition included; among fill-ins whole sentences win, then the seed's, then the sentence that shares the most with the intro of the answer's own page (each shared word weighted by its rarity among the pool's lead sentences); a definition cut from the second sentence alone comes last, and after it a person's thin definition with the given names and a blank.
 2. Bucket fill-in clues by their first 3 tokens and keep at most 2 per bucket across the puzzle.
 3. No clue text and no source sentence is used twice.
 
@@ -305,6 +307,7 @@ Implemented in two parts: the search is the Rust program `layout-rs/src/main.rs`
 
 1. Start from the highest-scoring answer and fill greedily: each step takes the legal placement with the best gain per newly used cell (one per word, a bonus per crossing, a bonus for a high answer score).
 2. Improve by simulated annealing over ruin-and-recreate steps: drop one to three random words and whatever they leave disconnected, refill, and keep the result unless it is worse than the current layout by more than a random allowance that cools to zero. `layout_restarts` scales the number of steps (750 each, 72,000 at the default 96); the best layout seen wins. `layout_candidates` caps how many clued answers are offered to the layout.
+3. The search uses only exact arithmetic: its random numbers are built in and the annealing test uses its own logarithm made of `+ - * /`, not the math library's, so the same answers and seed give the same layout on every platform.
 
 #### Outputs
 
