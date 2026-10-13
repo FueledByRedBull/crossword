@@ -17,7 +17,7 @@ from ..term_extractor import (
     merge_terms,
     title_to_answer,
 )
-from ..text_normalize import strip_diacritics, tokenize
+from ..text_normalize import is_sensitive, strip_diacritics, tokenize
 from ..clue_builder import answer_pattern, split_sentences
 from ..lexicon import load_lexicon_scores, lexicon_score_for_tokens
 from ..wiki_client import WikiClient
@@ -261,12 +261,14 @@ def _rank_candidates(
 
 
 def _candidate_status(group: int) -> tuple[str, str]:
-    """The status of a ranked candidate and the reason for it: an off-topic page is cut, an on-topic one never is.
+    """The status of a ranked candidate and the reason for it: a sensitive or off-topic page is cut, an on-topic one never is.
 
     Similarity to the seed text runs low when the seed article is short or broad (most on-topic links of the Greek
     Mathematics article score under 0.1), so it only ranks the on-topic pages. Among them nothing but the cap on
     title answers cuts.
     """
+    if group == 3:
+        return "CUT", "cut_sensitive"
     if group == 2:
         return "CUT", "cut_off_topic"
     return "KEEP", "on_topic"
@@ -386,6 +388,7 @@ def run_candidate_scoring_stage(
     mentions_it: list[bool] = []
     backlink_only = set(backlink_titles or [])
     seed_mentions: list[int] = []
+    sensitive: list[bool] = []
     for candidate in candidates:
         title = candidate["title"]
         payload, lead_wikitext = _fetch_candidate_page(errors, client, title)
@@ -394,6 +397,9 @@ def run_candidate_scoring_stage(
         texts.append(extract)
         # A derived form ("Roman") counts only where the page is defined; later on it is a passing mention.
         first_sentence = (split_sentences(extract) or [""])[0]
+        sensitive.append(
+            any(is_sensitive(text, lang, seed_title) for text in (title, payload.get("title") or title, first_sentence))
+        )
         # A page that merely links to the seed is about it only when its first sentence uses a seed word, and a page
         # that mentions it (second tier, like the pages the seed names) when a later sentence uses it, unless the
         # use is another form of it tagged as an adverb.
@@ -442,14 +448,16 @@ def run_candidate_scoring_stage(
     ranked = _rank_candidates(candidates, rel_scores, pairwise, title_lexicon_scores, lexicon_weight, weights)
 
     # A linked page is on topic when its intro uses a seed word or the seed article names it twice. Pages whose
-    # intro does is first, then pages the seed merely names, then the rest; MMR order within each group (stable).
+    # intro does is first, then pages the seed merely names, then the rest, then the sensitive pages; MMR order
+    # within each group (stable).
     group = [
-        0 if intro else 1 if mentions >= 2 or mentioned else 2
-        for intro, mentions, mentioned in zip(intro_on_topic, seed_mentions, mentions_it)
+        3 if blocked else 0 if intro else 1 if mentions >= 2 or mentioned else 2
+        for blocked, intro, mentions, mentioned in zip(sensitive, intro_on_topic, seed_mentions, mentions_it)
     ]
     ranked.sort(key=lambda row: group[int(row["index"])])
 
-    ranked_indices = [int(row["index"]) for row in ranked]
+    # The sensitive pages rank last and are no candidate for the selection, which pairs these indices with the rows.
+    ranked_indices = [int(row["index"]) for row in ranked if group[int(row["index"])] < 3]
     scored_rows: list[dict] = []
     for rank_idx, row in enumerate(ranked):
         idx = int(row["index"])

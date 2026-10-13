@@ -468,6 +468,42 @@ class PipelineTests(unittest.TestCase):
         # A page the seed links itself stays on topic by a later sentence.
         self.assertEqual(csv_rows["Algae"]["intro_on_topic"], "True")
 
+    def test_scoring_cuts_a_sensitive_page_and_the_selection_never_takes_it(self) -> None:
+        intros = {
+            **self.ROME_INTROS,
+            "Slaves": "Slavery was common in Rome.",
+            "Brothel": "A brothel in Rome sold prostitution.",  # on topic by the seed word, cut by the other
+            "Vice": "Rome had a vice trade.",
+        }
+        pages = {"Vice": "Child pornography"}  # a redirect: the page title is the sensitive one
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.score_rome(tmp, intros, pages=pages)
+            by_title = {row["title"]: row for row in result.scores}
+            titles = list(intros)[1:]
+            selected = run_k_selection_stage(
+                seed_title="Ancient Rome",
+                diagnostics_path=Path(tmp) / "diagnostics_k.json",
+                trace_path=Path(tmp) / "trace.csv",
+                selected_path=Path(tmp) / "selected.json",
+                min_k=len(titles),
+                max_k=len(titles),
+                scoring=result,
+            ).selected["selected_titles"]
+
+        for title in ("Brothel", "Vice"):
+            self.assertEqual((by_title[title]["status"], by_title[title]["reason"]), ("CUT", "cut_sensitive"))
+        self.assertEqual(by_title["Slaves"]["status"], "KEEP")  # slavery is a subject of history
+        # They rank last, and not even a selection that takes every other page, off-topic ones included, has them.
+        self.assertEqual([row["title"] for row in result.scores[-2:]], ["Brothel", "Vice"])
+        self.assertEqual(sorted(selected), sorted(set(titles) - {"Brothel", "Vice"}))
+
+    def test_scoring_blocks_nothing_when_the_seed_title_is_itself_sensitive(self) -> None:
+        intros = {"Prostitution": "Prostitution is sex for pay.", "Brothel": "A brothel is a place of prostitution."}
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.score_rome(tmp, intros, "A brothel.", seed_title="Prostitution")
+
+        self.assertEqual([(row["status"], row["reason"]) for row in result.scores], [("KEEP", "on_topic")])
+
     def test_linked_titles_takes_an_even_share_of_each_parents_new_links(self) -> None:
         client = MagicMock()
         client.fetch_links_concurrent.return_value = (
@@ -1235,6 +1271,22 @@ class PipelineTests(unittest.TestCase):
         texts = [row["clue"].lower() for row in result.clues]
         self.assertEqual(len(texts), len(set(texts)))
 
+    def test_clue_stage_does_not_use_a_sensitive_sentence_and_takes_another_clue(self) -> None:
+        extracts = {
+            "Bebop": "Bebop is a style of jazz. Fans say the bebop style grew among prostitution rings in the early 1940s. "
+            "Fans say the bebop style of jazz grew fast in the early 1940s in Harlem clubs."
+        }
+        result, _ = self._run_clues_for("clue_sensitive", ["Bebop,BEBOP,Bebop,spacy"], extracts)
+        self.assertEqual(len(result.clues), 1)
+        self.assertNotIn("prostitution", result.clues[0]["clue"])
+
+        only = {"Bebop": "Fans say the bebop style grew among prostitution rings in the early 1940s in Harlem."}
+        blocked, _ = self._run_clues_for("clue_sensitive_only", ["Bebop,BEBOP,Bebop,spacy"], only)
+        self.assertEqual(blocked.clues, [])
+        # The seed asked for the subject: nothing is blocked.
+        allowed, _ = self._run_clues_for("clue_sensitive_seed", ["Bebop,BEBOP,Bebop,spacy"], only, seed_title="Prostitution")
+        self.assertEqual(len(allowed.clues), 1)
+
     def test_clue_stage_lengthens_a_definition_another_answer_already_uses(self) -> None:
         result, _ = self._run_clues_for(
             "clue_definition_collision",
@@ -1646,6 +1698,46 @@ class PipelineTests(unittest.TestCase):
         )
         header = (tmp_dir / "answer_candidates.csv").read_text(encoding="utf-8").splitlines()[0]
         self.assertTrue(header.startswith("answer,normalized_answer,length,source_method,"))
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_term_stage_drops_a_sensitive_term_taken_from_the_text(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "term_sensitive"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        (tmp_dir / "selected_candidates.json").write_text(
+            json.dumps({"seed_title": "Jazz", "lang": "en", "selected_k": 1, "selected_titles": ["Bebop"]}),
+            encoding="utf-8",
+        )
+        extract = "Bebop is a style of jazz played by Gillespie, who left the prostitution of the swing era."
+
+        def terms(seed_title):
+            with (
+                patch("src.pipeline.answers._resolve_nlp_backend", return_value=(None, None, [], None, None)),
+                patch("src.wiki_client.WikiClient.fetch_page_extract", return_value={"title": "Bebop", "extract": extract}),
+                patch(
+                    "src.wiki_client.WikiClient.fetch_page_extract_with_revid",
+                    return_value={"title": "Bebop", "extract": extract, "revid": 5},
+                ),
+                patch(
+                    "src.wiki_client.WikiClient.fetch_lead_wikitext",
+                    return_value={"wikitext": "'''Bebop''' by '''Gillespie''' and '''prostitution'''", "revid": 5},
+                ),
+            ):
+                return {
+                    row["normalized_answer"]
+                    for row in run_term_extraction_stage(
+                        seed_title=seed_title,
+                        lang="en",
+                        diagnostics_path=tmp_dir / "diagnostics_terms.json",
+                        selected_path=tmp_dir / "selected_candidates.json",
+                        terms_path=tmp_dir / "answer_candidates.csv",
+                        min_df=1,
+                    ).terms
+                }
+
+        self.assertEqual(terms("Jazz"), {"BEBOP", "GILLESPIE"})
+        self.assertEqual(terms("Prostitution"), {"BEBOP", "GILLESPIE", "PROSTITUTION"})
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def test_term_stage_does_not_answer_twice_with_a_selected_redirect_and_the_page_it_leads_to(self) -> None:

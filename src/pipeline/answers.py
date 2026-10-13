@@ -19,7 +19,7 @@ from ..term_extractor import (
     term_frequency_across_docs,
     title_to_answer,
 )
-from ..text_normalize import tokenize
+from ..text_normalize import is_sensitive, tokenize
 from ..vocab_gate import evaluate_vocab_gate
 from ..wikidata_client import WikidataClient
 from ..lexicon import load_lexicon_scores, lexicon_score_for_token
@@ -416,7 +416,11 @@ def run_term_extraction_stage(
     for term, freq in eligible_terms:
         # Extracted words ("players", "American", "result") only add noise; the title pool carries the
         # names, so the secondary pool keeps lead-bold terms (an article's own alternative names) only.
-        if not term.lead_bold_signal or term.normalized_answer in GENERIC_GRID_JUNK_EN:
+        if (
+            not term.lead_bold_signal
+            or term.normalized_answer in GENERIC_GRID_JUNK_EN
+            or is_sensitive(term.answer, lang, seed_title)
+        ):
             common_reject_count += 1
             continue
         theme_score = 0.0 if max_df == 0 else freq / max_df

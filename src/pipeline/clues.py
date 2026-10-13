@@ -29,6 +29,7 @@ from ..clue_builder import (
     who_definition,
 )
 from ..provenance import build_oldid_url, validate_clue_provenance
+from ..text_normalize import is_sensitive
 from ..wiki_client import WikiClient
 
 from .common import ClueStageResult, _safe_float, _safe_int, _fetch_extract_with_revid, _prefetch, _answer_key
@@ -561,6 +562,7 @@ def run_clue_extraction_stage(
                 + [row for row in definitions if row["last_resort"]]
             )
 
+        candidates = [row for row in candidates if not is_sensitive(row["clue"], lang, seed_title)]
         chosen, rejected_for_diversity = _choose_clue(
             candidates, used_texts, used_sentences, fill_clues, nlp=nlp, diversity_cap=diversity_cap
         )

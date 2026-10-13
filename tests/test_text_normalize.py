@@ -1,6 +1,6 @@
 import unittest
 
-from src.text_normalize import enumeration, tokenize
+from src.text_normalize import enumeration, is_sensitive, tokenize
 
 
 class EnumerationTests(unittest.TestCase):
@@ -29,6 +29,27 @@ class GreekTests(unittest.TestCase):
 
     def test_tokens_are_lowercase_without_accents(self) -> None:
         self.assertEqual(tokenize("Ο Ήρωνας Αϊνστάιν", lang="el"), ["ο", "ηρωνας", "αινσταιν"])
+
+
+class SensitiveTests(unittest.TestCase):
+    def test_english_stems_and_words_match(self) -> None:
+        for text in ("Child pornography", "Rape during the war", "Paedophilia", "Sexual abuse", "Sexual slavery", "Revenge porn", "Incestuous", "Prostitution"):
+            self.assertTrue(is_sensitive(text, "en"), text)
+
+    def test_english_short_words_match_whole_words_only(self) -> None:
+        for text in ("Rapeseed", "Grape", "Sextus Empiricus", "Sextant", "Sexual selection", "Ruin porn", "The Rape of the Sabine Women", "Slavery", "Genocide", "Execution", "Plague"):
+            self.assertFalse(is_sensitive(text, "en"), text)
+
+    def test_greek_matches_whatever_the_accent_case_or_ending(self) -> None:
+        for text in ("Παιδική πορνογραφία", "ΠΟΡΝΟΓΡΑΦΙΑ", "βιασμός", "Σεξουαλικής κακοποίησης", "Αιμομιξία", "Πορνεία"):
+            self.assertTrue(is_sensitive(text, "el"), text)
+        for text in ("Βιασύνη", "Βιαστικός", "Γλυπτική", "Σεξτάντας", "Δουλεία", "Γενοκτονία"):
+            self.assertFalse(is_sensitive(text, "el"), text)
+
+    def test_a_sensitive_seed_title_turns_the_filter_off(self) -> None:
+        self.assertTrue(is_sensitive("Prostitution in Rome", "en"))
+        self.assertFalse(is_sensitive("Prostitution in Rome", "en", seed_title="Prostitution"))
+        self.assertTrue(is_sensitive("Prostitution in Rome", "en", seed_title="Rome"))
 
 
 if __name__ == "__main__":
