@@ -34,9 +34,9 @@ def strip_parentheticals(text: str) -> str:
 # A full extract sets each section title on its own line after two blank lines.
 _TRAILING_SECTIONS = re.compile(
     r"\n\n\n(?:See also|Notes|References|Citations|Sources|Bibliography|Further reading|External links"
-    r"|Works|Publications|Selected works|Discography|Filmography"
-    r"|Δείτε [Εε]πίσης|Παραπομπές(?: και παρατηρήσεις)?|Αναφορές|Σημειώσεις|Πηγές|Βιβλιογραφία|Προτεινόμενη βιβλιογραφία"
-    r"|Περισσότερες πληροφορίες|Εξωτερικοί σύνδεσμοι|Έργα|Δημοσιεύσεις|Δισκογραφία|Ταινιογραφία)(?:\n|$)"
+    r"|Works|Publications|Selected works|Selected publications|Published works|Discography|Filmography"
+    r"|Δείτε [Εε]πίσης|Παραπομπές(?: και παρατηρήσεις)?|Αναφορές|Σημειώσεις(?: και παραπομπές)?|Πηγές|Βιβλιογραφία|Προτεινόμενη βιβλιογραφία"
+    r"|Περαιτέρω ανάγνωση|Περισσότερες πληροφορίες|Εξωτερικοί σύνδεσμοι|Εσωτερικοί σύνδεσμοι|Έργα|Δημοσιεύσεις|Δισκογραφία|Ταινιογραφία)(?:\n|$)"
 )
 
 

@@ -749,7 +749,8 @@ class GenericDefinitionTests(unittest.TestCase):
         body = "Weinberg won a prize."
         headings = (
             "See also", "Notes", "References", "Citations", "Sources", "Bibliography", "Further reading",
-            "External links", "Works", "Publications", "Selected works", "Discography", "Filmography",
+            "External links", "Works", "Publications", "Selected works", "Selected publications", "Published works",
+            "Discography", "Filmography",
         )
         for heading in headings:
             text = f"{body}\n\n\nCareer\nHe taught.\n\n\n{heading}\nA ____ link.\n\n\nExternal links\nB"
@@ -1981,6 +1982,7 @@ class GreekTextTests(unittest.TestCase):
         for heading in (
             "Δείτε επίσης", "Δείτε Επίσης", "Παραπομπές", "Παραπομπές και παρατηρήσεις", "Αναφορές", "Σημειώσεις",
             "Πηγές", "Βιβλιογραφία", "Προτεινόμενη βιβλιογραφία", "Περισσότερες πληροφορίες", "Εξωτερικοί σύνδεσμοι",
+            "Σημειώσεις και παραπομπές", "Περαιτέρω ανάγνωση", "Εσωτερικοί σύνδεσμοι",
         ):
             text = f"{body}\n\n\nΙστορία\nΜια πρόταση.\n\n\n{heading}\nΜια ____ σύνδεση."
             self.assertEqual(strip_trailing_sections(text), f"{body}\n\n\nΙστορία\nΜια πρόταση.", heading)
