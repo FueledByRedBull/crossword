@@ -317,6 +317,7 @@ class PipelineTests(unittest.TestCase):
         pages: dict[str, str] | None = None,
         max_len: int = 15,
         backlink_titles: list[str] | None = None,
+        seed_title: str = "Ancient Rome",
     ):
         intros = intros or self.ROME_INTROS
         pages = pages or {}  # a redirect: link title -> the title of the page it leads to
@@ -339,7 +340,7 @@ class PipelineTests(unittest.TestCase):
             patch("src.wiki_client.WikiClient.fetch_lead_wikitext", return_value={"wikitext": ""}),
         ):
             return run_candidate_scoring_stage(
-                seed_title="Ancient Rome",
+                seed_title=seed_title,
                 cache_dir=Path(tmp) / "cache",
                 diagnostics_path=Path(tmp) / "diagnostics.json",
                 scores_path=Path(tmp) / "scores.csv",
@@ -413,6 +414,43 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual((csv_rows["Senate"]["depth"], csv_rows["Senate"]["links_back_to_seed"]), ("1", "True"))
         self.assertEqual((csv_rows["Roman law"]["depth"], csv_rows["Roman law"]["links_back_to_seed"]), ("2", "False"))
+
+    def test_scoring_does_not_count_an_adverb_of_the_seed_word_as_a_mention_by_a_backlink_page(self) -> None:
+        intros = {
+            "Thermodynamics": "Thermodynamics is a branch of physics.",
+            "Heat": "Heat is energy in transit.",
+            "Diamond": "Diamond is a solid. It is thermodynamically unstable.",
+            "Cycle": "A cycle repeats. It is a thermodynamic process.",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.score_rome(
+                tmp, intros, "Heat flows.", backlink_titles=["Diamond", "Cycle"], seed_title="Thermodynamics"
+            )
+
+        status = {row["title"]: row["status"] for row in result.scores}
+        self.assertEqual((status["Diamond"], status["Cycle"]), ("CUT", "KEEP"))  # an adjective still names the field
+
+    def test_scoring_counts_the_seed_word_in_its_own_form_as_a_mention_whatever_the_tagger_says(self) -> None:
+        intros = {
+            "Thermodynamics": "Thermodynamics is a branch of physics.",
+            "Heat": "Heat is energy in transit.",
+            "Engine": "An engine moves. It obeys Thermodynamics.",
+            "Diamond": "Diamond is a solid. It is thermodynamically unstable.",
+        }
+
+        def tagger(text):  # tags every word as an adverb
+            return [SimpleNamespace(text=word, pos_="ADV") for word in text.split()]
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("src.pipeline.scoring._resolve_nlp_backend", return_value=(tagger, None, [], None, None)),
+        ):
+            result = self.score_rome(
+                tmp, intros, "Heat flows.", backlink_titles=["Engine", "Diamond"], seed_title="Thermodynamics"
+            )
+
+        status = {row["title"]: row["status"] for row in result.scores}
+        self.assertEqual((status["Engine"], status["Diamond"]), ("KEEP", "CUT"))  # only another form is no mention
 
     def test_scoring_ranks_a_backlink_page_by_whether_its_first_sentence_uses_the_seed_word(self) -> None:
         late = "Plankton drifts. It was once studied in Rome."

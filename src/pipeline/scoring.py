@@ -59,6 +59,22 @@ def _seed_mentions(title: str, seed_text: str, *, lang: str, intro: str = "") ->
     return len(re.findall(pattern, _plain_words(seed_text)))
 
 
+def _names_seed_word(extract: str, seed_title: str, *, lang: str, lexicon: dict[str, float], nlp: object | None) -> bool:
+    """Whether the text uses a seed word, other than another form of it that the tagger calls an adverb.
+
+    "thermodynamically stable" names no field, but a seed word in its own written form ("μαθηματικά" for Μαθηματικά)
+    always counts, whatever its tag. Without a tagger every use counts.
+    """
+    if nlp is None:
+        return _uses_seed_word(extract, seed_title, lang=lang, lexicon=lexicon)
+    seed_words = tokenize(seed_title, lang=lang)
+    return any(
+        _uses_seed_word(token.text, seed_title, lang=lang, lexicon=lexicon)
+        and (token.pos_ != "ADV" or any(word in seed_words for word in tokenize(token.text, lang=lang)))
+        for token in nlp(extract)
+    )
+
+
 def _inventory_min_k_target(
     *,
     size: int,
@@ -379,14 +395,17 @@ def run_candidate_scoring_stage(
         # A derived form ("Roman") counts only where the page is defined; later on it is a passing mention.
         first_sentence = (split_sentences(extract) or [""])[0]
         # A page that merely links to the seed is about it only when its first sentence uses a seed word, and a page
-        # that mentions it (second tier, like the pages the seed names) when a later sentence does.
+        # that mentions it (second tier, like the pages the seed names) when a later sentence uses it, unless the
+        # use is another form of it tagged as an adverb.
         in_intro = _uses_seed_word(extract, seed_title, lang=lang, lexicon=lexicon)
         in_first = _uses_seed_word(first_sentence, seed_title, lang=lang, lexicon=lexicon) or _uses_seed_word(
             first_sentence, seed_title, lang=lang, lexicon=lexicon, derived=True
         )
         if title in backlink_only:
             intro_on_topic.append(in_first)
-            mentions_it.append(in_intro and not in_first)
+            mentions_it.append(
+                in_intro and not in_first and _names_seed_word(extract, seed_title, lang=lang, lexicon=lexicon, nlp=nlp)
+            )
         else:
             intro_on_topic.append(in_intro or in_first)
             mentions_it.append(False)
