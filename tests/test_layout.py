@@ -99,8 +99,7 @@ class BuildLayoutTests(unittest.TestCase):
         layout = build_layout(THERMODYNAMICS)
         self.assertEqual(validate_layout(layout.grid, layout.placements), [])
         metrics = layout.metrics
-        # The greedy-and-polish search this replaced placed 18 words with 21 crossings on this list;
-        # this one places 19 to 21 words with 25 to 29 crossings over seeds 0 to 7.
+        # Floors under the 19 to 21 words and 25 to 29 crossings the search places on this list over seeds 0 to 7.
         self.assertGreaterEqual(metrics["word_count"], 19)
         self.assertGreaterEqual(metrics["crossing_count"], 25)
         placed = {p.answer for p in layout.placements}
