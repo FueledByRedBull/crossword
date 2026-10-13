@@ -1629,6 +1629,53 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(header.startswith("answer,normalized_answer,length,source_method,"))
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def test_term_stage_does_not_answer_twice_with_a_selected_redirect_and_the_page_it_leads_to(self) -> None:
+        tmp_dir = Path("tests") / "tmp_outputs" / "term_redirect"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        (tmp_dir / "selected_candidates.json").write_text(
+            json.dumps({"seed_title": "Vehicle", "lang": "en", "selected_k": 1, "selected_titles": ["Automobile"]}),
+            encoding="utf-8",
+        )
+        (tmp_dir / "candidate_scores.csv").write_text(
+            "rank,title,depth,links_back_to_seed,rel_score,red_score,selection_score,intro_on_topic,seed_mentions,status,reason\n"
+            "1,Automobile,1,True,0.5,0.0,0.5,True,0,KEEP,x\n",
+            encoding="utf-8",
+        )
+        extract = "A motorcar or automobile is a wheeled vehicle that carries its own engine."
+
+        def intro(title, intro_only=True):  # "Automobile" is a redirect to "Motorcar", the page both names belong to
+            if title == "Vehicle":
+                return {"title": title, "extract": "A vehicle moves people or goods."}
+            return {"title": "Motorcar", "extract": extract}
+
+        def with_revid(title, intro_only=True):
+            return {**intro(title), "revid": 5}
+
+        with (
+            patch("src.pipeline.answers._resolve_nlp_backend", return_value=(None, None, [], None, None)),
+            patch("src.wiki_client.WikiClient.fetch_page_extract", side_effect=intro),
+            patch("src.wiki_client.WikiClient.fetch_page_extract_with_revid", side_effect=with_revid),
+            patch(
+                "src.wiki_client.WikiClient.fetch_lead_wikitext",
+                return_value={"wikitext": "A '''motorcar''' or '''automobile''' is a vehicle.", "revid": 5},
+            ),
+        ):
+            result = run_term_extraction_stage(
+                seed_title="Vehicle",
+                lang="en",
+                diagnostics_path=tmp_dir / "diagnostics_terms.json",
+                selected_path=tmp_dir / "selected_candidates.json",
+                terms_path=tmp_dir / "answer_candidates.csv",
+                min_df=1,
+                scores_path=tmp_dir / "candidate_scores.csv",
+            )
+
+        # The redirect's name is a second spelling of the page's title answer, not a term of its own.
+        self.assertEqual({row["normalized_answer"] for row in result.terms}, {"VEHICLE", "MOTORCAR"})
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
     def title_pool(
         self,
         seed: str,
@@ -1746,7 +1793,7 @@ class PipelineTests(unittest.TestCase):
                 "Monet": "Claude Monet|Impressionism",
                 "Jean Monet": "Jean Monet (son of Claude Monet)",
                 "Renoir": "Pierre-Auguste Renoir|Impressionism",  # an answer only through the surname
-                "Edgar Degas": "Edgar Degas|Impressionism",  # alone once
+                "Degas": "Edgar Degas|Impressionism",  # alone once
                 "Mary Lou Williams": "Mary Lou Williams|Impressionism",  # neither Williams is named more than the other
                 "Tony Williams": "Tony Williams (drummer)|Impressionism",
                 # No person, but a proper name in the seed, twice in mid-sentence: the seed alone is its source.
@@ -1765,7 +1812,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual({row["answer"]: row["answer_score"] for row in pool}["Monet"], 2.2)
         self.assertEqual(
             {row["answer"] for row in pool if row["page_is_person"]},
-            {"Monet", "Jean Monet", "Renoir", "Edgar Degas", "Mary Lou Williams", "Tony Williams"},
+            {"Monet", "Jean Monet", "Renoir", "Degas", "Mary Lou Williams", "Tony Williams"},
         )
         # A word of the seed title is not free, however often the seed uses it.
         rome = _seed_short_names(
@@ -1777,7 +1824,8 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(rome, {})
         unnamed = {row["answer"] for row in self.title_pool("Impressionism", rows, intros, cap=30)}  # a seed that names none
-        self.assertEqual((("Claude Monet" in unnamed), ("Renoir" in unnamed), ("Chicago" in unnamed)), (True, False, False))
+        # Two Monets and no seed to tell them apart keep their titles; Renoir has no rival, Chicago is no person.
+        self.assertEqual((("Claude Monet" in unnamed), ("Renoir" in unnamed), ("Chicago" in unnamed)), (True, True, False))
 
     def test_a_person_page_that_spans_a_life_is_a_person_and_a_war_or_period_is_not(self) -> None:
         for lead in (
@@ -1802,20 +1850,44 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(_is_person("Ο Πυθαγόρας (~580 π.Χ. - 496 π.Χ.) ήταν φιλόσοφος.", lang="el"))
         self.assertFalse(_is_person("Ο Μεσαίωνας (476-1492 μ.Χ) ήταν περίοδος.", lang="el"))
 
-    def test_a_person_is_answered_by_the_surname_the_seed_or_the_page_itself_uses(self) -> None:
-        def short_names(intros: dict[str, str], seed_text: str = "Heat is energy.") -> dict:
-            return _seed_short_names(
-                intros, "Thermodynamics", seed_text, lang="en", has_seed_fill_in=lambda display, normalized: True
-            )
+    def test_a_greek_lead_that_says_born_in_words_is_a_person(self) -> None:
+        for lead in (
+            "Ο Γκέοργκ Κάντορ (γερμανικά: Georg Cantor) ήταν μαθηματικός.\nΟ Κάντορ γεννήθηκε το 1845 στην Αγία Πετρούπολη.",
+            "Η Ρένα Κρουαζιέ είναι Ελληνίδα ζωγράφος που γεννήθηκε στην Κέρκυρα.",
+            "Η Σαντάλ Μουφ (γαλλ. Chantal Mouffe, γενν. 17 Ιουνίου 1943) είναι Βελγίδα φιλόσοφος.",
+            "Ο Ζακ Ρανσιέρ (γαλλ. Jacques Rancière), γεννημένος το 1940 στην Αλγερία, είναι Γάλλος φιλόσοφος.",
+            "* Το «Μαρξ» ανακατευθύνει εδώ.\nΟ Καρλ Μαρξ (γερμ. Karl Marx, γεν. 5 Μαΐου 1818) ήταν φιλόσοφος.",
+            # A copula inside the name does not end it before the life dates.
+            "Ο Σαίρεν Κίρκεγκωρ ή, όπως είναι ευρέως γνωστός, Σέρεν Κίρκεγκορ (5 Μαΐου 1813 - 11 Νοεμβρίου 1855) ήταν φιλόσοφος.",
+        ):
+            self.assertTrue(_is_person(lead, lang="el"), lead)
+        for lead in (
+            "Η κοσμολογία είναι κλάδος της αστροφυσικής που εξετάζει γιατί γεννήθηκε το σύμπαν.",  # no name before the verb
+            "Το Βραβείο Άμπελ είναι βραβείο μαθηματικών. Ο Άμπελ γεννήθηκε το 1802.",  # a prize, not "Ο" or "Η"
+            "Ο Απόλλωνας (Ομηρικά: Ἀπόλλων (γεν. Ἀπόλλωνος)) ήταν θεός.",  # "γεν." is the genitive
+            # A page named after a person, whose lead gives the person's life dates, opens on no "Ο" or "Η".
+            "Οι Μετασχηματισμοί Λόρεντς ονομάστηκαν προς τιμήν του Χέντρικ Λόρεντς (1853 - 1928).",
+        ):
+            self.assertFalse(_is_person(lead, lang="el"), lead)
 
+    def short_names(self, intros: dict[str, str], seed_text: str = "Heat is energy.", seed_title: str = "Thermodynamics") -> dict:
+        return _seed_short_names(
+            intros, seed_title, seed_text, lang="en", has_seed_fill_in=lambda display, normalized: True
+        )
+
+    def test_a_person_is_answered_by_the_surname_unless_the_title_must_stay_whole(self) -> None:
+        short_names = self.short_names
         kelvin = "Lord Kelvin (1824 – 1907) was a physicist. Kelvin proposed the scale. He died in 1907."
-        # The page's own intro names the surname alone after its first sentence; the seed need not.
+        # Nothing has to name the surname alone: a page with no sentence to show it is answered by it all the same.
         self.assertEqual(short_names({"Lord Kelvin": kelvin}), {"Lord Kelvin": ("Kelvin", "KELVIN", 0, True)})
-        # The first sentence is the full name; "Kelvin scale" next to a name is part of it.
         once = "Lord Kelvin (1824 – 1907) was a physicist. He used the Absolute Kelvin Scale."
-        self.assertEqual(short_names({"Lord Kelvin": once}), {})
-        # Another page's own title keeps the word: "Kelvin" the unit.
+        self.assertEqual(short_names({"Lord Kelvin": once}), {"Lord Kelvin": ("Kelvin", "KELVIN", 0, True)})
+        # Another page's own title keeps the word, "Kelvin" the unit, unless the seed uses it alone twice.
         self.assertEqual(short_names({"Lord Kelvin": kelvin, "Kelvin (unit)": "The kelvin is a unit."}), {})
+        self.assertEqual(
+            short_names({"Lord Kelvin": kelvin, "Kelvin (unit)": "The kelvin is a unit."}, "Kelvin said so. Kelvin left."),
+            {"Lord Kelvin": ("Kelvin", "KELVIN", 2, True)},
+        )
         # A surname after a lower-case word is none, whoever uses it.
         for title in ("Louis de Broglie", "Cato the Younger"):
             last = title.split()[-1]
@@ -1845,6 +1917,44 @@ class PipelineTests(unittest.TestCase):
             {"Tony Williams (drummer)": ("Williams", "WILLIAMS", 0, True)},
         )
 
+    def test_a_person_the_page_calls_by_another_word_or_writes_in_east_asian_script_keeps_the_title(self) -> None:
+        short_names = self.short_names
+        # The family name comes first, or the person goes by the given name: the page uses another word.
+        ding = "Ding Liren (born 1992) is a chess player. Ding won the title. Ding lost a game."
+        da_ponte = "Lorenzo Da Ponte (1749 - 1838) was a librettist. Da Ponte wrote the words. Da Ponte left Vienna."
+        self.assertEqual(short_names({"Ding Liren": ding, "Lorenzo Da Ponte": da_ponte}), {})
+        # The surname does not have to win every count, only not to lose: the seed uses both words alone once.
+        both = "Ding Liren (born 1992) is a chess player. Ding won the title."
+        self.assertEqual(short_names({"Ding Liren": both}, "Liren smiled."), {"Ding Liren": ("Liren", "LIREN", 1, True)})
+        # A lead in East Asian script may write the family name first; nothing in the text says otherwise.
+        ju = "Ju Wenjun (Chinese: \u5c45\u6587\u541b; born 1991) is a chess player."
+        self.assertEqual(short_names({"Ju Wenjun": ju}), {})
+        # A text that uses the surname alone shows it is what the person is called, in any script.
+        nakamura = "Hikaru Nakamura (\u4e2d\u6751 \u5149, born 1987) is a player. Nakamura won."
+        self.assertEqual(short_names({"Hikaru Nakamura": nakamura}), {"Hikaru Nakamura": ("Nakamura", "NAKAMURA", 0, True)})
+
+    def test_a_person_whose_birth_name_shares_no_word_with_the_title_keeps_it_unless_the_surname_is_used(self) -> None:
+        short_names = self.short_names
+        # A stage name: the birth name in the opening parenthesis has nothing of the title.
+        man = "Man Ray (born Emmanuel Radnitzky; August 27, 1890 - November 18, 1976) was an artist. He lived in Paris."
+        self.assertEqual(short_names({"Man Ray": man}), {})
+        # The birth name has the surname ("Kid Ory (born Edward Ory)"), or none is given: "(born May 24, 1937)".
+        ory = "Kid Ory (born Edward Ory; December 25, 1886 - January 23, 1973) was a trombonist."
+        ellington = "Duke Ellington (born Edward Kennedy Ellington; April 29, 1899 - 1974) was a pianist."
+        shepp = "Archie Shepp (born May 24, 1937) is a saxophonist."
+        self.assertEqual(
+            set(short_names({"Kid Ory": ory, "Duke Ellington": ellington, "Archie Shepp": shepp})),
+            {"Kid Ory", "Duke Ellington", "Archie Shepp"},
+        )
+        # A text that uses the surname alone shows what the person is called.
+        self.assertEqual(short_names({"Man Ray": man + " Ray left."}), {"Man Ray": ("Ray", "RAY", 0, True)})
+
+    def test_a_surname_after_a_name_particle_is_none(self) -> None:
+        for title in ("Giuseppe De Nittis", "Mario Del Monaco", "Leigh Van Valen", "Louis-Charles Mahé de La Bourdonnais"):
+            last = title.split()[-1]
+            intro = f"{title} (1846 - 1884) was a painter. {last} worked. {last} left."
+            self.assertEqual(self.short_names({title: intro}, f"{last} and {last} agreed."), {}, title)
+
     def test_a_surname_only_the_page_uses_keeps_the_pages_seed_mentions(self) -> None:
         rows = ["1,Lord Kelvin,1,True,0.5,0.0,0.5,False,5,KEEP,x"]
         intros = {
@@ -1873,12 +1983,20 @@ class PipelineTests(unittest.TestCase):
             intros, "Αστρονομία", seed_text, lang="el", has_seed_fill_in=lambda display, normalized: True
         )
 
-        # Two stand-alone mentions in the title's own form; the full name does not count. "του Νεύτωνα" is another
-        # form, one mention is too few, an epithet is never named alone, and a page that is no person keeps its title.
-        self.assertEqual(names, {"Γιοχάνες Κέπλερ": ("Κέπλερ", "ΚΕΠΛΕΡ", 2, True)})
+        # The seed's two stand-alone mentions of "Κέπλερ" count; the full name does not. The seed writes "του Νεύτωνα"
+        # and "Μπράχε" once, but a person is answered by the surname in the title's own form all the same. An epithet
+        # is never named alone, and a page that is no person keeps its title.
+        self.assertEqual(
+            names,
+            {
+                "Γιοχάνες Κέπλερ": ("Κέπλερ", "ΚΕΠΛΕΡ", 2, True),
+                "Ισαάκ Νεύτων": ("Νεύτων", "ΝΕΥΤΩΝ", 0, True),
+                "Τύχο Μπράχε": ("Μπράχε", "ΜΠΡΑΧΕ", 1, True),
+            },
+        )
 
-        # The person's own page names the surname alone after its first sentence: the seed need not.
-        nernst = {"Βάλτερ Νερνστ": "Ο Βάλτερ Νερνστ (1864 – 1941) ήταν Γερμανός χημικός. Ο Νερνστ διατύπωσε το θεώρημα."}
+        # A short Greek page that never names its person alone is answered by the surname too.
+        nernst = {"Βάλτερ Νερνστ": "Ο Βάλτερ Νερνστ (1864 - 1941) ήταν Γερμανός χημικός."}
         names = _seed_short_names(nernst, "Θερμοδυναμική", "Η θερμότητα.", lang="el", has_seed_fill_in=lambda d, n: True)
         self.assertEqual(names, {"Βάλτερ Νερνστ": ("Νερνστ", "ΝΕΡΝΣΤ", 0, True)})
 

@@ -14,6 +14,7 @@ from ..term_extractor import (
 )
 from ..clue_builder import answer_pattern, has_verb, lead_subject, split_sentences
 from ..lexicon import lexicon_score_for_token
+from ..text_normalize import strip_diacritics
 from ..wiki_client import WikiClient
 
 from .common import (
@@ -46,8 +47,45 @@ def _life_span(dates: str) -> int:
     return max(years) - min(years) if years else 0
 
 
+# A Greek lead says "born" in words, not in a "(born ...)" parenthesis: "Ο Χ γεννήθηκε", "Ελληνίδα ζωγράφος που
+# γεννήθηκε", "γεννημένος το 1940", "(γενν. 1944)", "(γεν. 21 Μαρτίου 1949)". A bare "γεν." is the genitive.
+_GREEK_BORN = re.compile(
+    r"(?:[Α-ΩΆ-Ώ]\w*|που|[;,]) ?γεννήθηκε|(?:^|[.;]\s*)Γεννήθηκε|γεννημένη|γεννημένος|\bγενν\.|\bγεν\. ?(?:το )?\d"
+)
+
+
+# A name in Chinese, Japanese or Korean script: the title may put the family name first.
+_EAST_ASIAN = re.compile(r"[\u3040-\u9fff\uac00-\ud7af]|[Pp]inyin|πινγίν")
+# The birth name an opening parenthesis gives: "(born Emmanuel Radnitzky; ...)", but not "(born May 24, 1937)".
+_BIRTH_NAME = re.compile(
+    r"\b(?:born|γεννημένος ως|γεννημένη ως|γεννημένος με το όνομα|γεννημένη με το όνομα)\s+"
+    r"(?!(?:January|February|March|April|May|June|July|August|September|October|November|December)\b)([A-ZΑ-Ω][^;,)\d]*)"
+)
+_NAME_PARTICLES = {"de", "da", "di", "del", "della", "du", "des", "van", "von", "der", "den", "le", "la"}
+
+
+def _words(text: str) -> set[str]:
+    return set(re.findall(r"[^\W\d_]+", strip_diacritics(text).casefold()))
+
+
+def _keeps_title(lead: str, phrase: str) -> bool:
+    """A lead in East Asian script, or one whose birth name shares no word with the title: a stage name
+    ("Man Ray (born Emmanuel Radnitzky; ...)", not "Kid Ory (born Edward Ory)")."""
+    parenthesis = _PARENTHESIS.search(lead[:300])
+    birth = _BIRTH_NAME.search(parenthesis.group()) if parenthesis else None
+    return bool(_EAST_ASIAN.search(lead[:300])) or bool(birth and not _words(phrase) & _words(birth.group(1)))
+
+
 def _is_person(text: str, *, lang: str) -> bool:
-    subject = lead_subject(text[:600], lang=lang)
+    if lang == "el":
+        # A Greek person's lead opens on the article "Ο" or "Η" (once typed with a Latin O), after a hatnote perhaps.
+        lead = re.search(r"^[OΟΗ] ", text[:300], re.M)
+        if lead is None:
+            return False
+        if _GREEK_BORN.search(text[lead.start() :][:400]):
+            return True
+    # "ή, όπως είναι ευρέως γνωστός" in a Greek name is no copula.
+    subject = lead_subject(text[:600].replace("όπως είναι", "όπως"), lang=lang)
     parentheses = _PARENTHESIS.findall(subject)
     if any(re.search(r"\b(?:born|fl)\b", dates) for dates in parentheses):
         return True
@@ -62,13 +100,16 @@ def _seed_short_names(
 ) -> dict[str, tuple[str, str, int, bool]]:
     """Pages the seed calls by the last word of their title: page title -> (display, normalized, mentions, person).
 
-    A person by the surname: "Monet" for "Claude Monet" when the seed names it alone at least twice, or when the
-    person's own page does after its first sentence ("Kelvin" for "Lord Kelvin"). `mentions` counts the seed's.
-    A surname after a lower-case word is none ("Vincent van Gogh", "Cato the Younger"), nor is a word of the seed
-    title, and one only the page uses never takes another page's title ("Kelvin", the unit). Of several people
-    with one surname, the one whose full name the seed uses more often than all the others' together takes it;
-    with no such person ("Williams") nobody does. Only a Greek person is named this way, and only by the title's
-    own form: the seed writes other pages in an ending of its own.
+    A person by the surname: "Monet" for "Claude Monet", "Kelvin" for "Lord Kelvin". `mentions` counts the seed's
+    stand-alone uses of it. A surname after a lower-case word or a name particle is none ("Vincent van Gogh", "Cato
+    the Younger", "Giuseppe De Nittis"), nor is a word of the seed title, nor another page's own title ("Kelvin", the
+    unit) unless the seed uses it alone at least twice. Of several people with one surname, the one whose full name
+    the seed uses more often than all the others' together takes it; with no such person ("Williams") nobody does.
+    A person the lead writes in Chinese, Japanese or Korean script keeps the title (the family name may come first:
+    "Ding Liren"), and so does one whose birth name shares no word with it ("Man Ray"), unless the seed or the
+    person's own page uses the surname alone. So does one they call more often by another word of the title
+    ("Gukesh Dommaraju"). Only a Greek person is named this way, and only by the title's own form: the seed writes
+    other pages in an ending of its own.
 
     Any other page by a word the seed uses as a proper name, capitalised in mid-sentence and alone at least twice:
     "Chicago" for "Music of Chicago", not "Rhythm" for "I Got Rhythm". The seed's sentence is its only clue, so
@@ -88,13 +129,24 @@ def _seed_short_names(
         phrases = {title: _TITLE_DISAMBIGUATOR.sub("", title).strip() for title, _ in rivals}
         named = {title: len(answer_pattern(phrase).findall(seed_text)) for title, phrase in phrases.items()}
         for title, pair in rivals:
-            if (len(rivals) > 1 and 2 * named[title] <= sum(named.values())) or phrases[title].split()[-2].islower():
+            before = phrases[title].split()[-2]  # a surname after a lower-case word or a name particle is none
+            rival = len(rivals) > 1 and 2 * named[title] <= sum(named.values())
+            if rival or before.islower() or before.casefold() in _NAME_PARTICLES:
                 continue
             if pair[0].casefold() in seed_title.casefold().split():  # a word of the seed title is not free
                 continue
-            mentions = _name_mentions(pair[0], seed_text, part_of=(phrases[title],))
+            words = phrases[title].split()
+            last_two = " ".join(words[-2:])  # "Da Ponte" is a name of its own, not the surname alone
+            mentions = _name_mentions(pair[0], seed_text, part_of=(phrases[title], last_two))
+            if pair[1] in titled and mentions < 2:
+                continue
+            # The page itself (after its first sentence) calls the person by the surname unless another word of the
+            # title or its last two do more often. With no use of the surname anywhere, a lead in East Asian script
+            # or one giving a birth name that shares no word with the title (a stage name) keeps the title.
             own = " ".join(split_sentences(intros[title])[1:])
-            if mentions >= 2 or (pair[1] not in titled and _name_mentions(pair[0], own, part_of=(phrases[title],))):
+            called = {name: _name_mentions(name, own, part_of=(phrases[title],)) for name in (*words[:-1], last_two)}
+            surname = mentions + _name_mentions(pair[0], own, part_of=(phrases[title], last_two))
+            if surname >= max(called.values()) and (surname or not _keeps_title(intros[title], phrases[title])):
                 names[title] = (*pair, mentions, True)
     if lang != "en":  # a Greek page that is no person keeps its title: the seed writes its inflected form
         return names

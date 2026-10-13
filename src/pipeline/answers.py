@@ -17,6 +17,7 @@ from ..term_extractor import (
     shape_penalty,
     crosswordability_score,
     term_frequency_across_docs,
+    title_to_answer,
 )
 from ..text_normalize import tokenize
 from ..vocab_gate import evaluate_vocab_gate
@@ -512,7 +513,18 @@ def run_term_extraction_stage(
         if scores_path is not None
         else []
     )
-    filtered_terms = _ranked_answer_pool(title_rows, filtered_terms)
+    # A selected redirect ("Αυτί") is another spelling of the page whose title already answers ("Αφτί").
+    answered = {row["source_titles"].split("|")[0] for row in title_rows}
+    spellings = {
+        pair[1]
+        for title, payload in full_payloads.items()
+        if payload["title"] != title
+        and payload["title"] in answered
+        and (pair := title_to_answer(title, lang=lang, max_len=max_len))
+    }
+    filtered_terms = _ranked_answer_pool(
+        title_rows, [row for row in filtered_terms if row["normalized_answer"] not in spellings]
+    )
 
     _write_terms_csv(terms_path, filtered_terms)
 
