@@ -6,7 +6,7 @@ from bisect import bisect_right
 from collections import Counter
 from typing import NamedTuple
 
-from .term_extractor import get_stopwords
+from .term_extractor import _TITLE_DISAMBIGUATOR, get_stopwords
 from .text_normalize import strip_diacritics, tokenize
 
 
@@ -200,6 +200,11 @@ class _Words(NamedTuple):
     # Time nouns that want what follows them ("in the years from the Spanish-American War to ...").
     time_heads: frozenset[str]
     articles: frozenset[str]
+    # Where set, the tagger calls nouns ("Γάλλος", "γλύπτης") ADP, ADV or VERB at random, which `_edge_pos` corrects: an ADP
+    # that is none of these prepositions (all of them, archaic ones too) is a noun, and so is an ADV or VERB with one of
+    # these endings of a masculine noun. Where empty, the tags are trusted.
+    all_prepositions: frozenset[str]
+    noun_endings: tuple[str, ...]
     # The words that join the last item of a list, as written: folded, the Greek "ή" (or) is the article "η".
     coordinators: frozenset[str]
     # How an answer's last word occurs in the subject: its last `stem_trim` letters may differ, then `endings`.
@@ -258,6 +263,8 @@ _EN = _Words(
     labels=_words("term word name phrase"),
     time_heads=_words("years decades period time era days"),
     articles=frozenset(),
+    all_prepositions=frozenset(),
+    noun_endings=(),
     coordinators=frozenset({"and", "or"}),
     stem_trim=0,
     endings=r"(?:e?s)?",
@@ -324,6 +331,10 @@ _EL = _Words(
     labels=frozenset(),
     time_heads=frozenset(),
     articles=_words(_EL_ARTICLE),
+    all_prepositions=_words(
+        f"{_EL_ADJUNCT} ως μέσω λόγω βάσει δια ανά αντί περί δίχως προ άνευ υπέρ εναντίον ενώπιον ένεκα χάριν εκ εξ εν εις"
+    ),
+    noun_endings=("ος", "ης"),
     coordinators=frozenset({"και", "κι", "ή"}),
     stem_trim=2,
     endings=r"\w{0,3}",
@@ -551,13 +562,34 @@ def _subject_tail(subject: str, answer: str, lex: _Words) -> str | None:
     return None if match is None else subject[match.end() :]
 
 
-def _is_noun_phrase(clue: str, nlp) -> bool:
+def _edge_pos(token, lex: _Words) -> str:
+    """The tag of a token at either end of a definition, with the Greek tagger's confusions of a noun corrected.
+
+    "Γάλλος φιλόσοφος και συγγραφέας" comes out as ADP, NOUN, CCONJ, ADP. Prepositions are a closed class, so an ADP
+    that is none of them (and is a word, not an initial) is a noun; an ADV or VERB in -ος or -ης is one too, unless it
+    is a participle ("γνωστός", "γεννημένος"), which does not end a definition either.
+    """
+    word = _fold(token.text)
+    wrong = (
+        (token.pos_ == "ADP" and lex.all_prepositions and len(word) > 1 and word not in lex.all_prepositions)
+        or (
+            token.pos_ in {"ADV", "VERB"}
+            and lex.noun_endings
+            and word.endswith(lex.noun_endings)
+            and not word.endswith(lex.participle_endings)
+            and word not in lex.participles
+        )
+    )
+    return "NOUN" if wrong else token.pos_
+
+
+def _is_noun_phrase(clue: str, nlp, lex: _Words) -> bool:
     """A noun phrase neither starts with a verb or adverb ("Fought in 53 BC ...") nor ends in a function word or adverb.
 
     Nor does it open on an adjective that wants a complement ("Popular in the 1940s", "Distinct from previous bebop").
     """
     tokens = [token for token in nlp(clue) if not token.is_punct]
-    if not tokens or tokens[0].pos_ in _BAD_START or tokens[-1].pos_ in _BAD_END:
+    if not tokens or _edge_pos(tokens[0], lex) in _BAD_START or _edge_pos(tokens[-1], lex) in _BAD_END:
         return False
     return not (len(tokens) > 1 and tokens[0].pos_ == "ADJ" and tokens[1].pos_ in {"ADP", "SCONJ"})
 
@@ -696,7 +728,7 @@ def _copula_definition(
         return None
     clue = " ".join(words).rstrip(" ,;:\u2013\u2014-")
     clue = clue[0].upper() + clue[1:]
-    return None if nlp is not None and not _is_noun_phrase(clue, nlp) else clue
+    return None if nlp is not None and not _is_noun_phrase(clue, nlp, lex) else clue
 
 
 def definition_clue(
@@ -971,6 +1003,7 @@ def lead_word_counts(leads: list[str]) -> Counter[str]:
 
 # A definition that opens on a nationality ("An American jazz drummer") needs this many informative words, any other one.
 _MIN_INFORMATIVE_WORDS = 2
+_TOO_FEW_WORDS = "too few informative words"
 # Head nouns that name a kind of word, not a kind of thing: generic unless the definition says what the word means.
 _KIND_OF_WORD = {"term", "name", "word", "phrase", "concept", "notion", "idea", "expression", "title", "label", "designation"}
 _MEANING_MARKERS = {
@@ -1038,7 +1071,7 @@ def _generic_reason(clue: str, counts: Counter[str], pool_size: int, nlp, seed_t
     nationalities = {word for token in people for word in _WORD.findall(token.lower_)}
     informative = _informative_words(clue, counts, pool_size, nationalities, seed_title)
     if len(informative) < (_MIN_INFORMATIVE_WORDS if own else 1):
-        return "too few informative words"
+        return _TOO_FEW_WORDS
     return None
 
 
@@ -1054,6 +1087,21 @@ def is_generic_definition(clue: str, counts: Counter[str], pool_size: int, nlp=N
     is generic as well.
     """
     return _generic_reason(clue, counts, pool_size, nlp, seed_title) is not None
+
+
+def is_thin_definition(clue: str, counts: Counter[str], pool_size: int, nlp=None, *, seed_title: str | None = None) -> bool:
+    """True when a definition is generic for no reason but its few informative words ("An American jazz drummer")."""
+    return _generic_reason(clue, counts, pool_size, nlp, seed_title) == _TOO_FEW_WORDS
+
+
+def name_the_person(definition: str, title: str, answer: str) -> str | None:
+    """"An American jazz drummer (Art ____)": the definition with the given names of a person's page and a blank for the surname.
+
+    None when the answer is not the last word of the title, the title has no other word, or the clue would be too long.
+    """
+    given, _, surname = _TITLE_DISAMBIGUATOR.sub("", title).strip().rpartition(" ")
+    clue = f"{definition} ({given} {BLANK})"
+    return clue if given and surname == answer and len(clue.split()) <= MAX_CLUE_WORDS else None
 
 
 def has_verb(clue: str, nlp) -> bool:

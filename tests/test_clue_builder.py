@@ -1,5 +1,6 @@
 import unittest
 from collections import Counter
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from src import clue_builder
@@ -14,7 +15,9 @@ from src.clue_builder import (
     has_morphological_leakage,
     has_verb,
     is_generic_definition,
+    is_thin_definition,
     mask_answer,
+    name_the_person,
     split_sentences,
     strip_trailing_sections,
     trim_clause,
@@ -559,6 +562,26 @@ class DefinitionCapAndEdgesTests(unittest.TestCase):
         self.assertIsNone(definition_clue(self.CARRHAE, nlp=nlp))
         self.assertTrue(definition_clue(self.CARRHAE).startswith("Fought in 53 BC"))
 
+    def test_a_greek_noun_the_tagger_takes_for_a_function_word_does_not_fail_the_noun_phrase_test(self) -> None:
+        def tagged(*tags: str):
+            def nlp(clue: str):
+                return [SimpleNamespace(text=word, pos_=pos, is_punct=False) for word, pos in zip(clue.split(), tags)]
+
+            return nlp
+
+        el, en = clue_builder._WORDS["el"], clue_builder._WORDS["en"]
+        is_noun_phrase = clue_builder._is_noun_phrase
+        # ADP that is no preposition, and ADV or VERB in -ος/-ης: nouns.
+        self.assertTrue(is_noun_phrase("Γάλλος φιλόσοφος και συγγραφέας", tagged("ADP", "NOUN", "CCONJ", "ADP"), el))
+        self.assertTrue(is_noun_phrase("Ολλανδός ανθρωπιστής και γλύπτης", tagged("VERB", "NOUN", "CCONJ", "ADV"), el))
+        # A preposition (an archaic one too), an initial, an adverb, a participle and an English tag keep failing.
+        self.assertFalse(is_noun_phrase("Γάλλος φιλόσοφος σε", tagged("NOUN", "NOUN", "ADP"), el))
+        self.assertFalse(is_noun_phrase("Οπτικό όργανο διάταξης δια", tagged("ADJ", "NOUN", "NOUN", "ADP"), el))
+        self.assertFalse(is_noun_phrase("Γάλλος φιλόσοφος Χ", tagged("NOUN", "NOUN", "ADP"), el))
+        self.assertFalse(is_noun_phrase("Ευρέως Γάλλος φιλόσοφος", tagged("ADV", "NOUN", "NOUN"), el))
+        self.assertFalse(is_noun_phrase("Γεννημένος Γάλλος φιλόσοφος", tagged("VERB", "NOUN", "NOUN"), el))
+        self.assertFalse(is_noun_phrase("Γάλλος φιλόσοφος και συγγραφέας", tagged("ADP", "NOUN", "CCONJ", "ADP"), en))
+
 
 class GenericDefinitionTests(unittest.TestCase):
     # Lead-sentence document frequencies measured on the offline runs of the four test seeds.
@@ -700,6 +723,27 @@ class GenericDefinitionTests(unittest.TestCase):
             "One of the world's earliest sewage systems",
         ):
             self.assertFalse(self._generic("jazz", clue), clue)
+
+    def test_a_definition_is_thin_only_when_its_informative_words_are_too_few(self) -> None:
+        size, counts = self.POOLS["thermo"]
+        counts = Counter({**self.COMMON, **counts})
+        self.assertTrue(is_thin_definition("A German physicist", counts, size))
+        for clue in ("Any of many different quantities", "A term coined in the 1980s"):
+            self.assertTrue(is_generic_definition(clue, counts, size), clue)
+            self.assertFalse(is_thin_definition(clue, counts, size), clue)
+
+    def test_a_person_is_named_by_the_given_names_of_the_page_title_and_a_blank_for_the_surname(self) -> None:
+        for title, answer, expected in (
+            ("Art Blakey", "Blakey", "An American jazz drummer (Art ____)"),
+            ("Benny Green (pianist)", "Green", "An American jazz drummer (Benny ____)"),
+            ("Howard M. Wiseman", "Wiseman", "An American jazz drummer (Howard M. ____)"),
+        ):
+            self.assertEqual(name_the_person("An American jazz drummer", title, answer), expected, title)
+        self.assertEqual(name_the_person("Ένας Γάλλος φιλόσοφος", "Ζαν-Πωλ Σαρτρ", "Σαρτρ"), "Ένας Γάλλος φιλόσοφος (Ζαν-Πωλ ____)")
+        # Another name of the person, a title of one word, and a clue past the word limit have no such form.
+        self.assertIsNone(name_the_person("An American jazz drummer", "Art Blakey", "Art"))
+        self.assertIsNone(name_the_person("An American jazz drummer", "Blakey", "Blakey"))
+        self.assertIsNone(name_the_person(" ".join(["word"] * 17), "Art Blakey", "Blakey"))
 
     def test_trailing_sections_are_cut_at_the_first_of_them(self) -> None:
         body = "Weinberg won a prize."

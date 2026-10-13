@@ -1424,6 +1424,25 @@ class PipelineTests(unittest.TestCase):
         # A page that is no person has no "who".
         self.assertEqual(run("clue_who_no_person", "False")[0][:2], ("fill_in_blank", 0))
 
+    def test_clue_stage_names_a_person_whose_definition_is_thin_when_nothing_else_clues_them(self) -> None:
+        names = ["Ana Vale", "Ben Cole", "Cy Dunn", "Fay Ito", "Gus Moe", "Dan Roe"]
+        extracts = {name: f"{name} was an American drummer." for name in names}
+        extracts["Gus Moe"] += " Moe played the drums with the quintet in Kyoto every year."  # a fill-in comes first
+        extracts["Dan Roe"] = "Dan Roe was a common term."  # generic, but for its kind of word: no name makes it specific
+        rows = [f"{name.split()[1]},{name.split()[1].upper()},{name},article_title,True,True" for name in names]
+        result, _ = self._run_clues_for("clue_named_person", rows, extracts)
+
+        self.assertEqual(
+            {row["answer"]: (row["clue_style"], row["clue"]) for row in result.clues},
+            {
+                "Vale": ("definition", "An American drummer (Ana ____)"),
+                "Cole": ("definition", "An American drummer (Ben ____)"),
+                "Dunn": ("definition", "An American drummer (Cy ____)"),
+                "Ito": ("definition", "An American drummer (Fay ____)"),
+                "Moe": ("fill_in_blank", "____ played the drums with the quintet in Kyoto every year."),
+            },
+        )
+
     def test_clue_stage_defines_an_answer_only_by_a_page_that_bears_its_name(self) -> None:
         extracts = {
             "Subatomic particle": "A subatomic particle is a particle smaller than an atom in every model.",

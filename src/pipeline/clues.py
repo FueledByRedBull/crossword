@@ -22,7 +22,9 @@ from ..clue_builder import (
     follow_up_definition,
     has_verb,
     is_generic_definition,
+    is_thin_definition,
     lead_word_counts,
+    name_the_person,
     split_sentences,
     who_definition,
 )
@@ -204,10 +206,34 @@ def _definition_clue_rows(
     `person` the generic one is joined with what the second or third sentence says they did ("An English
     physicist who studied the nature of heat"), and that is as good as a first-sentence definition.
     When none is left, the second sentence is tried ("He was one of the most influential figures in jazz piano."):
-    a `follow_up` row, the last resort after the fill-ins.
+    a `last_resort` row, used after the fill-ins. So is the person's thin first-sentence definition (too few informative
+    words) with the given names of the page and a blank for the surname ("An American jazz drummer (Art ____)"),
+    when nothing else clues the answer.
     """
     sentences = split_sentences(payload.get("extract", ""))
     rows: list[dict] = []
+    named: str | None = None
+
+    def definition_rows(texts: list[tuple[str, int]], last_resort: bool) -> list[dict]:
+        return [
+            {
+                **_build_clue_row(
+                    answer=answer,
+                    normalized_answer=normalized_answer,
+                    answer_key_value=answer_key_value,
+                    clue_text=clue_text,
+                    source_method=term_source_method,
+                    source_page=payload.get("title", title) or title,
+                    revid=payload.get("revid"),
+                    sentence_offset=source,
+                    lang=lang,
+                    clue_style="definition",
+                ),
+                "last_resort": last_resort,
+            }
+            for clue_text, source in texts
+        ]
+
     # The second sentence is the last resort of an answer whose first one gave no definition.
     for offset, cut in enumerate((definition_clue, follow_up_definition)):
         if rows or offset >= len(sentences):
@@ -238,24 +264,20 @@ def _definition_clue_rows(
                         break
                 if texts:
                     break
-        rows = [
-            {
-                **_build_clue_row(
-                    answer=answer,
-                    normalized_answer=normalized_answer,
-                    answer_key_value=answer_key_value,
-                    clue_text=clue_text,
-                    source_method=term_source_method,
-                    source_page=payload.get("title", title) or title,
-                    revid=payload.get("revid"),
-                    sentence_offset=source,
-                    lang=lang,
-                    clue_style="definition",
-                ),
-                "follow_up": cut is follow_up_definition,
-            }
-            for clue_text, source in texts
-        ]
+            if not texts:
+                named = next(
+                    (
+                        clue
+                        for head in sorted(generic.values(), key=len, reverse=True)
+                        if is_thin_definition(head, lead_counts, pool_size, nlp, seed_title=seed_title)
+                        and (clue := name_the_person(head, title, answer))
+                        and clue_pass_validate(clue, answer, min_words=3, nlp=nlp, lang=lang)
+                    ),
+                    None,
+                )
+        rows = definition_rows(texts, cut is follow_up_definition)
+    if named and not rows:
+        rows = definition_rows([(named, 0)], True)
     return rows
 
 
@@ -532,11 +554,11 @@ def run_clue_extraction_stage(
                     seed_title=seed_title,
                     person=person,
                 )
-            # A follow-up (the second sentence) is for an answer nothing else clues: it comes after the fill-ins.
+            # A follow-up (the second sentence) or a named definition is for an answer nothing else clues: it comes after the fill-ins.
             candidates = (
-                [row for row in definitions if not row["follow_up"]]
+                [row for row in definitions if not row["last_resort"]]
                 + candidates
-                + [row for row in definitions if row["follow_up"]]
+                + [row for row in definitions if row["last_resort"]]
             )
 
         chosen, rejected_for_diversity = _choose_clue(
