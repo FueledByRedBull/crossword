@@ -22,5 +22,4 @@ env/
 outputs/
 data/cache/
 tests/tmp_outputs/
-data/lexicon/hunspell-en_US-large-*/
 layout-rs/target/

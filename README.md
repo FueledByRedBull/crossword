@@ -147,3 +147,5 @@ The deselected test, the offline integration corpus, runs four cached seeds end 
 ## License
 
 [MIT](LICENSE)
+
+The word lists under `data/lexicon` derive from SCOWL; where each comes from and SCOWL's notice are in [data/lexicon/README.md](data/lexicon/README.md).
