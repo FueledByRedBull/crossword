@@ -1673,8 +1673,11 @@ class PipelineTests(unittest.TestCase):
                 scores_path=tmp_dir / "candidate_scores.csv",
             )
 
-        self.prefetch_lead_wikitext.assert_called_once_with(["Bebop"])
         pool_intros = self.prefetch_intro_extracts.call_args.args[0]
+        # The selected titles' lead wikitext, then the pool's (the seed apart) for the infobox captions.
+        lead_prefetches = [call.args[0] for call in self.prefetch_lead_wikitext.call_args_list]
+        self.assertEqual((lead_prefetches[0], sorted(lead_prefetches[1])), (["Bebop"], sorted(pool_intros[1:])))
+        self.assertEqual(len(lead_prefetches), 2)
         self.assertEqual(
             (pool_intros[0], "Barcelona" in pool_intros, "Paris" in pool_intros, "Ragtime" in pool_intros),
             ("Jazz", True, False, False),
@@ -1796,6 +1799,7 @@ class PipelineTests(unittest.TestCase):
         redirects: dict[str, str] | None = None,
         extracts: dict[str, str] | None = None,
         seed_text: str = "",
+        lead_wikitexts: dict[str, str] | None = None,
     ) -> list[dict]:
         header = "rank,title,depth,links_back_to_seed,rel_score,red_score,selection_score,intro_on_topic,seed_mentions,status,reason"
         with tempfile.TemporaryDirectory() as tmp:
@@ -1808,6 +1812,7 @@ class PipelineTests(unittest.TestCase):
                 return {"title": page, "extract": intros.get(page, "")}
 
             client.fetch_page_extract.side_effect = fetch
+            client.fetch_lead_wikitext.side_effect = lambda title: {"wikitext": (lead_wikitexts or {}).get(title, "")}
             client.fetch_page_extract_with_revid.return_value = {"title": seed, "extract": seed_text, "revid": 1}
             return _build_title_answer_rows(
                 seed_title=seed,
@@ -2065,6 +2070,52 @@ class PipelineTests(unittest.TestCase):
             last = title.split()[-1]
             intro = f"{title} (1846 - 1884) was a painter. {last} worked. {last} left."
             self.assertEqual(self.short_names({title: intro}, f"{last} and {last} agreed."), {}, title)
+
+    def test_a_person_the_page_calls_by_the_last_two_words_is_answered_by_both(self) -> None:
+        def short_names(intro: str, caption: str = "", title: str = "Noris Salazar Allen") -> dict:
+            return _seed_short_names(
+                {title: intro}, "Bryology", "Moss is a plant.", lang="en", has_seed_fill_in=lambda d, n: True,
+                captions={title: caption},
+            )
+
+        # A Hispanic double surname: the sentences only say "She", the caption of the infobox says "Salazar Allen".
+        salazar = "Noris Salazar Allen (born 1947) is a bryologist. She studied mosses. She taught in Panama."
+        self.assertEqual(
+            short_names(salazar, "Salazar Allen in 2017"), {"Noris Salazar Allen": ("Salazar Allen", "SALAZARALLEN", 0, True)}
+        )
+        self.assertEqual(
+            short_names(salazar + " Salazar Allen wrote a flora. Salazar Allen retired."),
+            {"Noris Salazar Allen": ("Salazar Allen", "SALAZARALLEN", 0, True)},
+        )
+        # Nothing calls her by both words, or the surname alone is used as often: the surname answers.
+        allen = {"Noris Salazar Allen": ("Allen", "ALLEN", 0, True)}
+        self.assertEqual(short_names(salazar), allen)
+        self.assertEqual(short_names(salazar + " Allen taught.", "Salazar Allen in 2017"), allen)
+        # A caption that uses the surname alone changes nothing: "Raúl" is a given name.
+        capablanca = "José Raúl Capablanca (1888 - 1942) was a chess player. He won the title."
+        self.assertEqual(
+            short_names(capablanca, "Capablanca in 1920", "José Raúl Capablanca"),
+            {"José Raúl Capablanca": ("Capablanca", "CAPABLANCA", 0, True)},
+        )
+
+    def test_the_infobox_caption_of_the_link_title_makes_a_double_surname(self) -> None:
+        rows = ["1,Salazar Allen,1,True,0.5,0.0,0.5,False,5,KEEP,x"]
+        intros = {
+            "Bryology": "Bryology is the study of mosses.",
+            "Noris Salazar Allen": "Noris Salazar Allen (born 1947) is a bryologist. She studied mosses. She taught.",
+        }
+        pool = self.title_pool(
+            "Bryology",
+            rows,
+            intros,
+            redirects={"Salazar Allen": "Noris Salazar Allen"},
+            lead_wikitexts={"Salazar Allen": "{{Infobox academic\n| name = Noris Salazar Allen\n| caption = Salazar Allen in 2017\n}}"},
+            seed_text="Moss is a plant.",
+        )
+        self.assertEqual([row["answer"] for row in pool if row["source_titles"].startswith("Noris")], ["Salazar Allen"])
+        # A page whose lead was never fetched is answered as before.
+        pool = self.title_pool("Bryology", rows, intros, redirects={"Salazar Allen": "Noris Salazar Allen"}, seed_text="Moss.")
+        self.assertEqual([row["answer"] for row in pool if row["source_titles"].startswith("Noris")], ["Allen"])
 
     def test_a_surname_only_the_page_uses_keeps_the_pages_seed_mentions(self) -> None:
         rows = ["1,Lord Kelvin,1,True,0.5,0.0,0.5,False,5,KEEP,x"]

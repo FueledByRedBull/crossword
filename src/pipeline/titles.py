@@ -62,6 +62,16 @@ _BIRTH_NAME = re.compile(
     r"(?!(?:January|February|March|April|May|June|July|August|September|October|November|December)\b)([A-ZΑ-Ω][^;,)\d]*)"
 )
 _NAME_PARTICLES = {"de", "da", "di", "del", "della", "du", "des", "van", "von", "der", "den", "le", "la"}
+# The caption of an infobox's image: "| caption = Salazar Allen in 2017".
+_CAPTION = re.compile(r"\|\s*(?:image_)?caption\s*=([^\n]*)")
+
+
+def _infobox_captions(client: WikiClient, title: str) -> str:
+    """The captions of a page's lead, cached by scoring; none when the lead was never fetched."""
+    try:
+        return "\n".join(_CAPTION.findall(client.fetch_lead_wikitext(title).get("wikitext", "")))
+    except RuntimeError:
+        return ""
 
 
 def _words(text: str) -> set[str]:
@@ -96,7 +106,13 @@ def _is_person(text: str, *, lang: str) -> bool:
 
 
 def _seed_short_names(
-    intros: dict[str, str], seed_title: str, seed_text: str, *, lang: str, has_seed_fill_in
+    intros: dict[str, str],
+    seed_title: str,
+    seed_text: str,
+    *,
+    lang: str,
+    has_seed_fill_in,
+    captions: dict[str, str] | None = None,
 ) -> dict[str, tuple[str, str, int, bool]]:
     """Pages the seed calls by the last word of their title: page title -> (display, normalized, mentions, person).
 
@@ -108,7 +124,9 @@ def _seed_short_names(
     A person the lead writes in Chinese, Japanese or Korean script keeps the title (the family name may come first:
     "Ding Liren"), and so does one whose birth name shares no word with it ("Man Ray"), unless the seed or the
     person's own page uses the surname alone. So does one they call more often by another word of the title
-    ("Gukesh Dommaraju"). Only a Greek person is named this way, and only by the title's own form: the seed writes
+    ("Gukesh Dommaraju"). One they call more often by the last two words of the title, in their sentences or in the
+    caption of their infobox `captions`, has a double surname and is answered by both: "Salazar Allen" for "Noris
+    Salazar Allen". Only a Greek person is named this way, and only by the title's own form: the seed writes
     other pages in an ending of its own.
 
     Any other page by a word the seed uses as a proper name, capitalised in mid-sentence and alone at least twice:
@@ -141,13 +159,19 @@ def _seed_short_names(
             if pair[1] in titled and mentions < 2:
                 continue
             # The page itself (after its first sentence) calls the person by the surname unless another word of the
-            # title or its last two do more often. With no use of the surname anywhere, a lead in East Asian script
-            # or one giving a birth name that shares no word with the title (a stage name) keeps the title.
+            # title or its last two do more often; the caption of its infobox counts for the last two ("Salazar Allen
+            # in 2017", where the sentences only say "She"). With no use of the surname anywhere, a lead in East Asian
+            # script or one giving a birth name that shares no word with the title (a stage name) keeps the title.
             own = " ".join(split_sentences(intros[title])[1:])
             called = {name: _name_mentions(name, own, part_of=(phrases[title],)) for name in (*words[:-1], last_two)}
+            called[last_two] += _name_mentions(last_two, (captions or {}).get(title, ""), part_of=(phrases[title],))
             surname = mentions + _name_mentions(pair[0], own, part_of=(phrases[title], last_two))
             if surname >= max(called.values()) and (surname or not _keeps_title(intros[title], phrases[title])):
                 names[title] = (*pair, mentions, True)
+            elif called[last_two] > max(surname, *(called[name] for name in words[:-1])) and (
+                double := title_to_answer(last_two, lang=lang)
+            ):
+                names[title] = (*double, _name_mentions(last_two, seed_text, part_of=(phrases[title],)), True)
     if lang != "en":  # a Greek page that is no person keeps its title: the seed writes its inflected form
         return names
     taken = set(people) | titled
@@ -234,12 +258,15 @@ def _build_title_answer_rows(
         )
         return any(nlp is None or has_verb(row["clue"], nlp) for row in fills)
 
+    linked = [page for page in pages if page[0] != seed_title]
+    _prefetch(errors, client.prefetch_lead_wikitext, [page[0] for page in linked])
     short_names = _seed_short_names(
         {page[4]: page[5] for page in pages},
         seed_title,
         seed_payload["extract"],
         lang=lang,
         has_seed_fill_in=has_seed_fill_in,
+        captions={page[4]: _infobox_captions(client, page[0]) for page in linked},
     )
     for page in pages:
         if page[4] in short_names and short_names[page[4]][2] >= 2:
