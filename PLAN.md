@@ -93,7 +93,7 @@ Held-out seeds: `data/benchmarks/held_out.json` holds the same kind of fixture f
    - Add candidates until crossword-aware marginal utility plateaus.
 5. `Term Extraction + Filtering`:
    - Take answers primarily from the titles of the most relevant linked articles, then from extracted noun phrases/entities, and apply quality filters.
-   - Answer a person's page by the surname (`MONET` for "Claude Monet", `KELVIN` for "Lord Kelvin"; 3 to 15 letters; in Greek only in the title's own form). The title stays whole when the surname follows a lower-case word or a name particle ("Vincent van Gogh", "Giuseppe De Nittis"), is a word of the seed title, is another page's title (unless the seed uses it alone twice), is shared by rival people, or is not what the person's own page calls them (another word of the title is used more); a person the page, or the caption of its infobox, calls more often by the last two words of the title is answered by both ("Salazar Allen"); and, when no text uses the surname alone, when the lead is in Chinese, Japanese or Korean script or gives a birth name that shares no word with the title ("Man Ray"). A page is a person's when its opening parenthesis says "born" or "fl." or gives years that span a life, or, in Greek, when the lead opens on "Ο" or "Η" and says "γεννήθηκε", "γεννημένος", "γεννημένη", "γενν." or "γεν." with a date.
+   - Answer a person's page by the surname (`MONET` for "Claude Monet"), and keep the whole title where the surname alone would not be a fair answer. When the title stays whole, how a double surname is answered and what makes a page a person's are rules of the implementation, in [docs/how-it-works.md](docs/how-it-works.md#pipeline), step 2.
    - A selected redirect gives no second answer for the page it leads to when that page's title already is one.
    - Answer any other page by the last word of its title when the seed article uses that word on its own as a name at least twice (`CARTHAGE` for "Ancient Carthage"). A word that ends two or more non-person titles ("Empire") is nobody's name.
 6. `Clue Generation`:
@@ -267,28 +267,23 @@ Additional notes:
 
 ### 5.5 Step 5: Clue Quality Pipeline (Four Passes)
 
+The rules as implemented are in [docs/how-it-works.md](docs/how-it-works.md): step 3 of [Pipeline](docs/how-it-works.md#pipeline) and the [Clue quality](docs/how-it-works.md#clue-quality) list.
+
 #### Pass 1: Extract
 
-1. Definition: the first sentence of the answer's own article with the subject removed, cut only at a clean boundary, never after a bare "the years" or "the period" that the sentence goes on to complete; an example phrase in mid-sentence ("like A, B and C") is left out when the cut would stop inside it. A lead whose main verb is no copula gives "It ..." or "They ..." with its predicate. A person's generic first definition is joined with the predicate of the second or third sentence ("An English physicist who studied the nature of heat"). A page defines only its own name: its title, or a name of the person it is about. A redirect's name and a short name of a page that is not about a person take fill-ins only. A page that may be another sense of the seed's word (a disambiguated title, or an intro that opens by sending the reader to another article, with an off-topic intro) gets no definition and its own text clues nothing. When the first sentence gives no usable definition, the second is cut the same way if its subject is a pronoun or the answer's name ("He was one of ..."); it is used only when no fill-in exists. A person answered by the surname whose first-sentence definition is generic only for having too few informative words, and whom nothing else clues, gets that definition followed by the given names and a blank ("An American jazz drummer (Art ____)"). A person whose first sentence gives no definition is tried again with a head of two words or more, which is joined or named the same way and never used alone ("Ολλανδός φυσικός (Χέντρικ ____)"). For a page that is no person, a cut that stops before a relative clause gives way to the longer cut through it, and a genus of fewer than three content words comes after the fill-ins. The cut rules in full are in [docs/how-it-works.md](docs/how-it-works.md). In Greek the tags at the two ends of a definition are corrected first: a word tagged as a preposition that is none, or as an adverb or verb in -ος or -ης that is no participle, is a noun.
-2. Fill-in-the-blank: sentences that contain the answer, taken only from the seed article, the answer's own page, or a selected article whose intro is on topic. A page read in full ends at its first reference section ("References", "Works", "Selected publications" ...). A short name of a page that is not about a person takes them from the seed alone; for a person's surname the blank may stand for the full name, and the name must be capitalised wherever the sentence has it.
+A definition comes first, taken from the first sentence of the answer's own article with its subject removed; a fill-in-the-blank sentence from an on-topic source is the fallback.
 
 #### Pass 2: Mask + Trim
 
-1. Mask the answer's surface form in the clue text.
-2. Keep a whole sentence, or its start cut once at a clause boundary; at most 18 words.
+The answer is masked in the clue text, and the clue is a whole sentence or a clean cut of one, at most 18 words.
 
 #### Pass 3: Validate
 
-1. Reject clues containing the answer, a content word of it, or a morphological cousin of one (lemma/stem check). A spelling that differs only by accents, a modifier letter or an apostrophe counts as the same word.
-2. Reject a fill-in that points outside itself: an opening back-reference word, a pronoun with nothing before it to refer to, a demonstrative with a noun not named earlier, "the former", "the following", "doing so", "as noted above", "the term" or "the name" followed directly by its verb, a "his" or "her" that only a pronoun subject explains; in Greek a verb that opens the sentence without a subject and a possessive with no noun before it; and a cut fill-in that lost its finite verb. Reject a fill-in whose blank is one part of a longer proper name, or one item of a list of three or more.
-3. Reject a generic definition: no word that is rare among the pool's lead sentences; the answer's nationality with fewer than two such words; a kind-of-word head noun without its meaning; a vague quantifier opener or "a part of a larger ...". A nationality on a kind-of-word head is a language and does not count as the answer's.
-4. Reject clues below the minimum word count (3 for a definition, 6 for a fill-in) as too vague.
+A clue is rejected when it gives the answer away, points outside itself, is generic or is too short.
 
 #### Pass 4: Order and Diversity
 
-1. The definition comes first, a person's joined definition included; among fill-ins whole sentences win, then the seed's, then the sentence that shares the most with the intro of the answer's own page (each shared word weighted by its rarity among the pool's lead sentences); a definition cut from the second sentence alone comes last, and after it a person's thin definition with the given names and a blank.
-2. Bucket fill-in clues by their first 3 tokens and keep at most 2 per bucket across the puzzle.
-3. No clue text and no source sentence is used twice.
+Definitions come before fill-ins and the fill-ins that share most with the answer's own page come first; no clue text, source sentence or opening repeats too often across the puzzle.
 
 #### Outputs
 
