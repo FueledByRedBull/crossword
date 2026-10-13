@@ -312,6 +312,7 @@ def run_candidate_scoring_stage(
     max_two_hop_parents: int | None = None,
     max_two_hop_links: int | None = None,
     max_candidates: int | None = None,
+    backlink_titles: list[str] | None = None,
     extra_titles: list[str] | None = None,
     weights: dict[str, float] | None = None,
     lexicon_path: str | Path | None = "data/lexicon/combined_wordfreq.txt",
@@ -336,8 +337,13 @@ def run_candidate_scoring_stage(
     )
 
     candidates = seed_result.diagnostics.get("candidates", [])
-    if candidates:  # two-hop pages: the seed does not link them, so no back-link
-        candidates = candidates + [{"title": t, "depth": 2, "links_back_to_seed": False} for t in extra_titles or []]
+    if candidates:
+        # Pages that link to the seed are one hop away; two-hop pages are not linked by the seed, so no back-link.
+        candidates = (
+            candidates
+            + [{"title": t, "depth": 1, "links_back_to_seed": True} for t in backlink_titles or []]
+            + [{"title": t, "depth": 2, "links_back_to_seed": False} for t in extra_titles or []]
+        )
     if not candidates:
         return _empty_scoring_result(
             seed_title, lang, seed_result.diagnostics.get("errors", []), weights, diagnostics_path, scores_path
@@ -361,6 +367,8 @@ def run_candidate_scoring_stage(
     titles = [seed_title]
     term_answer_inventories: list[set[str]] = []
     intro_on_topic: list[bool] = []
+    mentions_it: list[bool] = []
+    backlink_only = set(backlink_titles or [])
     seed_mentions: list[int] = []
     for candidate in candidates:
         title = candidate["title"]
@@ -370,10 +378,18 @@ def run_candidate_scoring_stage(
         texts.append(extract)
         # A derived form ("Roman") counts only where the page is defined; later on it is a passing mention.
         first_sentence = (split_sentences(extract) or [""])[0]
-        intro_on_topic.append(
-            _uses_seed_word(extract, seed_title, lang=lang, lexicon=lexicon)
-            or _uses_seed_word(first_sentence, seed_title, lang=lang, lexicon=lexicon, derived=True)
+        # A page that merely links to the seed is about it only when its first sentence uses a seed word, and a page
+        # that mentions it (second tier, like the pages the seed names) when a later sentence does.
+        in_intro = _uses_seed_word(extract, seed_title, lang=lang, lexicon=lexicon)
+        in_first = _uses_seed_word(first_sentence, seed_title, lang=lang, lexicon=lexicon) or _uses_seed_word(
+            first_sentence, seed_title, lang=lang, lexicon=lexicon, derived=True
         )
+        if title in backlink_only:
+            intro_on_topic.append(in_first)
+            mentions_it.append(in_intro and not in_first)
+        else:
+            intro_on_topic.append(in_intro or in_first)
+            mentions_it.append(False)
         if intro_on_topic[-1]:
             seed_mentions.append(_seed_mentions(title, seed_text, lang=lang))
         else:
@@ -408,7 +424,10 @@ def run_candidate_scoring_stage(
 
     # A linked page is on topic when its intro uses a seed word or the seed article names it twice. Pages whose
     # intro does is first, then pages the seed merely names, then the rest; MMR order within each group (stable).
-    group = [0 if intro else 1 if mentions >= 2 else 2 for intro, mentions in zip(intro_on_topic, seed_mentions)]
+    group = [
+        0 if intro else 1 if mentions >= 2 or mentioned else 2
+        for intro, mentions, mentioned in zip(intro_on_topic, seed_mentions, mentions_it)
+    ]
     ranked.sort(key=lambda row: group[int(row["index"])])
 
     ranked_indices = [int(row["index"]) for row in ranked]

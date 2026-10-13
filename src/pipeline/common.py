@@ -182,9 +182,11 @@ def _uses_seed_word(text: str, seed_title: str, *, lang: str, lexicon: dict[str,
     if len(set(scores)) > 1:  # the rarest word names the topic: "Rome", not "ancient", in "Ancient Rome"
         seed_words = [seed_words[scores.index(min(scores))]]
     # A shared stem, not shared letters: thermodynamic/thermodynamics, but not thermostat or Romania/Rome.
-    # `derived` also takes a short stem with at most two more letters: roman/rome.
+    # `derived` also takes a short stem with at most two more letters: roman/rome. A Greek noun in -ία changes its
+    # last two letters in the agent noun and the adjective, so it shares one letter less: φιλοσοφία/φιλόσοφος.
     return any(
-        len(os.path.commonprefix([word, seed])) >= max(3 if derived else 4, len(seed) - 1)
+        len(os.path.commonprefix([word, seed]))
+        >= max(3 if derived else 4, len(seed) - (2 if lang == "el" and seed.endswith("ια") else 1))
         and (not derived or len(word) <= len(seed) + 2)
         for word in set(tokenize(text, lang=lang))
         for seed in seed_words

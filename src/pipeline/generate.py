@@ -15,10 +15,13 @@ from .packaging import run_layout_stage, run_packaging_stage
 
 
 # Widening for a thin seed: link lists of at most 6 selected articles (one request each), at most 100 new pages
-# (five intro batches of 20), 6 of them selected.
+# (five intro batches of 20), 6 of them selected. Pages that link to the seed: at most 300 new ones (15 intro
+# batches of 20). The 6 best new on-topic pages join the selection and further ones replace selected articles that
+# were cut.
 _RESCUE_PARENTS = 6
 _RESCUE_NEW_PAGES = 100
 _RESCUE_SELECTED = 6
+_RESCUE_BACKLINKS = 300
 
 
 def _linked_titles(client: WikiClient, parents: list[str], known: set[str], errors: list[str]) -> list[str]:
@@ -80,6 +83,39 @@ def _next_ranked_titles(candidate_scores_path: str | Path, selected_titles: list
             if len(promoted) >= 3:
                 break
     return promoted
+
+
+def _join_new_pages(selected_titles: list[str], scores: list[dict], new_titles: set[str]) -> list[str]:
+    """The selection after a widening step: the best 6 new pages that are not cut join it, and each further one
+    replaces a selected article the scores cut, the last selected first."""
+    fresh = [row["title"] for row in scores if row["title"] in new_titles and row["status"] != "CUT"]
+    cut = [title for title in selected_titles if any(r["title"] == title and r["status"] == "CUT" for r in scores)]
+    replacements = fresh[_RESCUE_SELECTED:][: len(cut)]
+    leaving = cut[len(cut) - len(replacements) :]
+    return [title for title in selected_titles if title not in leaving] + fresh[:_RESCUE_SELECTED] + replacements
+
+
+def _backlink_titles(
+    candidate_scores_path: str | Path,
+    seed_title: str,
+    lang: str,
+    cache_dir: str | Path,
+    max_backlinks: int | None,
+    errors: list[str],
+) -> list[str]:
+    """The pages that link to the seed and are not scored yet, an even sample of them when there are too many."""
+    client = WikiClient(DiskCache(cache_dir), api_base=f"https://{lang}.wikipedia.org/w/api.php")
+    try:
+        resolved_title = client.fetch_links(seed_title)["seed_title"]  # as the seed stage asks, after redirects
+        backlinks = client.fetch_backlinks(resolved_title, max_backlinks=max_backlinks)
+    except RuntimeError as exc:
+        errors.append(f"backlink_fetch_failed:{exc}")
+        return []
+    known = {row["title"] for row in _read_csv_rows(candidate_scores_path)} | {seed_title, resolved_title}
+    fresh = sorted(backlinks - known)
+    if len(fresh) > _RESCUE_BACKLINKS:
+        fresh = [fresh[i * len(fresh) // _RESCUE_BACKLINKS] for i in range(_RESCUE_BACKLINKS)]
+    return fresh
 
 
 def _widening_titles(
@@ -211,22 +247,44 @@ def run_rescue_ladder(
     if gate.passed:
         return _finish(True, "promote_next_ranked", gate)
 
-    # Two-hop: the pages the on-topic selected articles link to are scored like the seed's own links. The best
-    # join the selected articles and all of them can be answers. Without the scoring arguments nothing can be scored.
+    # A stub article links mostly to sibling topics, but the pages that link to it are on topic: the unscored ones are
+    # scored as one-hop pages. The best join the selected articles and all of them can be answers. Without the
+    # scoring arguments, or with backlinks off, nothing is scored.
+    backlink_titles: list[str] = []
+    if scoring_args is not None and scoring_args.get("include_backlinks", True):
+        backlink_titles = _backlink_titles(
+            candidate_scores_path, seed_title, lang, cache_dir, scoring_args.get("max_backlinks"), errors
+        )
+    steps.append({"action": "widen_from_backlinks", "value": len(backlink_titles)})
+    if backlink_titles:
+        widened = run_candidate_scoring_stage(
+            **scoring_args,
+            backlink_titles=backlink_titles,
+            diagnostics_path=Path(diagnostics_path).with_name("diagnostics_scores_rescue.json"),
+            scores_path=Path(selected_override_path).with_name("candidate_scores_rescue.csv"),
+        )
+        candidate_scores_path = widened.scores_path
+        selected_titles = _join_new_pages(selected_titles, widened.scores, set(backlink_titles))
+        selected_path = _write_selected(Path(selected_override_path), selected_titles, seed_title, lang)
+        gate = _run_gate(min_df_value=1, min_len_value=min_len)
+        if gate.passed:
+            return _finish(True, "widen_from_backlinks", gate)
+
+    # Two-hop: the pages the on-topic selected articles link to are scored like the seed's own links, on top of the
+    # backlink pages. The best join the selected articles and all of them can be answers.
     if scoring_args is not None:
         extra_titles = _widening_titles(candidate_scores_path, selected_titles, seed_title, lang, cache_dir, errors)
         steps.append({"action": "widen_from_selected", "value": len(extra_titles)})
         if extra_titles:
             widened = run_candidate_scoring_stage(
                 **scoring_args,
+                backlink_titles=backlink_titles,
                 extra_titles=extra_titles,
                 diagnostics_path=Path(diagnostics_path).with_name("diagnostics_scores_rescue.json"),
                 scores_path=Path(selected_override_path).with_name("candidate_scores_rescue.csv"),
             )
             candidate_scores_path = widened.scores_path
-            selected_titles = selected_titles + [
-                row["title"] for row in widened.scores if row["depth"] == 2 and row["status"] != "CUT"
-            ][:_RESCUE_SELECTED]
+            selected_titles = _join_new_pages(selected_titles, widened.scores, set(extra_titles))
             selected_path = _write_selected(Path(selected_override_path), selected_titles, seed_title, lang)
             gate = _run_gate(min_df_value=1, min_len_value=min_len)
             if gate.passed:

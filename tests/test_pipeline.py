@@ -316,10 +316,14 @@ class PipelineTests(unittest.TestCase):
         extra_titles: list[str] | None = None,
         pages: dict[str, str] | None = None,
         max_len: int = 15,
+        backlink_titles: list[str] | None = None,
     ):
         intros = intros or self.ROME_INTROS
         pages = pages or {}  # a redirect: link title -> the title of the page it leads to
-        candidates = [{"title": title, "depth": 1, "links_back_to_seed": True} for title in list(intros)[1:]]
+        extras = [*(backlink_titles or []), *(extra_titles or [])]  # not linked by the seed
+        candidates = [
+            {"title": title, "depth": 1, "links_back_to_seed": True} for title in list(intros)[1:] if title not in extras
+        ]
         seed_result = SimpleNamespace(diagnostics={"candidates": candidates, "errors": []})
         seed_text = seed_text or "Hannibal crossed the Alps. Diocletian split the empire; later Diocletian retired."
         with (
@@ -340,6 +344,7 @@ class PipelineTests(unittest.TestCase):
                 diagnostics_path=Path(tmp) / "diagnostics.json",
                 scores_path=Path(tmp) / "scores.csv",
                 lexicon_path=None,
+                backlink_titles=backlink_titles,
                 extra_titles=extra_titles,
                 max_len=max_len,
             )
@@ -399,6 +404,32 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(csv_rows["Plankton"]["reason"], "cut_off_topic")
         self.assertEqual(csv_rows["Hannibal"]["depth"], "1")
 
+    def test_scoring_scores_backlink_titles_as_one_hop_pages_that_link_back(self) -> None:
+        intros = {**self.ROME_INTROS, "Roman law": "Roman law developed over centuries.", "Senate": "Rome had a senate."}
+        with tempfile.TemporaryDirectory() as tmp:
+            self.score_rome(tmp, intros, backlink_titles=["Senate"], extra_titles=["Roman law"])
+            with (Path(tmp) / "scores.csv").open(encoding="utf-8", newline="") as handle:
+                csv_rows = {row["title"]: row for row in csv.DictReader(handle)}
+
+        self.assertEqual((csv_rows["Senate"]["depth"], csv_rows["Senate"]["links_back_to_seed"]), ("1", "True"))
+        self.assertEqual((csv_rows["Roman law"]["depth"], csv_rows["Roman law"]["links_back_to_seed"]), ("2", "False"))
+
+    def test_scoring_ranks_a_backlink_page_by_whether_its_first_sentence_uses_the_seed_word(self) -> None:
+        late = "Plankton drifts. It was once studied in Rome."
+        intros = {**self.ROME_INTROS, "Senate": "Rome had a senate.", "Algae": late, "Plankton": late, "Reef": "Reefs form."}
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.score_rome(tmp, intros, backlink_titles=["Senate", "Plankton", "Reef"])
+            with (Path(tmp) / "scores.csv").open(encoding="utf-8", newline="") as handle:
+                csv_rows = {row["title"]: row for row in csv.DictReader(handle)}
+
+        order = [row["title"] for row in result.scores]
+        self.assertEqual([(csv_rows[t]["intro_on_topic"], csv_rows[t]["status"]) for t in ("Senate", "Plankton", "Reef")],
+                         [("True", "KEEP"), ("False", "KEEP"), ("False", "CUT")])
+        self.assertLess(order.index("Senate"), order.index("Plankton"))  # the second tier ranks after every on-topic page
+        self.assertLess(order.index("Plankton"), order.index("Reef"))
+        # A page the seed links itself stays on topic by a later sentence.
+        self.assertEqual(csv_rows["Algae"]["intro_on_topic"], "True")
+
     def test_linked_titles_takes_an_even_share_of_each_parents_new_links(self) -> None:
         client = MagicMock()
         client.fetch_links_concurrent.return_value = (
@@ -451,6 +482,8 @@ class PipelineTests(unittest.TestCase):
                     return_value=({"On": {"links": [{"title": "Heat"}, {"title": "Cold"}, {"title": "On"}]}}, {}),
                 ) as links,
                 patch("src.pipeline.generate.run_candidate_scoring_stage", return_value=widened) as rescore,
+                patch("src.wiki_client.WikiClient.fetch_links", return_value={"seed_title": "Seed"}),
+                patch("src.wiki_client.WikiClient.fetch_backlinks", return_value=set()),
             ):
                 result = run_rescue_ladder(
                     seed_title="Seed",
@@ -470,6 +503,160 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result["diagnostics"]["reason"], "widen_from_selected")
         self.assertEqual(selected, ["On", "Named", "Heat"])  # new pages that scoring did not cut
         self.assertEqual(terms.call_args.kwargs["scores_path"], widened.scores_path)
+
+    def run_backlink_ladder(
+        self,
+        tmp_dir: Path,
+        gates: list,
+        backlinks: set[str] | Exception,
+        scoring_args: dict | None,
+        scored: list,
+        selected: tuple[str, ...] = ("On", "Named"),
+    ):
+        """The ladder up to its backlink step: a scores CSV of On and Named, backlinks fetched or failing, and the
+        rescue scoring stage answering with the given results in turn. Returns the result, the stage mock and the
+        backlink fetch mock."""
+        (tmp_dir / "selected.json").write_text(json.dumps({"selected_titles": list(selected)}), encoding="utf-8")
+        (tmp_dir / "scores.csv").write_text(
+            "rank,title,depth,links_back_to_seed,rel_score,intro_on_topic,seed_mentions,status,reason\n"
+            "1,On,1,True,0.5,True,0,KEEP,x\n"
+            "2,Named,1,True,0.5,False,2,KEEP,x\n",
+            encoding="utf-8",
+        )
+        fetch = (
+            {"side_effect": backlinks} if isinstance(backlinks, Exception) else {"return_value": backlinks}
+        )
+        with (
+            patch("src.pipeline.generate.run_term_extraction_stage", return_value=SimpleNamespace(terms=[])),
+            patch("src.pipeline.generate.evaluate_vocab_gate", side_effect=gates),
+            patch("src.wiki_client.WikiClient.fetch_links", return_value={"seed_title": "Seed"}),
+            patch("src.wiki_client.WikiClient.fetch_backlinks", **fetch) as fetched,
+            patch(
+                "src.wiki_client.WikiClient.fetch_links_concurrent",
+                side_effect=lambda parents, max_links: (
+                    {parent: {"links": [{"title": "Heat"}, {"title": "Ion"}]} for parent in parents},
+                    {},
+                ),
+            ),
+            patch("src.pipeline.generate.run_candidate_scoring_stage", side_effect=scored) as rescore,
+        ):
+            result = run_rescue_ladder(
+                seed_title="Seed",
+                selected_path=tmp_dir / "selected.json",
+                terms_path=tmp_dir / "terms.csv",
+                diagnostics_path=tmp_dir / "diagnostics_rescue.json",
+                candidate_scores_path=tmp_dir / "scores.csv",
+                terms_diagnostics_path=tmp_dir / "diagnostics_terms_rescue.json",
+                selected_override_path=tmp_dir / "selected_rescue.json",
+                scoring_args=scoring_args,
+            )
+        return result, rescore, fetched
+
+    def test_rescue_ladder_widens_from_the_pages_that_link_to_the_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            widened = SimpleNamespace(
+                scores_path=tmp_dir / "candidate_scores_rescue.csv",
+                scores=[
+                    {"title": "Ion", "status": "KEEP"},
+                    {"title": "On", "status": "KEEP"},
+                    {"title": "Cold", "status": "CUT"},
+                    {"title": "Heat", "status": "KEEP"},
+                ],
+            )
+            gates = [SimpleNamespace(passed=False)] * 3 + [SimpleNamespace(passed=True)]
+            result, rescore, fetched = self.run_backlink_ladder(
+                tmp_dir, gates, {"Seed", "On", "Heat", "Cold", "Ion"}, {"seed_title": "Seed", "max_backlinks": 50}, [widened]
+            )
+            selected = json.loads((tmp_dir / "selected_rescue.json").read_text(encoding="utf-8"))["selected_titles"]
+
+        # The seed and the page the scores list are left out; the rest are scored in title order as backlink pages.
+        fetched.assert_called_once_with("Seed", max_backlinks=50)
+        self.assertEqual(rescore.call_args.kwargs["backlink_titles"], ["Cold", "Heat", "Ion"])
+        self.assertNotIn("extra_titles", rescore.call_args.kwargs)
+        self.assertEqual(result["diagnostics"]["reason"], "widen_from_backlinks")
+        self.assertEqual(result["diagnostics"]["steps"][-1], {"action": "widen_from_backlinks", "value": 3})
+        self.assertEqual(selected, ["On", "Named", "Ion", "Heat"])  # new pages in rank order, the cut one skipped
+
+    def test_rescue_ladder_replaces_cut_selected_articles_with_further_new_pages(self) -> None:
+        # The step before promotes On and Named into the selection; of 9 new pages two replace cut articles, of 7 one.
+        for new_count, kept, joined in ((9, ["K1", "K2"], 8), (7, ["K1", "C1", "K2"], 7)):
+            with self.subTest(new_count=new_count), tempfile.TemporaryDirectory() as tmp:
+                new = [f"n{i}" for i in range(1, new_count + 1)]
+                rows = [{"title": t, "status": "CUT" if t[0] == "C" else "KEEP"} for t in ("K1", "C1", "K2", "C2")]
+                widened = SimpleNamespace(
+                    scores_path=Path(tmp) / "scores.csv", scores=rows + [{"title": t, "status": "KEEP"} for t in new]
+                )
+                gates = [SimpleNamespace(passed=False)] * 3 + [SimpleNamespace(passed=True)]
+                self.run_backlink_ladder(
+                    Path(tmp), gates, set(new), {"seed_title": "Seed"}, [widened], selected=("K1", "C1", "K2", "C2")
+                )
+                selected = json.loads((Path(tmp) / "selected_rescue.json").read_text(encoding="utf-8"))["selected_titles"]
+
+            # The best 6 join; each further page takes the place of the last cut article, none leaves unreplaced.
+            self.assertEqual(selected, [*kept, "On", "Named", *new[:joined]])
+
+    def test_rescue_ladder_scores_an_even_sample_of_the_backlinks_above_the_cap(self) -> None:
+        backlinks = {f"b{i}" for i in range(10)} | {"On", "Seed"}
+        with tempfile.TemporaryDirectory() as tmp:
+            widened = SimpleNamespace(scores_path=Path(tmp) / "scores.csv", scores=[])
+            with patch("src.pipeline.generate._RESCUE_BACKLINKS", 4):
+                result, rescore, _ = self.run_backlink_ladder(
+                    Path(tmp), [SimpleNamespace(passed=False, term_count=0)] * 9, backlinks, {"seed_title": "Seed"}, [widened] * 2
+                )
+
+        self.assertEqual(rescore.call_args_list[0].kwargs["backlink_titles"], ["b0", "b2", "b5", "b7"])
+        self.assertEqual(result["diagnostics"]["steps"][2], {"action": "widen_from_backlinks", "value": 4})
+
+    def test_rescue_ladder_skips_the_backlink_step_without_scoring_arguments_or_backlinks(self) -> None:
+        cases = {
+            "no scoring arguments": (None, {"On"}),
+            "backlinks off": ({"seed_title": "Seed", "include_backlinks": False}, {"On"}),
+            "fetch fails": ({"seed_title": "Seed"}, RuntimeError("offline_cache_miss:w_api_query_backlinks")),
+        }
+        for name, (scoring_args, backlinks) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                forward = SimpleNamespace(scores_path=Path(tmp) / "scores.csv", scores=[])
+                result, rescore, fetched = self.run_backlink_ladder(
+                    Path(tmp), [SimpleNamespace(passed=False, term_count=0)] * 9, backlinks, scoring_args, [forward]
+                )
+
+                diagnostics = result["diagnostics"]
+                self.assertEqual(diagnostics["steps"][2], {"action": "widen_from_backlinks", "value": 0})
+                self.assertFalse(any(call.kwargs["backlink_titles"] for call in rescore.call_args_list))  # no page scored
+                self.assertEqual(fetched.called, name == "fetch fails")
+                self.assertEqual(
+                    diagnostics["errors"],
+                    ["backlink_fetch_failed:offline_cache_miss:w_api_query_backlinks"] if name == "fetch fails" else [],
+                )
+
+    def test_rescue_ladder_widens_from_selected_on_top_of_a_backlink_step_that_did_not_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            rescue_scores = tmp_dir / "candidate_scores_rescue.csv"
+            rescue_scores.write_text(
+                "rank,title,depth,links_back_to_seed,rel_score,intro_on_topic,seed_mentions,status,reason\n"
+                "1,On,1,True,0.5,True,0,KEEP,x\n"
+                "2,Ion,1,True,0.5,True,0,KEEP,x\n",
+                encoding="utf-8",
+            )
+            backlinked = SimpleNamespace(scores_path=rescue_scores, scores=[{"title": "Ion", "status": "KEEP"}])
+            forward = SimpleNamespace(
+                scores_path=rescue_scores, scores=[{"title": "Heat", "depth": 2, "status": "KEEP"}]
+            )
+            gates = [SimpleNamespace(passed=False)] * 4 + [SimpleNamespace(passed=True)]
+            result, rescore, _ = self.run_backlink_ladder(
+                tmp_dir, gates, {"Ion"}, {"seed_title": "Seed"}, [backlinked, forward]
+            )
+            selected = json.loads((tmp_dir / "selected_rescue.json").read_text(encoding="utf-8"))["selected_titles"]
+
+        # The backlink page stays in the second scoring as a one-hop page and is not a two-hop extra again.
+        self.assertEqual(rescore.call_args.kwargs["backlink_titles"], ["Ion"])
+        self.assertEqual(rescore.call_args.kwargs["extra_titles"], ["Heat"])
+        self.assertEqual(result["diagnostics"]["reason"], "widen_from_selected")
+        self.assertEqual([step["action"] for step in result["diagnostics"]["steps"][-2:]],
+                         ["widen_from_backlinks", "widen_from_selected"])
+        self.assertEqual(selected, ["On", "Named", "Ion", "Heat"])
 
     def test_scoring_counts_only_seed_mentions_of_the_answer_itself_for_a_page_with_an_off_topic_intro(self) -> None:
         intros = {
@@ -537,6 +724,18 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(uses("Homs is an ancient city.", "Ancient Rome", lexicon))
         self.assertTrue(uses("Homs is an ancient city.", "Ancient Rome"))
         self.assertTrue(uses("Rome was ancient.", "Ancient Rome", lexicon))
+
+    def test_seed_word_match_takes_the_agent_noun_and_adjective_of_a_greek_seed_in_ia(self) -> None:
+        def uses(text, seed, lang="el", derived=False):
+            return _uses_seed_word(text, seed, lang=lang, lexicon={}, derived=derived)
+
+        self.assertTrue(uses("Ήταν Γερμανός φιλόσοφος.", "Φιλοσοφία"))
+        self.assertTrue(uses("Ο σεισμολόγος μελετά.", "Σεισμολογία"))
+        self.assertTrue(uses("Ένας σεισμολογικός σταθμός.", "Σεισμολογία", derived=True))
+        # Another ending keeps the old stem: Φυσική needs "φυσικ"; "φυσιο" shares only len - 2 letters.
+        self.assertTrue(uses("Η φυσικός ιδιότητα.", "Φυσική"))
+        self.assertFalse(uses("Η φυσιολογία.", "Φυσική"))
+        self.assertFalse(uses("A thermostat.", "Thermodynamics", lang="en"))
 
     def test_k_selection_takes_on_topic_articles_first_and_falls_back_when_they_run_out(self) -> None:
         picks = {}
