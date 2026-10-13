@@ -293,7 +293,7 @@ Additional notes:
 
 ### 5.6 Step 6: Free-Form Layout
 
-Implemented in `src/layout.py`. Words are placed on a `size` x `size` grid so that they intersect where letters match; there are no templates, no black-square patterns, and no filler words.
+Implemented in two parts: the search is the Rust program `layout-rs/src/main.rs`; validity checks, metrics and the call to the program are in `src/layout.py`. Words are placed on a `size` x `size` grid so that they intersect where letters match; there are no templates, no black-square patterns, and no filler words.
 
 #### Validity Rules
 
@@ -304,7 +304,7 @@ Implemented in `src/layout.py`. Words are placed on a `size` x `size` grid so th
 #### Search
 
 1. Start from the highest-scoring answer and fill greedily: each step takes the legal placement with the best gain per newly used cell (one per word, a bonus per crossing, a bonus for a high answer score).
-2. Improve by simulated annealing over ruin-and-recreate steps: drop one to three random words and whatever they leave disconnected, refill, and keep the result unless it is worse than the current layout by more than a random allowance that cools to zero. `layout_restarts` scales the number of steps (25 each); the best layout seen wins. `layout_candidates` caps how many clued answers are offered to the layout.
+2. Improve by simulated annealing over ruin-and-recreate steps: drop one to three random words and whatever they leave disconnected, refill, and keep the result unless it is worse than the current layout by more than a random allowance that cools to zero. `layout_restarts` scales the number of steps (750 each, 72,000 at the default 96); the best layout seen wins. `layout_candidates` caps how many clued answers are offered to the layout.
 
 #### Outputs
 
@@ -344,8 +344,8 @@ This is required for reliable CC BY-SA attribution in published outputs.
    - Four-pass clue pipeline (including diversity) and leakage checks.
 7. `src/vocab_gate.py`:
    - Vocabulary readiness gate.
-8. `src/layout.py`:
-   - Free-form layout search, validity checks, layout metrics.
+8. `layout-rs/src/main.rs` and `src/layout.py`:
+   - Free-form layout search (Rust program), its call, validity checks, layout metrics.
 9. `src/render.py`:
    - Text rendering of `puzzle.json`.
 10. `src/provenance.py`:

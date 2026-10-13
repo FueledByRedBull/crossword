@@ -1,0 +1,12 @@
+[package]
+name = "crossword-layout"
+version = "0.1.0"
+edition = "2021"
+description = "Free-form crossword layout search used by src/layout.py"
+
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"

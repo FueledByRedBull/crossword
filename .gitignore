@@ -74,3 +74,4 @@ tests/tmp_outputs/
 .ignore
 .claude/
 data/lexicon/hunspell-en_US-large-*/
+layout-rs/target/

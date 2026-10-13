@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import itertools
-import math
-import random
+import os
+import subprocess
 from collections import Counter
 from dataclasses import dataclass
-from heapq import heappop, heappush
-from typing import Iterable, Sequence
+from pathlib import Path
+from typing import Sequence
 
 EMPTY = "#"
 ACROSS = "across"
@@ -15,30 +14,20 @@ DOWN = "down"
 _BLANKS = (EMPTY, ".")
 _MIN_WORD_LEN = 3
 
-# A cell is the int row * _ROW + col, so its neighbours are +-1 and +-_ROW. The row is so wide that
-# a column cannot wrap into the next row however far the board drifts while the search moves it.
-_ROW_BITS = 32
-_ROW = 1 << _ROW_BITS
-_COL_MASK = _ROW - 1
-_ORIGIN = (_ROW // 2) * (_ROW + 1)
+# The search is the layout-rs program: simulated annealing over ruin-and-recreate steps, `restarts`
+# times this many of them (see layout-rs/src/main.rs). It runs about 15,000 steps a second, so the
+# default 96 restarts (72,000 steps) take about 4 s on an 80-candidate list. More steps keep paying,
+# slowly: mean over 21 candidate lists and 3 seeds at 96 restarts, value = words + 1.5 * crossings
+# + 3 * the squared normalised scores of the placed answers,
+#   steps per restart   25     250    750    2,500
+#   words               21.5   22.2   22.4   22.5
+#   crossings           26.3   28.3   29.3   29.7
+#   value               78.7   82.8   84.1   85.3
+# and on 8 of the lists going from 2,500 to 25,000 added about 0.4 words, 0.5 crossings and 1.8 value.
+_STEPS_PER_RESTART = 750
 
-# Search value of a layout: 1 per word, a bonus per crossing, and a bonus per answer score squared.
-# Scores are scaled to 0..1, so only the top answers earn much: one outweighs a word or two.
-_CROSSING_VALUE = 1.5
-_SCORE_VALUE = 3.0
-
-# Simulated annealing over ruin-and-recreate steps: each step drops 1.._RUIN_MAX random words,
-# refills greedily, and keeps the result unless it is worse than the current board by more than a
-# random allowance that cools linearly from _START_TEMPERATURE to zero. A step takes about 2 ms and
-# ten times the default step count gains only a fraction of a word, so `restarts` scales the length
-# of this one run instead of starting independent ones.
-_STEPS_PER_RESTART = 25
-_RUIN_MAX = 3
-_START_TEMPERATURE = 3.0
-
-# Refill takes the legal placement with the best value per newly used cell (square-rooted, so long
-# answers are not ruled out), raised by a random factor of up to 1 + _PICK_NOISE so refills differ.
-_PICK_NOISE = 1.0
+_CRATE = Path(__file__).resolve().parents[1] / "layout-rs"
+_BINARY = _CRATE / "target" / "release" / ("crossword-layout.exe" if os.name == "nt" else "crossword-layout")
 
 
 @dataclass(frozen=True)
@@ -222,234 +211,42 @@ def layout_metrics(
     }
 
 
-class _Board:
-    """Sparse board with unbounded coordinates, built from and cut back by whole words.
-
-    Invariant: the board is always a valid layout, so a move only needs local checks.
-    """
-
-    def __init__(self, span: int) -> None:
-        self.span = span
-        self.letters: dict[int, str] = {}
-        self.owner: dict[bool, dict[int, str]] = {True: {}, False: {}}  # keyed by across
-        self.placed: dict[str, tuple[int, bool]] = {}  # answer -> (start cell, across)
-        self.crossings = 0
-        self.bounds = (0, 0, 0, 0)  # min_row, max_row, min_col, max_col
-
-    def cells(self, word: str) -> list[int]:
-        pos, across = self.placed[word]
-        step = 1 if across else _ROW
-        return [pos + step * i for i in range(len(word))]
-
-    def fit(self, word: str, pos: int, across: bool) -> int | None:
-        """Return the crossings `word` would make from `pos`, or None if the move is illegal."""
-        n = len(word)
-        lo_r, hi_r, lo_c, hi_c = self.bounds
-        reach = self.span - 1
-        r, c = pos >> _ROW_BITS, pos & _COL_MASK
-        if across:
-            step, side = 1, _ROW
-            if r < hi_r - reach or r > lo_r + reach or c < hi_c - reach or c + n - 1 > lo_c + reach:
-                return None
-        else:
-            step, side = _ROW, 1
-            if c < hi_c - reach or c > lo_c + reach or r < hi_r - reach or r + n - 1 > lo_r + reach:
-                return None
-        letters, mine = self.letters, self.owner[across]
-        if pos - step in letters or pos + step * n in letters:
-            return None
-        crossings = 0
-        for ch in word:
-            have = letters.get(pos)
-            if have is None:
-                if pos + side in letters or pos - side in letters:
-                    return None
-            elif have != ch or pos in mine:
-                return None
-            else:
-                crossings += 1
-            pos += step
-        return crossings or None
-
-    def anchors(self, cells: Iterable[int]) -> dict[str, dict[int, bool]]:
-        """Single-owner cells by letter; the value says whether a crossing word runs across."""
-        down = self.owner[False]
-        found: dict[str, dict[int, bool]] = {}
-        for pos in cells:
-            if (pos in self.owner[True]) != (pos in down):
-                found.setdefault(self.letters[pos], {})[pos] = pos in down
-        return found
-
-    def moves(self, word: str, anchors: dict[str, dict[int, bool]]) -> list[tuple[int, int, bool]]:
-        """Legal (crossings, start cell, across) placements of `word` through the given anchors."""
-        found = []
-        for i, ch in enumerate(word):
-            for anchor, across in anchors.get(ch, {}).items():
-                pos = anchor - i if across else anchor - i * _ROW
-                crossings = self.fit(word, pos, across)
-                if crossings:
-                    found.append((crossings, pos, across))
-        return found
-
-    def place(self, word: str, pos: int, across: bool) -> None:
-        step = 1 if across else _ROW
-        mine = self.owner[across]
-        self.placed[word] = (pos, across)
-        for ch in word:
-            if pos in self.letters:
-                self.crossings += 1
-            else:
-                self.letters[pos] = ch
-            mine[pos] = word
-            pos += step
-        self._rebound()
-
-    def remove(self, word: str) -> dict[str, tuple[int, bool]]:
-        """Take `word` off, and with it any word its crossings would leave touching a neighbour.
-
-        Two crossing words that sit side by side are only legal while the word across their
-        ends is there. Return every word taken off, with where it stood.
-        """
-        gone: dict[str, tuple[int, bool]] = {}
-        doomed = [word]
-        for name in doomed:  # the loop also visits words appended meanwhile
-            pos, across = gone[name] = self.placed.pop(name)
-            step = 1 if across else _ROW
-            mine, theirs = self.owner[across], self.owner[not across]
-            kept = []
-            for _ in name:
-                del mine[pos]
-                if pos in theirs:
-                    self.crossings -= 1
-                    kept.append(pos)
-                else:
-                    del self.letters[pos]
-                pos += step
-            for pos in kept:
-                if pos - step in self.letters and theirs[pos] not in doomed:
-                    doomed.append(theirs[pos])
-        if self.placed:
-            self._rebound()
-        return gone
-
-    def _rebound(self) -> None:
-        spans = []
-        for word, (pos, across) in self.placed.items():
-            r, c = pos >> _ROW_BITS, pos & _COL_MASK
-            end = len(word) - 1
-            spans.append((r, r if across else r + end, c, c + end if across else c))
-        lo_r, hi_r, lo_c, hi_c = zip(*spans)
-        self.bounds = (min(lo_r), max(hi_r), min(lo_c), max(hi_c))
-
-    def components(self) -> list[list[str]]:
-        """Groups of words joined by crossings."""
-        seen: set[str] = set()
-        groups = []
-        for first in self.placed:
-            if first in seen:
-                continue
-            seen.add(first)
-            group = [first]
-            for word in group:  # the loop also visits words appended meanwhile
-                theirs = self.owner[not self.placed[word][1]]
-                for cell in self.cells(word):
-                    other = theirs.get(cell)
-                    if other is not None and other not in seen:
-                        seen.add(other)
-                        group.append(other)
-            groups.append(group)
-        return groups
-
-    def value(self, scores: dict[str, float]) -> float:
-        return (
-            len(self.placed)
-            + _CROSSING_VALUE * self.crossings
-            + _SCORE_VALUE * sum(scores[word] for word in self.placed)
-        )
+def _binary() -> Path:
+    """The layout-rs program, built first when it is missing or older than its sources."""
+    sources = [_CRATE / "Cargo.toml", *(_CRATE / "src").rglob("*.rs")]
+    if _BINARY.exists() and _BINARY.stat().st_mtime >= max(path.stat().st_mtime for path in sources):
+        return _BINARY
+    command = ["cargo", "build", "--release", "--offline", "--manifest-path", str(_CRATE / "Cargo.toml")]
+    try:
+        build = subprocess.run(command, capture_output=True, encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        raise RuntimeError(
+            "the layout search is a Rust program and needs cargo to build it: install a Rust toolchain from https://rustup.rs"
+        ) from None
+    if build.returncode:
+        tail = "\n".join(build.stderr.strip().splitlines()[-15:])
+        raise RuntimeError(f"building layout-rs failed ({' '.join(command)}):\n{tail}")
+    return _BINARY
 
 
-def _refill(
-    board: _Board, words: Sequence[str], scores: dict[str, float], rng: random.Random, limit: int
-) -> list[str]:
-    """Place unused words best-first until none fits; return them in placement order.
-
-    One scan finds every legal move; after that a placement only adds the moves that cross its own
-    new letters, and stale moves are re-checked when they come off the heap.
-    """
-    heap: list[tuple[float, int, str, int, bool]] = []
-    ticket = itertools.count()  # unique, so equal gains never compare words
-    placed = board.placed
-    unused = [word for word in words if word not in placed]
-
-    def offer(word: str, anchors: dict[str, dict[int, bool]]) -> None:
-        for crossings, pos, across in board.moves(word, anchors):
-            gain = 1 + _CROSSING_VALUE * crossings + _SCORE_VALUE * scores[word]
-            gain /= math.sqrt(max(len(word) - crossings, 1))
-            gain *= 1 + _PICK_NOISE * rng.random()
-            heappush(heap, (-gain, next(ticket), word, pos, across))
-
-    everywhere = board.anchors(board.letters)
-    for word in unused:
-        offer(word, everywhere)
-    added = []
-    while heap and len(placed) < limit:
-        _, _, word, pos, across = heappop(heap)
-        if word in placed or board.fit(word, pos, across) is None:
-            continue
-        board.place(word, pos, across)
-        added.append(word)
-        fresh = board.anchors(board.cells(word))
-        for other in unused:
-            if other not in placed:
-                offer(other, fresh)
-    return added
+def _search(words: Sequence[str], scores: Sequence[float], size: int, seed: int, steps: int, limit: int) -> list[Placement]:
+    """Run the layout-rs search on words already ordered best first; limit 0 means no cap."""
+    lines = [f"{size} {seed % 2**64} {steps} {limit}"]
+    for word, score in zip(words, scores):
+        if "\t" in word or "\n" in word:
+            raise ValueError(f"answer {word!r} contains a tab or newline")
+        lines.append(f"{score!r}\t{word}")
+    done = subprocess.run([str(_binary())], input="\n".join(lines).encode("utf-8") + b"\n", capture_output=True)
+    if done.returncode:
+        raise RuntimeError(f"layout-rs exited with status {done.returncode}: {done.stderr.decode('utf-8', 'replace').strip()}")
+    placements = []
+    for line in filter(None, done.stdout.decode("utf-8").split("\n")):
+        answer, row, col, direction = line.rsplit("\t", 3)
+        placements.append(Placement(answer, int(row), int(col), ACROSS if direction == "A" else DOWN))
+    return placements
 
 
-def _search(
-    words: Sequence[str],
-    scores: dict[str, float],
-    size: int,
-    rng: random.Random,
-    steps: int,
-    limit: int,
-) -> dict[str, tuple[int, bool]]:
-    board = _Board(size)
-    board.place(words[0], _ORIGIN, True)
-    _refill(board, words, scores, rng, limit)
-    value = board.value(scores)
-    best_value, best = value, dict(board.placed)
-    for step in range(steps):
-        if len(board.placed) < 2:
-            break
-        temperature = _START_TEMPERATURE * (1 - step / steps)
-        dropped = {}
-        ruined = rng.randint(1, min(_RUIN_MAX, len(board.placed) - 1))
-        for word in rng.sample(list(board.placed), ruined):
-            if word in board.placed:  # an earlier removal may have taken it along
-                dropped.update(board.remove(word))
-        groups = sorted(board.components(), key=len, reverse=True)
-        for word in (word for group in groups[1:] for word in group):  # cut off from the main group
-            if word in board.placed:
-                dropped.update(board.remove(word))
-        added = _refill(board, words, scores, rng, limit)
-        trial = board.value(scores)
-        if trial >= value + temperature * math.log(1 - rng.random()):
-            value = trial
-            if value > best_value:
-                best_value, best = value, dict(board.placed)
-        else:
-            for word in reversed(added):
-                board.remove(word)
-            for word, (pos, across) in dropped.items():
-                board.place(word, pos, across)
-    return best
-
-
-def _to_layout(placed: dict[str, tuple[int, bool]], size: int) -> Layout:
-    raw = [
-        Placement(word, pos >> _ROW_BITS, pos & _COL_MASK, ACROSS if across else DOWN)
-        for word, (pos, across) in placed.items()
-    ]
+def _to_layout(raw: Sequence[Placement], size: int) -> Layout:
     cells = [cell for p in raw for cell in _cells(p)]
     row_off = col_off = 0
     if cells:
@@ -479,12 +276,11 @@ def build_layout(
             best_score[answer] = max(score, best_score.get(answer, score))
     ordered = sorted(best_score.items(), key=lambda item: (-item[1], item[0]))
     if not ordered:
-        return _to_layout({}, size)
+        return _to_layout([], size)
 
     low, high = ordered[-1][1], ordered[0][1]
     spread = high - low
-    scores = {w: ((s - low) / spread if spread else 1.0) ** 2 for w, s in ordered}
-    limit = max_words if max_words is not None else len(ordered)
+    scores = [((s - low) / spread if spread else 1.0) ** 2 for _, s in ordered]
+    limit = max(max_words, 1) if max_words is not None else 0  # the first word is always placed
     steps = max(restarts, 1) * _STEPS_PER_RESTART
-    rng = random.Random(random_seed)
-    return _to_layout(_search([w for w, _ in ordered], scores, size, rng, steps, limit), size)
+    return _to_layout(_search([w for w, _ in ordered], scores, size, random_seed, steps, limit), size)

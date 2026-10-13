@@ -1,4 +1,3 @@
-import copy
 import os
 import random
 import subprocess
@@ -10,7 +9,6 @@ from unittest import mock
 from src import layout as layout_module
 from src.layout import (
     Placement,
-    _Board,
     build_layout,
     number_placements,
     validate_layout,
@@ -97,29 +95,17 @@ class BuildLayoutTests(unittest.TestCase):
             build_layout(THERMODYNAMICS, restarts=8), build_layout(THERMODYNAMICS, restarts=8)
         )
 
-    def test_real_sized_list_is_valid_and_denser_than_the_old_search(self) -> None:
+    def test_real_sized_list_is_valid_and_dense(self) -> None:
         layout = build_layout(THERMODYNAMICS)
         self.assertEqual(validate_layout(layout.grid, layout.placements), [])
         metrics = layout.metrics
-        # The greedy-and-polish search this replaced placed 18 words with 21 crossings on this list.
+        # The greedy-and-polish search this replaced placed 18 words with 21 crossings on this list;
+        # this one places 19 to 21 words with 25 to 29 crossings over seeds 0 to 7.
         self.assertGreaterEqual(metrics["word_count"], 19)
-        self.assertGreaterEqual(metrics["crossing_count"], 21)
+        self.assertGreaterEqual(metrics["crossing_count"], 25)
         placed = {p.answer for p in layout.placements}
         top_ten = [answer for answer, _ in sorted(THERMODYNAMICS, key=lambda c: -c[1])[:10]]
         self.assertGreaterEqual(sum(answer in placed for answer in top_ten), 6)
-
-    def test_search_improves_on_its_first_greedy_fill(self) -> None:
-        for seed in range(3):
-            with self.subTest(seed=seed):
-                with mock.patch.object(layout_module, "_STEPS_PER_RESTART", 0):
-                    plain = build_layout(THERMODYNAMICS, random_seed=seed)
-                searched = build_layout(THERMODYNAMICS, random_seed=seed, restarts=24)
-                self.assertGreater(searched.metrics["word_count"], plain.metrics["word_count"])
-
-    def test_search_work_is_a_fixed_number_of_steps(self) -> None:
-        with mock.patch.object(layout_module, "_refill", wraps=layout_module._refill) as refill:
-            build_layout(THERMODYNAMICS, restarts=2)
-        self.assertEqual(refill.call_count, 1 + 2 * layout_module._STEPS_PER_RESTART)
 
     def test_bad_candidates_are_ignored(self) -> None:
         layout = build_layout(
@@ -134,55 +120,27 @@ class BuildLayoutTests(unittest.TestCase):
         self.assertEqual(len(layout.placements), 5)
         self.assertEqual(validate_layout(layout.grid, layout.placements), [])
 
+    def test_answer_with_a_tab_or_newline_is_a_programming_error(self) -> None:
+        for answer in ("CA\tT", "CA\nT"):
+            with self.subTest(answer=answer), self.assertRaises(ValueError):
+                build_layout([(answer, 1.0), ("CAT", 0.5)], size=5)
+
+    def test_missing_cargo_or_failed_build_is_a_clear_error(self) -> None:
+        missing = Path("no-such-dir") / "crossword-layout"
+        with mock.patch.object(layout_module, "_BINARY", missing):
+            with mock.patch.object(layout_module.subprocess, "run", side_effect=FileNotFoundError("cargo")):
+                with self.assertRaisesRegex(RuntimeError, "cargo"):
+                    build_layout([("CAT", 1.0), ("TAR", 0.5)], size=5)
+            failed = subprocess.CompletedProcess(["cargo"], 101, stdout="", stderr="warning: x\nerror: no such crate")
+            with mock.patch.object(layout_module.subprocess, "run", return_value=failed):
+                with self.assertRaisesRegex(RuntimeError, "error: no such crate"):
+                    build_layout([("CAT", 1.0), ("TAR", 0.5)], size=5)
+
     def test_unplaceable_input_returns_what_it_has(self) -> None:
         self.assertEqual(build_layout([]).placements, [])
         single = build_layout([("CAT", 1.0)], size=5)
         self.assertEqual([p.answer for p in single.placements], ["CAT"])
         self.assertTrue(validate_layout(single.grid, single.placements))
-
-
-class BoardTests(unittest.TestCase):
-    def test_remove_undoes_place(self) -> None:
-        board = _Board(15)
-        board.place("CAT", layout_module._ORIGIN, True)
-        board.place("CAR", layout_module._ORIGIN, False)
-        before = copy.deepcopy(vars(board))
-        board.place("TOE", layout_module._ORIGIN + 2, False)
-        self.assertEqual(board.crossings, 2)
-        board.remove("TOE")
-        self.assertEqual(vars(board), before)
-
-    def test_fit_refuses_words_running_alongside_or_past_the_span(self) -> None:
-        board = _Board(3)
-        board.place("CAT", layout_module._ORIGIN, True)
-        board.place("CAR", layout_module._ORIGIN, False)
-        self.assertIsNone(board.fit("ARE", layout_module._ORIGIN + 1, False))
-        self.assertEqual(board.fit("TOE", layout_module._ORIGIN + 2, False), 1)
-        self.assertIsNone(board.fit("TOES", layout_module._ORIGIN + 2, False))
-
-    def test_remove_never_leaves_letters_touching_side_by_side(self) -> None:
-        origin, row = layout_module._ORIGIN, layout_module._ROW
-        board = _Board(15)
-        board.place("BELL", origin, True)
-        board.place("PHASE", origin + 1 - 4 * row, False)  # ends on BELL's E
-        board.place("LIGHT", origin + 2, False)  # starts on BELL's L, one column over
-
-        def problems() -> list[str]:
-            layout = layout_module._to_layout(board.placed, 15)
-            return validate_layout(layout.grid, layout.placements)
-
-        self.assertEqual(problems(), [])
-        board.remove("BELL")
-        self.assertEqual([p for p in problems() if "non-word" in p], [])
-
-    def test_components_split_when_a_bridge_word_goes(self) -> None:
-        board = _Board(15)
-        board.place("CAT", layout_module._ORIGIN, True)
-        board.place("TOE", layout_module._ORIGIN + 2, False)
-        board.place("EAR", layout_module._ORIGIN + 2 * layout_module._ROW, True)
-        self.assertEqual(len(board.components()), 1)
-        board.remove("TOE")
-        self.assertEqual(sorted(sorted(group) for group in board.components()), [["CAT"], ["EAR"]])
 
 
 class ValidateLayoutTests(unittest.TestCase):
