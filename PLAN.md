@@ -1,6 +1,6 @@
 # Wikipedia-Seeded Thematic Crossword Generator
 
-This document is target scope and backlog, not a statement that every item below is implemented or continuously validated today.
+This document is the design and the target scope, not a statement that every item below is implemented or continuously validated today. Not implemented: a lightweight-embedding backend and larger spaCy model profiles (sections 5.2 and 5.4), an adaptive `min_df` (the default is a fixed 2), and Wikidata entity-type preference by default (it is opt-in with `--entity-type-scoring`). What the program does today is described in the [README](README.md) and in [docs/how-it-works.md](docs/how-it-works.md).
 
 ## 1. Goal and Scope
 
@@ -30,6 +30,7 @@ The system should optimize for thematic coherence, layout quality, clue quality,
 10. Lay out the clued answers in a free-form grid (no templates, no filler words).
 11. Render a puzzle as text (`py -3 cli.py render --puzzle <path>`).
 12. Emit puzzle, diagnostics, and attribution/provenance artifacts.
+13. Export a puzzle as an ipuz file or a printable HTML page (`py -3 cli.py export --puzzle <path> --format ipuz|html --output <path>`).
 
 ### Non-Functional Requirements
 
@@ -140,7 +141,7 @@ Held-out seeds: `data/benchmarks/held_out.json` holds the same kind of fixture f
 #### Vectorization
 
 1. Baseline: TF-IDF on seed + candidate corpus.
-2. Optional backend: lightweight embeddings for robustness.
+2. Optional backend: lightweight embeddings for robustness (not implemented).
 
 #### Core Scores
 
@@ -157,16 +158,16 @@ Held-out seeds: `data/benchmarks/held_out.json` holds the same kind of fixture f
 
 `score(i) = a * rel(i) - b * red(i) - c * depth_pen(i) + d * back(i)`
 
-#### Weight Defaults (BASELINE_V1)
+#### Weight Defaults
 
 | Weight | Default | Rationale |
 |--------|---------|--------------------------------------------|
-| `a`    | 1.0     | Relevance is the primary signal |
-| `b`    | 0.5     | Redundancy penalty is half as strong |
+| `a`    | 1.5     | Relevance is the primary signal |
+| `b`    | 0.3     | Redundancy penalty for similarity to pages already ranked |
 | `c`    | 0.3     | Depth is a light penalty |
 | `d`    | 0.2     | Backlink is a light bonus |
 
-Document as `BASELINE_V1` in config. Tune by hand against benchmark seeds before running a grid search.
+The defaults are set in `run_candidate_scoring_stage` (`src/pipeline/scoring.py`) and written to `diagnostics_scores.json`; `scripts/tune_weights.py` grid-searches them.
 
 Notes:
 
@@ -189,7 +190,7 @@ Choose `K` with diminishing returns:
 
 `J(K) = w1*coherence + w2*diversity + w3*term_quality`
 
-#### J(K) Weight Defaults (BASELINE_V1)
+#### J(K) Weight Defaults
 
 `w1 = w2 = w3 = 1.0`. Rationale: equal weight on the three quality signals.
 
@@ -205,7 +206,7 @@ Choose `K` with diminishing returns:
 
 If `J(K)` plateaus but the vocabulary readiness gate is not satisfied, apply the following steps in order, stopping as soon as the gate passes:
 
-1. Loosen `min_df` to `1` (from adaptive default).
+1. Loosen `min_df` to `1` (from the default 2).
 2. Promote the next 3 on-topic candidates by rank that are not selected yet into the selected set (`promote_next_ranked` in the diagnostics).
 3. Widen from the pages that link to the seed (`widen_from_backlinks`): score the ones not scored yet as one-hop pages (an even sample of at most 300; those whose first sentence uses a seed word rank first and are the ones selected and used as clue sources; the others that use it in a later sentence can still be answers, unless the only use is another form of the word that the tagger calls an adverb), let the best 6 not cut join the selected articles (further ones replace selected articles that were cut), and let all of them be answers.
 4. Widen from the selected articles: score the pages linked from at most 6 selected articles whose intro is on topic (an even sample of each one's links, at most 100 new pages), let the best 6 join the selected articles (further ones replace selected articles that were cut), and let all of them be answers.
@@ -238,7 +239,7 @@ If `J(K)` plateaus but the vocabulary readiness gate is not satisfied, apply the
 
 Additional notes:
 
-1. Optional quality profile: upgrade to `en_core_web_md` / `el_core_news_md` when higher recall is needed.
+1. Only the `sm` models are wired in. Upgrading to `en_core_web_md` / `el_core_news_md` for higher recall is not implemented.
 2. Greek leakage check must rely on spaCy's Greek lemmatizer rather than simple stemming, due to high inflection.
 3. Structural boost: terms found in lead boldface receive a score bonus, not an auto-accept.
 4. Provenance tags on each candidate: `source_method = spacy|lead_bold|hybrid`.
@@ -249,11 +250,11 @@ Additional notes:
 
 1. Basic crosswordability:
    - Length range (default 4-15), high alphabetic ratio.
-2. Wikidata entity type preference:
+2. Wikidata entity type preference (opt-in with `--entity-type-scoring`):
    - Prioritize scientific concept, physical quantity, unit of measurement.
 3. Frequency floor across selected articles:
    - Prefer terms appearing in at least `min_df` selected pages.
-   - Recommended adaptive default: `min_df = max(2, ceil(0.2*K))`.
+   - Default `min_df = 2` (`--min-df`); the rescue ladder loosens it to 1. An adaptive `min_df = max(2, ceil(0.2*K))` was proposed and is not implemented.
 4. Answer shape scoring:
    - Penalize low-crossability letter patterns early.
    - Treat shape as a score penalty, not a hard reject.
@@ -334,7 +335,7 @@ This is required for reliable CC BY-SA attribution in published outputs.
 ## 6. Module Layout and Interfaces
 
 1. `src/wiki_client.py`:
-   - `fetch_links`, `fetch_backlinks`, `fetch_page_content`, `fetch_revid`, `fetch_lead_markup`.
+   - `fetch_links`, `fetch_backlinks`, `fetch_page_extract`, `fetch_page_extract_with_revid`, `fetch_lead_wikitext`, `extract_lead_bold_terms`, and batch `prefetch_*` calls; `src/cache.py` holds the disk cache and `src/wikidata_client.py` the Wikidata entity-type lookup.
 2. `src/text_normalize.py`:
    - Cleaning, tokenization, phrase normalization.
 3. `src/semantic.py`:
@@ -347,18 +348,23 @@ This is required for reliable CC BY-SA attribution in published outputs.
    - Four-pass clue pipeline (including diversity) and leakage checks.
 7. `src/vocab_gate.py`:
    - Vocabulary readiness gate.
+   - `src/lexicon.py` loads the word-frequency list that scores titles and terms.
 8. `layout-rs/src/main.rs` and `src/layout.py`:
    - Free-form layout search (Rust program), its call, validity checks, layout metrics.
 9. `src/render.py`:
    - Text rendering of `puzzle.json`.
+   - `src/export.py` writes it as ipuz or printable HTML.
 10. `src/provenance.py`:
     - Attribution capture and output validation.
 11. `src/evaluation.py`:
     - Benchmark summaries and release gates.
 12. `src/pipeline/`:
-    - Stage orchestration: one module per stage group (`seed`, `scoring`, `titles`, `answers`, `clues`, `packaging`) and `generate.py` for the end-to-end run.
+    - Stage orchestration: one module per stage group (`seed`, `scoring`, `titles`, `answers`, `clues`, `packaging`), `common.py` for the shared result types and helpers, and `generate.py` for the rescue ladder and the end-to-end run.
+    - `src/artifact_models.py` holds the stage artifacts read back from disk and `src/diagnostics.py` the seed-stage diagnostics and the JSON writer.
 13. `cli.py`:
-    - User entry point (`generate`, `render`, per-stage commands).
+    - User entry point (`generate`, `render`, `export`, per-stage commands).
+14. `scripts/`:
+    - `bench.py` and `benchmark_suite.ps1` (benchmarks and release gates), `tune_weights.py` (weight grid search), `build_combined_lexicon.py` (builds `data/lexicon/combined_wordfreq.txt`).
 
 ## 7. Data Models
 
@@ -523,8 +529,8 @@ Entry record: `number`, `answer`, `display_answer`, `enumeration`, `clue`, `clue
 ### Key Configuration Knobs
 
 1. Language: `lang` (`en` | `el`), controls Wikipedia URL, spaCy model, alphabet filter, accent normalization.
-2. Selection weights: `a`, `b`, `c`, `d` (see BASELINE_V1 defaults in Section 5.2).
-3. `J(K)` weights: `w1-w3` (see BASELINE_V1 defaults in Section 5.3).
+2. Selection weights: `a`, `b`, `c`, `d` (defaults in Section 5.2).
+3. `J(K)` weights: `w1-w3` (defaults in Section 5.3).
 4. `K` optimization params: `epsilon`, `m`, `min_k`, `max_k`.
 5. Term filter params: length bounds, `min_df`, entity-type weights, shape penalty weight.
 6. Clue constraints: min/max words, leakage strictness, diversity bucket cap.
@@ -541,38 +547,30 @@ Entry record: `number`, `answer`, `display_answer`, `enumeration`, `clue`, `clue
 
 ```bash
 # English
-python cli.py generate \
+py -3 cli.py generate \
   --seed "Thermodynamics" \
   --lang en \
   --grid-size 15 \
   --expansion one_hop_plus_bounded_two_hop \
-  --model tfidf \
-  --output outputs/thermo_15.json
+  --output-dir outputs/thermo_15
 
 # Greek
-python cli.py generate \
+py -3 cli.py generate \
   --seed "Θερμοδυναμική" \
   --lang el \
   --grid-size 13 \
   --expansion one_hop_only \
-  --model tfidf \
-  --output outputs/thermo_el_13.json
+  --output-dir outputs/thermo_el_13
 ```
 
 ### Output Bundle
 
-1. `puzzle.json`
-2. `diagnostics.json`
-3. `candidate_scores.csv`
-4. `k_selection_trace.csv`
-5. `attribution.json`
-
-`diagnostics.json` is required from the first runnable pipeline stage, not only full puzzle runs.
+`generate --output-dir <dir>` writes `puzzle.json`, `attribution.json`, `candidate_scores.csv`, `selected_candidates.json`, `k_selection_trace.csv`, `answer_candidates.csv`, `clues.csv`, `grid.json` and one `diagnostics_<stage>.json` per stage; the [README](README.md) lists them all. The `seed` stage alone writes `diagnostics.json` (default `outputs/diagnostics.json`), the first diagnostics file of a pipeline that has not run to the end.
 
 ## 11. Risks and Mitigations
 
 1. Risk: semantic model misses technical nuance.
-   - Mitigation: optional embedding backend and weighted ensemble.
+   - Mitigation: a weighted ensemble or an embedding backend (neither is implemented).
 2. Risk: link graph introduces topic drift.
    - Mitigation: depth penalty + backlink bonus + strict bounded 2-hop expansion.
 3. Risk: answer set is thematic but hard to fill.
@@ -584,29 +582,13 @@ python cli.py generate \
 6. Risk: attribution gaps discovered late.
    - Mitigation: capture revid/span metadata at extraction time and enforce output validation.
 7. Risk: `J(K)` plateaus before sufficient vocabulary is available.
-   - Mitigation: four-step rescue ladder (loosen min_df -> promote the next candidates by rank -> widen from selected articles -> shorten min length) before failing gracefully.
+   - Mitigation: five-step rescue ladder (loosen min_df -> promote the next candidates by rank -> widen from the pages that link to the seed -> widen from the selected articles -> shorten min length) before failing gracefully.
 8. Risk: Greek accent variants break layout intersection matching.
    - Mitigation: strip diacritics at normalization time for the grid; retain accented form only in display and clue text.
 9. Risk: overfitting selection/weights to a single STEM seed.
    - Mitigation: tune and gate against at least two dissimilar seeds from the start.
 
-## 12. Milestones (Suggested)
-
-1. Week 1:
-   - Ingestion, cache-first layer, backlink/depth features, lead-bold signal capture.
-   - Establish benchmark seeds: `Thermodynamics` plus one dissimilar domain (`Jazz` or `Ancient Rome`).
-2. Week 2:
-   - Semantic scoring and drift diagnostics.
-3. Week 3:
-   - Crossword-aware `K` optimization.
-4. Week 4:
-   - Term extraction backends, structural signals, and clue pipeline.
-5. Week 5:
-   - Vocabulary readiness gate, then free-form layout.
-6. Week 6:
-   - Layout search, render, evaluation, tuning, attribution QA, release.
-
-## 13. Acceptance Criteria
+## 12. Acceptance Criteria
 
 1. End-to-end command produces puzzle + diagnostics + attribution bundle.
 2. Candidate selection uses relevance, redundancy, depth, and backlink signals.
@@ -617,17 +599,3 @@ python cli.py generate \
 7. Every layout is valid: each word crosses another, one connected piece, every run of 2+ letters is one placed word.
 8. A failed layout emits `fill_status: failed` and `validity_errors`, never a partial grid labelled ok.
 9. Every published clue includes stable source provenance.
-
-## 14. Immediate Next Tasks (Execution Order)
-
-1. Implement `wiki_client` (links, backlinks, content, `revid`) with caching.
-2. Finalize cache key schema `(endpoint, params_hash)` and emit `diagnostics.json` on first runnable stage.
-3. Add lead-section boldface extraction via `mwparserfromhell` and storage.
-4. Select and fix benchmark seeds: `Thermodynamics` + one dissimilar domain (`Jazz` or `Ancient Rome`).
-5. Implement semantic scorer with depth/backlink-aware MMR ranking.
-6. Implement `K` optimizer with a conflict-aware objective, plus thin-pool fallbacks.
-7. Implement term extraction (`spaCy`) with entity/frequency/shape scoring.
-8. Implement four-pass clue builder (extract, mask, validate, diversity) with leakage checks.
-9. Gate layout start on vocabulary readiness criteria.
-10. Implement the free-form layout (Phase 5) and `render`.
-11. Add attribution persistence and validation in final output.
