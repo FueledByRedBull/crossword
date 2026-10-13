@@ -140,6 +140,7 @@ py -3 scripts/tune_weights.py `
 py -3 -m pip install -r requirements-dev.txt
 py -3 -m pytest tests -q -k "not corpus"
 cargo test --manifest-path layout-rs/Cargo.toml
+py -3 -m ruff check .
 ```
 
 The deselected test, the offline integration corpus, runs four cached seeds end to end and takes several minutes; it is skipped when the cache is missing. It and the benchmark runner (`scripts\benchmark_suite.ps1`), the release gates and the held-out seeds are described in [docs/evaluation.md](docs/evaluation.md).
