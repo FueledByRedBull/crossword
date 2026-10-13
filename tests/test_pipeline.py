@@ -858,6 +858,7 @@ class PipelineTests(unittest.TestCase):
             ],
             ranked_indices=[2, 0, 1],
             term_scores=[0.0, 0.0, 0.0],
+            term_answer_inventories=[],
         )
 
         with patch("src.pipeline.scoring.run_candidate_scoring_stage", return_value=mocked_scoring):

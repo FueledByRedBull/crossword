@@ -585,7 +585,7 @@ def run_k_selection_stage(
     pairwise = scoring.pairwise
     ranked_indices = scoring.ranked_indices
     term_scores = scoring.term_scores
-    term_answer_inventories = getattr(scoring, "term_answer_inventories", [])
+    term_answer_inventories = scoring.term_answer_inventories
     max_k_limit = max_k or len(ranked_indices)
     if max_k is None and size >= 15:
         max_k_limit = min(max_k_limit, 12)

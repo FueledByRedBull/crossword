@@ -69,14 +69,6 @@ def mask_answer(sentence: str, answer: str) -> str:
     return answer_pattern(answer).sub(BLANK, sentence)
 
 
-def select_sentence(sentences: list[str], answer: str) -> str | None:
-    pattern = answer_pattern(answer)
-    for sentence in sentences:
-        if pattern.search(sentence):
-            return sentence
-    return None
-
-
 def trim_clause(sentence: str, max_words: int = 12) -> tuple[str, bool]:
     """Return (clue, clean): the sentence if it fits MAX_CLUE_WORDS, else a window of at most `max_words` words.
 
@@ -117,11 +109,6 @@ def trim_clause(sentence: str, max_words: int = 12) -> tuple[str, bool]:
     if end < len(words):
         clue = f"{clue} ..."
     return clue, not rank((start, end))[0]
-
-
-def clue_pass_extract(text: str, answer: str) -> str | None:
-    sentence, _ = clue_pass_extract_with_offset(text, answer)
-    return sentence
 
 
 def clue_pass_extract_with_offset(text: str, answer: str) -> tuple[str | None, int | None]:

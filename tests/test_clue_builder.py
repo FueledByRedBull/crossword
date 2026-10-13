@@ -5,7 +5,6 @@ from unittest.mock import patch
 
 from src import clue_builder
 from src.clue_builder import (
-    clue_pass_extract,
     clue_pass_extract_with_offset,
     clue_pass_mask_trim,
     clue_pass_validate,
@@ -45,11 +44,6 @@ class ClueBuilderTests(unittest.TestCase):
         clue, _ = clue_pass_mask_trim(sentence, "Entropy", max_words=10)
         self.assertTrue(clue_pass_validate(clue, "Entropy", min_words=3, nlp=None))
         self.assertNotIn("Entropy", clue)
-
-    def test_extract_sentence(self) -> None:
-        text = "Heat is energy. Entropy is a measure."
-        sentence = clue_pass_extract(text, "Entropy")
-        self.assertEqual(sentence, "Entropy is a measure.")
 
     def test_extract_sentence_with_offset(self) -> None:
         text = "Heat is energy. Entropy is a measure."
@@ -137,7 +131,7 @@ class WordBoundaryTests(unittest.TestCase):
     def test_extract_and_validate_respect_word_boundaries(self) -> None:
         sentence, offset = clue_pass_extract_with_offset("An extension of bebop. Tension rose.", "TENSION")
         self.assertEqual((sentence, offset), ("Tension rose.", 1))
-        self.assertIsNone(clue_pass_extract("An extension of bebop.", "TENSION"))
+        self.assertIsNone(clue_pass_extract_with_offset("An extension of bebop.", "TENSION")[0])
         # "extension" in the clue is not a leak of TENSION at the text level.
         self.assertTrue(clue_pass_validate("An extension of the idea", "TENSION", min_words=3))
         self.assertFalse(clue_pass_validate("Mounting tension in the idea", "TENSION", min_words=3))
