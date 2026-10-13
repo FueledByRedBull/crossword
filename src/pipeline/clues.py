@@ -17,6 +17,7 @@ from ..clue_builder import (
     answer_pattern,
     clue_pass_mask_trim,
     clue_pass_validate,
+    content_word_count,
     definition_clue,
     enforce_diversity,
     follow_up_definition,
@@ -26,6 +27,7 @@ from ..clue_builder import (
     lead_word_counts,
     name_the_person,
     split_sentences,
+    stops_before_relative,
     who_definition,
 )
 from ..provenance import build_oldid_url, validate_clue_provenance
@@ -209,7 +211,10 @@ def _definition_clue_rows(
     When none is left, the second sentence is tried ("He was one of the most influential figures in jazz piano."):
     a `last_resort` row, used after the fill-ins. So is the person's thin first-sentence definition (too few informative
     words) with the given names of the page and a blank for the surname ("An American jazz drummer (Art ____)"),
-    when nothing else clues the answer.
+    when nothing else clues the answer. A person whose first sentence gives no definition at all is tried once more with
+    a head of two words ("Γάλλος αστρονόμος, γνωστός κυρίως ..."): that head is joined or named, never a clue of its own.
+    Of a page that is no person, the short cut that stops before a relative clause gives way to the longer one that goes
+    through it; one of fewer than three content words ("A young child") is a last resort as well.
     """
     sentences = split_sentences(payload.get("extract", ""))
     rows: list[dict] = []
@@ -252,6 +257,13 @@ def _definition_clue_rows(
                     generic[max_words] = clue_text
                 else:
                     texts.append((clue_text, offset))
+        heads: set[str] = set()  # the short heads of a person: they are joined or named whatever their words
+        if person and offset == 0 and not generic and not texts:
+            for max_words in (16, MAX_CLUE_WORDS):
+                clue_text = cut(sentences[offset], answer=answer, max_words=max_words, nlp=nlp, lang=lang, person=True)
+                if clue_text and clue_pass_validate(clue_text, answer, min_words=2, nlp=nlp, lang=lang):
+                    generic[max_words] = clue_text
+                    heads.add(clue_text)
         if person and offset == 0 and generic and not texts:
             for later, sentence in enumerate(sentences[1:3], 1):
                 for max_words, head in generic.items():
@@ -270,13 +282,21 @@ def _definition_clue_rows(
                     (
                         clue
                         for head in sorted(generic.values(), key=len, reverse=True)
-                        if is_thin_definition(head, lead_counts, pool_size, nlp, seed_title=seed_title)
+                        if (head in heads or is_thin_definition(head, lead_counts, pool_size, nlp, seed_title=seed_title))
                         and (clue := name_the_person(head, title, answer))
                         and clue_pass_validate(clue, answer, min_words=3, nlp=nlp, lang=lang)
                     ),
                     None,
                 )
-        rows = definition_rows(texts, cut is follow_up_definition)
+        # The cut of a page that stops right before a relative clause gives way to the longer cut through it, and with
+        # fewer than three content words it is a last resort, after the fill-ins ("Η επιστήμη και η τέχνη [η οποία ...]").
+        genus = False
+        if not person and texts and stops_before_relative(sentences[offset], texts[0][0], lang=lang):
+            if len(texts) == 2 and texts[1][0].startswith(texts[0][0]):
+                texts = texts[1:]
+            else:
+                genus = content_word_count(texts[0][0], lang=lang) < 3
+        rows = definition_rows(texts, cut is follow_up_definition or genus)
     if named and not rows:
         rows = definition_rows([(named, 0)], True)
     return rows

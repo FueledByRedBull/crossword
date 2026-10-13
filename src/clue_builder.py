@@ -171,6 +171,8 @@ class _Words(NamedTuple):
     # Words that need the preposition after them, and endings that mark such a word.
     participles: frozenset[str]
     participle_endings: tuple[str, ...]
+    # Nouns that need the preposition after them: a cut never falls between ("a special interest [in ...]").
+    complemented: frozenset[str]
     # A word with one of these endings opens an adjunct clause, like a comma does.
     gerund_endings: tuple[str, ...]
     determiners: frozenset[str]
@@ -216,7 +218,7 @@ _EN_ADJUNCT = (
     "in at by for from with during after before near around across through within against under over into"
     " between among since"
 )
-_EN_RELATIVE = "that which who whose where when"
+_EN_RELATIVE = "that which who whose where when wherein"
 _EN = _Words(
     copulas=_words("is was are were"),
     accusative_copulas=frozenset(),
@@ -238,10 +240,11 @@ _EN = _Words(
     weak_end=_words(
         f"{_EN_ADJUNCT} {_EN_RELATIVE} a an the and or but of to as than is was are were be been being has have had"
         " not all first also then often usually typically generally commonly thus so hence while because although"
-        " such including especially mainly particularly only once this these those"
+        " such including especially mainly particularly only once this these those best"
     ),
-    participles=_words("known born made built found given taken written chosen held"),
+    participles=_words("known born made built found given taken written chosen held rich"),
     participle_endings=("ed", "ing", "ble"),
+    complemented=_words("interest figure figures role conjunction cooperation border relationships"),
     gerund_endings=(),
     determiners=_words("the a an this these its their his her some any each every all"),
     finite_verbs=_words("was is were are had has became also"),
@@ -307,6 +310,7 @@ _EL = _Words(
     ),
     participles=_words("γνωστός γνωστή γνωστό γνωστοί γνωστές γνωστά υπεύθυνος υπεύθυνη υπεύθυνο"),
     participle_endings=("μενος", "μενη", "μενο", "μενοι", "μενες", "μενα"),
+    complemented=_words("συνεισφορά συμβολή"),
     gerund_endings=("ντας",),
     determiners=_words(
         f"{_EL_ARTICLE} {_EL_INDEFINITE} αυτός αυτή αυτό αυτοί αυτές αυτά κάθε κάποιος κάποια κάποιο κάποιοι κάποιες"
@@ -401,11 +405,17 @@ def _reaches_its_verb(kept: list[str], relative: int, nlp) -> bool:
 _TIME_ADJUNCTS = frozenset({"during", "after", "before", "since", "until", "throughout"})
 
 
+def _is_dated(preposition) -> bool:
+    """True when the object of `preposition` is a date: a time adjunct, which a cut may leave out."""
+    return any(child.dep_ == "pobj" and child.ent_type_ == "DATE" for child in preposition.children)
+
+
 def _ends_its_clause(kept: list[str], relatives: list[int], doc, nlp) -> bool:
     """True when each relative clause of `kept` has its verb and the cut falls after a noun, before a time adjunct of that verb.
 
-    "A general who formed the Second Triumvirate alongside Octavian and Mark Antony [during ...]" is whole. `doc` is the
-    tagged, parsed predicate.
+    "A general who formed the Second Triumvirate alongside Octavian and Mark Antony [during ...]" is whole, and so is "the
+    branch of biology that studies the evolution of plants [over the last 3.5 billion years]": a preposition with a date
+    for its object is a time adjunct. `doc` is the tagged, parsed predicate.
     """
     offset = len(" ".join(kept)) + 1
     cut = next((token for token in doc if token.idx == offset), None)
@@ -413,7 +423,7 @@ def _ends_its_clause(kept: list[str], relatives: list[int], doc, nlp) -> bool:
     return (
         cut is not None
         and cut.dep_ == "prep"
-        and cut.lower_ in _TIME_ADJUNCTS
+        and (cut.lower_ in _TIME_ADJUNCTS or _is_dated(cut))
         and cut.head.pos_ in {"VERB", "AUX"}
         and bool(last)
         and last[-1].pos_ in {"NOUN", "PROPN"}
@@ -421,8 +431,36 @@ def _ends_its_clause(kept: list[str], relatives: list[int], doc, nlp) -> bool:
     )
 
 
-def _clean_prefix(words: list[str], limit: int, lex: _Words, nlp=None) -> list[str] | None:
-    """Longest prefix of at most `limit` words that stops at a clean boundary, or None."""
+def _leaves_its_noun(kept: list[str], tail: int, doc) -> bool:
+    """True when `kept` ends inside the comma tail that opens at word `tail` on "with" or a verb, on a noun that goes on.
+
+    "..., with a libretto [by Piave]" and "..., regarded as a key figure [in jazz]" leave a noun without what it wants:
+    the next word is a preposition that hangs from the last word of `kept`, after "with" a participle clause too
+    ("with a libretto [written by ...]"), unless it is a time ("the first Roman emperor [in 27 BC]"). `doc` is the
+    tagged, parsed predicate.
+    """
+    opener = next((token for token in doc if token.idx == len(" ".join(kept[:tail])) + 1), None)
+    offset = len(" ".join(kept)) + 1
+    cut = next((token for token in doc if token.idx == offset), None)
+    last = [token for token in doc if token.idx < offset and not token.is_punct]
+    if opener is None or cut is None or not last or cut.head != last[-1]:
+        return False
+    if _is_dated(cut) or (cut.lower_ == "in" and any(token.like_num for token in cut.subtree)):
+        return False
+    if opener.lower_ == "with":
+        return cut.dep_ in {"prep", "acl"}
+    return opener.pos_ == "VERB" and cut.dep_ == "prep"
+
+
+def _clean_prefix(
+    words: list[str], limit: int, lex: _Words, nlp=None, person: bool = False, noun_phrase: bool = False
+) -> list[str] | None:
+    """Longest prefix of at most `limit` words that stops at a clean boundary, or None.
+
+    A cut keeps five words at least. For the head of a `person` ("Γάλλος αστρονόμος, γνωστός κυρίως ...") two are enough
+    when the cut falls at a comma or before a relative word, and any relative word may start the cut-off clause. With
+    `nlp`, a cut for a `noun_phrase` does not end on a word that no noun phrase ends on.
+    """
 
     doc = nlp(" ".join(words)) if nlp is not None else None
 
@@ -441,7 +479,8 @@ def _clean_prefix(words: list[str], limit: int, lex: _Words, nlp=None) -> list[s
             )
         ):
             kept = kept[: commas[-1] + 1]
-        if len(kept) < 5 or _fold(kept[-1].strip(",;:")) in lex.weak_end:
+        head = person and (at_comma or _fold(words[count]) in lex.relatives)
+        if len(kept) < (2 if head else 5) or _fold(kept[-1].strip(",;:")) in lex.weak_end | lex.personal:
             return None
         # A bare "the years" or "the period" waits for what follows it: "... in New Orleans in the years [from the ...]".
         end = [_fold(word) for word in kept[-2:]]
@@ -469,6 +508,9 @@ def _clean_prefix(words: list[str], limit: int, lex: _Words, nlp=None) -> list[s
         opened = [i + 1 for i, word in enumerate(kept[:-1]) if word[-1] in ",;:"]
         if opened and kept[-1][-1] not in ",;:" and lowered[opened[-1]] in lex.tails:
             return None
+        # So is a tail that "with" or a verb opens, when the cut leaves its last noun without what the next word adds.
+        if opened and kept[-1][-1] not in ",;:" and doc is not None and _leaves_its_noun(kept, opened[-1], doc):
+            return None
         # ", and with around 223,000 inhabitants" is no part of the definition, even when a comma closes it.
         if opened and _opens_tail(kept, opened[0] - 1, lex):
             return None
@@ -480,6 +522,7 @@ def _clean_prefix(words: list[str], limit: int, lex: _Words, nlp=None) -> list[s
                 lowered[pos] in lex.verbal_relatives
                 and pos + 1 < len(lowered)
                 and lowered[pos + 1] not in lex.determiners
+                and lowered[pos - 1] not in lex.prepositions
                 for pos in relatives
             )
             if not (has_verb and (at_comma or doc is not None and _ends_its_clause(kept, relatives, doc, nlp))):
@@ -491,30 +534,49 @@ def _clean_prefix(words: list[str], limit: int, lex: _Words, nlp=None) -> list[s
             for pos in relatives
         ):
             return None
+        if nlp is not None and noun_phrase:
+            # A cut that the noun phrase check would turn down ("... in open systems far [from]") leaves the shorter ones their chance.
+            text = " ".join(kept).rstrip(",;:")
+            tokens = [token for token in nlp(text[0].upper() + text[1:]) if not token.is_punct]
+            if _edge_pos(tokens[-1], lex) in _BAD_END:
+                return None
         return None if nlp is not None and _ends_in_nationality(kept, nlp) else kept
 
     cuts: dict[int, tuple[bool, bool]] = {}
-    for i in range(1, limit):
+    for i in range(1, limit + 1):  # a cut before `words[limit]` keeps `limit` words
         word = words[i]
-        if word[-1] in ",;:":
+        if i < limit and word[-1] in ",;:":
             if _fold(word.strip(",;:")) in lex.conjunctions:  # "... jazz piano [and, according to one source, ...]"
                 cuts.setdefault(i, (True, False))
             closes_list = _fold(words[i - 1]) in lex.conjunctions and words[i - 2][-1] == ","
-            place = words[i - 1][-1] == "," and words[i - 1][0].isupper() and word[0].isupper()
+            # Two capitalised items are a place name ("New Orleans, Louisiana,") unless a third goes on ("Judea, Idumea, Peraea,").
+            goes_on = _fold(words[i + 1]) in lex.conjunctions or (
+                words[i + 1][0].isupper()
+                and (words[i + 1][-1] in ",;:" or any(_fold(later) in lex.conjunctions for later in words[i + 2 : i + 3]))
+            )
+            place = words[i - 1][-1] == "," and words[i - 1][0].isupper() and word[0].isupper() and not goes_on
             inside_list = (
                 words[i - 1][-1] in ",;:"
                 or any(_fold(later) in lex.conjunctions for later in words[i + 1 : i + 3])
                 or _opens_list_item(words[i + 1 : i + 3], lex)
                 or any(later[-1] in ",;:" for later in words[i + 1 : i + 4])
             )
-            if closes_list or place or not inside_list or _opens_tail(words, i, lex):
+            # The head of a person stops at the only comma of "a Puerto Rican painter, and the only Latin American artist".
+            apposed = (
+                person
+                and _fold(words[i + 1]) in lex.conjunctions
+                and any(_fold(later) in lex.determiners for later in words[i + 2 : i + 3])
+                and not any(later[-1] in ",;:" for k, later in enumerate(words) if k != i)
+            )
+            if closes_list or place or not inside_list or _opens_tail(words, i, lex) or apposed:
                 cuts[i + 1] = (True, closes_list or place)
         elif _fold(word) in lex.adjunct_prepositions:
-            # Never leave a participle or adjective dangling ("formed by", "based in", "responsible for").
+            # Never leave a participle or adjective dangling ("formed by", "based in", "responsible for"), nor a noun
+            # that wants the preposition ("a special interest [in ...]").
             before = _fold(words[i - 1])
-            cuts.setdefault(
-                i - 1 if before.endswith(lex.participle_endings) or before in lex.participles else i, (False, False)
-            )
+            end = i - 1 if before.endswith(lex.participle_endings) or before in lex.participles else i
+            if end and _fold(words[end - 1]) not in lex.complemented:
+                cuts.setdefault(end, (False, False))
         elif _fold(word).endswith(lex.gerund_endings):
             cuts[i] = (True, False)
         elif _fold(word) in lex.relatives:
@@ -522,7 +584,7 @@ def _clean_prefix(words: list[str], limit: int, lex: _Words, nlp=None) -> list[s
             # the last resort below, unless a participle or a comma before it has a say ("hypotheses proposing [that ...]").
             before = _fold(words[i - 1])
             if (
-                (i >= 6 or _fold(word) in lex.person_relatives)
+                (i >= 6 or person or _fold(word) in lex.person_relatives)
                 and words[i - 1][-1] not in ",;:"
                 and not before.endswith(lex.participle_endings)
                 and before not in lex.participles
@@ -532,8 +594,8 @@ def _clean_prefix(words: list[str], limit: int, lex: _Words, nlp=None) -> list[s
         if (kept := prefix(count, *cuts[count])) is not None:
             return kept
     # Otherwise drop the first relative clause: "An American scientist [who ...]", "A branch of physics [that ...]".
-    first = next((i for i in range(3, limit) if _fold(words[i]) in lex.relatives), None)
-    if first is not None and (_fold(words[first]) in lex.person_relatives or first >= 6):
+    first = next((i for i in range(3, limit + 1) if _fold(words[i]) in lex.relatives), None)
+    if first is not None and (person or _fold(words[first]) in lex.person_relatives or first >= 6):
         start = first
         while start > 1 and _fold(words[start - 1]) in lex.relative_lead:
             start -= 1
@@ -553,13 +615,16 @@ def lead_subject(lead: str, *, lang: str = "en") -> str:
 def _subject_tail(subject: str, answer: str, lex: _Words) -> str | None:
     """What follows the last word of the answer in the lead sentence subject, None when it does not occur there.
 
-    "" for "Volume", " of a system" for "the volume of a system". The word may carry another ending or number.
+    "" for "Volume", " of a system" for "the volume of a system". The word may carry another ending or number, or a
+    lower-case prefix hyphenated to it ("αλ-Χουαρίζμι"), not a capitalised one ("Neo-Impressionism").
     """
     last = _fold(answer.split()[-1])
     stem = last[: len(last) - lex.stem_trim] if len(last) - lex.stem_trim >= 3 else last
-    subject = _fold(subject)
-    match = re.search(rf"(?<![\w-]){re.escape(stem)}{lex.endings}(?![\w-])", subject)
-    return None if match is None else subject[match.end() :]
+    for text in (subject, _NAME_PREFIX.sub("", subject)):
+        text = _fold(text)
+        if match := re.search(rf"(?<![\w-]){re.escape(stem)}{lex.endings}(?![\w-])", text):
+            return text[match.end() :]
+    return None
 
 
 def _edge_pos(token, lex: _Words) -> str:
@@ -664,17 +729,28 @@ def _example_span(words: list[str], nlp) -> tuple[int, int] | None:
 
 
 def _copula_definition(
-    lead_sentence: str, *, max_words: int = 16, answer: str | None = None, nlp=None, lang: str = "en"
+    lead_sentence: str, *, max_words: int = 16, answer: str | None = None, nlp=None, lang: str = "en", person: bool = False
 ) -> str | None:
     """Turn "Bebop is a style of jazz ..." into "A style of jazz ...".
 
     The whole predicate is used when it fits `max_words`; a longer one is cut only at a clean
     boundary, otherwise there is no definition. With `answer`, the sentence must be about it:
-    its last word has to occur before the copula. With `nlp`, the result must also be a noun phrase.
+    its last word has to occur before the copula. With `nlp`, the result must also be a noun phrase. For the head of a
+    `person` ("Γάλλος αστρονόμος, γνωστός κυρίως ...") two words are a definition, and so is a cut of two words.
     """
     lex = _WORDS[lang]
     lead = strip_parentheticals(lead_sentence).split()
-    copula = next((i for i, word in enumerate(lead) if i and _fold(word) in lex.copulas), None)
+    # The verb of a relative clause or an aside ("... tensions that [are] accumulated ...", "Ο Πωλ Φεγεράμπεντ ή, όπως
+    # [είναι] ευρέως γνωστός, ...") is not the copula of the sentence.
+    subordinate = lex.relatives | lex.tails
+    copula = next(
+        (
+            i
+            for i, word in enumerate(lead)
+            if i and _fold(word) in lex.copulas and not any(_fold(before) in subordinate for before in lead[max(i - 3, 0) : i])
+        ),
+        None,
+    )
     if copula is None:
         return None
     tail = None
@@ -697,14 +773,14 @@ def _copula_definition(
             words = words[:i]
             break
     first = _fold(words[0]) if words else ""
-    if len(words) < 3 or lex.not_a_noun_phrase.match(first) or first in lex.demonstratives | lex.possessives:
+    if len(words) < (2 if person else 3) or lex.not_a_noun_phrase.match(first) or first in lex.demonstratives | lex.possessives:
         return None
     if _fold(lead[copula]) in lex.accusative_copulas and (
         first in lex.accusative_openers or (nlp is not None and _masculine_accusative(words[:6], nlp))
     ):
         return None
     if len(words) > max_words:
-        cut = _clean_prefix(words, max_words, lex, nlp)
+        cut = _clean_prefix(words, max_words, lex, nlp, person, True)
         examples = _example_span(words, nlp) if lang == "en" and nlp is not None else None
         if examples and (cut is None or examples[0] < len(cut) < examples[1]):
             # The cut stops inside the examples: "artists like A, B and C to distinguish their work" loses them instead.
@@ -712,7 +788,7 @@ def _copula_definition(
             if words[end - 1].endswith(","):
                 words[start - 1] = words[start - 1].rstrip(",")
             words = words[:start] + words[end:]
-            cut = words if len(words) <= max_words else _clean_prefix(words, max_words, lex, nlp)
+            cut = words if len(words) <= max_words else _clean_prefix(words, max_words, lex, nlp, person, True)
         if cut is None:
             return None
         words = cut
@@ -732,13 +808,14 @@ def _copula_definition(
 
 
 def definition_clue(
-    lead_sentence: str, *, max_words: int = 16, answer: str | None = None, nlp=None, lang: str = "en"
+    lead_sentence: str, *, max_words: int = 16, answer: str | None = None, nlp=None, lang: str = "en", person: bool = False
 ) -> str | None:
     """The definition a lead sentence gives: through its copula ("Bebop is a style of jazz ..." -> "A style of jazz ..."),
     else, for a lead with a main verb of the answer's own ("Temperature reflects the average kinetic energy ..."),
     "It reflects the average kinetic energy ...". The first is `_copula_definition`, which keeps every sentence it defines.
+    With `person`, the head of a person may be as short as two words, which the pipeline joins or names.
     """
-    clue = _copula_definition(lead_sentence, max_words=max_words, answer=answer, nlp=nlp, lang=lang)
+    clue = _copula_definition(lead_sentence, max_words=max_words, answer=answer, nlp=nlp, lang=lang, person=person)
     if clue is None and answer is not None and nlp is not None and lang == "en":
         return _it_definition(lead_sentence, max_words, answer, nlp)
     return clue
@@ -1104,6 +1181,25 @@ def name_the_person(definition: str, title: str, answer: str) -> str | None:
     return clue if given and surname == answer and len(clue.split()) <= MAX_CLUE_WORDS else None
 
 
+def stops_before_relative(sentence: str, clue: str, *, lang: str = "en") -> bool:
+    """True when `clue`, cut from `sentence`, stops right before a relative clause: "A group of two or more atoms [that ...]"."""
+    lex = _WORDS[lang]
+
+    def bare(text: str) -> list[str]:
+        return [_fold(word.strip(_PUNCTUATION)) for word in text.split()]
+
+    words, wanted = bare(strip_parentheticals(sentence)), bare(clue)
+    start = next((i for i in range(len(words) - len(wanted) + 1) if words[i : i + len(wanted)] == wanted), None)
+    return start is not None and any(word in lex.relatives for word in words[start + len(wanted) :][:2])
+
+
+def content_word_count(clue: str, *, lang: str = "en") -> int:
+    """The words of `clue` that are not articles, prepositions, conjunctions and the like: "Η επιστήμη και η τέχνη" has two."""
+    lex = _WORDS[lang]
+    function = lex.weak_end | lex.prepositions | lex.determiners
+    return sum(_fold(word.strip(_PUNCTUATION)) not in function for word in clue.split())
+
+
 def has_verb(clue: str, nlp) -> bool:
     """False for titles, citations and list entries, and for a clause cut before its main verb: poor fill-ins.
 
@@ -1193,6 +1289,7 @@ def has_morphological_leakage(clue: str, answer: str, nlp, *, lang: str = "en") 
 
 # A blank that is one part of a longer proper name ("the ____ Florida Institute", "the Rome-Berlin ____") clues nothing.
 _CAPITAL = "A-ZΑ-ΫΆΈ-ΊΌΎΏ"  # Latin and Greek, tonos included
+_NAME_PREFIX = re.compile(rf"(?<![\w-])[a-zά-ώ]{{1,3}}-(?=[{_CAPITAL}])")
 _PART_OF_A_NAME = re.compile(
     BLANK + rf"(?= +[{_CAPITAL}])|[{_CAPITAL}][\w']*[ \-\N{{EN DASH}}\N{{EM DASH}}](?={BLANK})"
 )

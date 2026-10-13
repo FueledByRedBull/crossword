@@ -1495,6 +1495,60 @@ class PipelineTests(unittest.TestCase):
             },
         )
 
+    def test_clue_stage_names_a_person_whose_first_sentence_gives_only_a_head(self) -> None:
+        extracts = {
+            "Ana Vale": (
+                "Ana Vale was a Danish physicist, one of the main pioneers of the theory of heat flow and a principal "
+                "scientist of the Kyoto program of the war effort."
+            ),
+            "Σαρλ Μεσιέ": (
+                "Ο Σαρλ Μεσιέ ήταν Γάλλος αστρονόμος, γνωστός κυρίως από τη σύνταξη του πρώτου ομώνυμου αστρονομικού "
+                "καταλόγου ουράνιων σωμάτων του «βαθέος ουρανού», όπως νεφελώματα, γαλαξίες και αστρικά σμήνη."
+            ),
+        }
+        english, _ = self._run_clues_for("clue_head_en", ["Vale,VALE,Ana Vale,article_title,True,True"], extracts)
+        greek, _ = self._run_clues_for(
+            "clue_head_el", ["Μεσιέ,ΜΕΣΙΕ,Σαρλ Μεσιέ,article_title,True,True"], extracts, lang="el", seed_title="Αστρονομία"
+        )
+        self.assertEqual([(row["clue_style"], row["clue"]) for row in english.clues], [("definition", "A Danish physicist (Ana ____)")])
+        self.assertEqual([(row["clue_style"], row["clue"]) for row in greek.clues], [("definition", "Γάλλος αστρονόμος (Σαρλ ____)")])
+
+    def test_clue_stage_takes_the_longer_cut_through_a_relative_clause_for_a_page_but_not_for_a_person(self) -> None:
+        extracts = {
+            "Tenor": "A tenor is a type of male singing voice whose vocal range lies between the countertenor and baritone voice types.",
+            "Ana Vale": "Ana Vale was a Danish physicist who studied the flow of heat through cold rooms in Kyoto and many other cities.",
+        }
+        rows = ["Tenor,TENOR,Tenor,article_title,True,False", "Vale,VALE,Ana Vale,article_title,True,True"]
+        result, _ = self._run_clues_for("clue_through_the_relative", rows, extracts)
+
+        self.assertEqual(
+            {row["answer"]: row["clue"] for row in result.clues},
+            {
+                "Tenor": "A type of male singing voice whose vocal range lies between the countertenor and baritone voice types",
+                "Vale": "A Danish physicist",
+            },
+        )
+
+    def test_clue_stage_puts_a_bare_genus_of_a_page_after_the_fill_ins(self) -> None:
+        extracts = {
+            "Prodigy": (
+                "A prodigy is a young child who possesses an aptitude for chess that far exceeds the expectations of the adults "
+                "who teach the game in the schools of the town. "
+                "Morphy was an extraordinary prodigy at the board, defeating every rival of his day."
+            ),
+            "Rookie": "A rookie is a young child who plays chess for the first time in the tournament held every year in the large hall of the town.",
+        }
+        rows = ["Prodigy,PRODIGY,Prodigy,article_title,True,False", "Rookie,ROOKIE,Rookie,article_title,True,False"]
+        result, _ = self._run_clues_for("clue_bare_genus", rows, extracts)
+
+        self.assertEqual(
+            {row["answer"]: (row["clue_style"], row["clue"]) for row in result.clues},
+            {
+                "Prodigy": ("fill_in_blank", "Morphy was an extraordinary ____ at the board, defeating every rival of his day."),
+                "Rookie": ("definition", "A young child"),
+            },
+        )
+
     def test_clue_stage_defines_an_answer_only_by_a_page_that_bears_its_name(self) -> None:
         extracts = {
             "Subatomic particle": "A subatomic particle is a particle smaller than an atom in every model.",

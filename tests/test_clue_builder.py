@@ -336,6 +336,16 @@ class DefinitionClueTests(unittest.TestCase):
             "A music genre that originated in the African-American communities of New Orleans, Louisiana",
         )
 
+    def test_two_capitalised_items_are_a_place_name_unless_a_list_of_names_goes_on(self) -> None:
+        judaea = (
+            "Judaea was a Roman province from 6 to 135 AD, which at its height encompassed the regions of Judea, Idumea, "
+            "Peraea, Samaria, and Galilee, as well as parts of the coastal plain of the southern Levant."
+        )
+        self.assertEqual(definition_clue(judaea, answer="Judaea", max_words=18), "A Roman province from 6 to 135 AD")
+        # Or its last item follows the conjunction.
+        judea = judaea.replace("Idumea, Peraea, Samaria, and Galilee", "Idumea, and Samaria")
+        self.assertEqual(definition_clue(judea, answer="Judaea", max_words=18), "A Roman province from 6 to 135 AD")
+
     def test_whole_predicate_is_used_when_it_fits(self) -> None:
         enthalpy = (
             "Enthalpy is the sum of a thermodynamic system's internal energy and the product "
@@ -480,6 +490,20 @@ class DefinitionClueTests(unittest.TestCase):
         self.assertIsNotNone(definition_clue(plural, answer="Afro-Cuban"))
         accented = "Schr\u00f6dinger's cat is a thought experiment in quantum physics."
         self.assertIsNotNone(definition_clue(accented, answer="Schrodinger's cat"))
+
+    def test_the_verb_of_a_relative_clause_or_an_aside_is_not_the_copula(self) -> None:
+        habitat = "Habitat, which is the array of resources, is a term of ecology that describes the place where an organism lives."
+        self.assertEqual(
+            definition_clue(habitat, answer="Habitat"), "A term of ecology that describes the place where an organism lives"
+        )
+        # The relative clause has its own verb before the copula, and a comma closes it.
+        farinelli = "Carlo Broschi, who performed under the stage name Farinelli, was an Italian castrato singer."
+        self.assertEqual(definition_clue(farinelli, answer="Farinelli"), "An Italian castrato singer")
+        expansion = (
+            "In physics, the term expansion means the release of tensions that are accumulated in a system that may "
+            "consist of solids, liquids or gases."
+        )
+        self.assertIsNone(definition_clue(expansion, answer="Expansion"))
 
     def test_adverb_start_is_not_a_definition(self) -> None:
         self.assertIsNone(definition_clue("Bulgarian jazz is significantly influenced by the cultural changes."))
@@ -1172,9 +1196,8 @@ class DefinitionCutTests(unittest.TestCase):
             "Byzantine, Latin, and Ottoman empires between its consecration in 330 and the formal abolition of the "
             "Ottoman sultanate in 1922."
         )
-        self.assertEqual(
-            definition_clue(city), "A historical city located on the Bosporus, which served as the capital of the Roman, Byzantine"
-        )
+        # "Roman, Byzantine," is two items of a list that goes on, not a place name: no cut after it, with or without a parser.
+        self.assertEqual(definition_clue(city), "A historical city located on the Bosporus")
         self.assertEqual(definition_clue(city, nlp=nlp), "A historical city located on the Bosporus")
         clave = (
             "The clave is a rhythmic pattern used as a tool for temporal organization in Brazilian, Cuban, and other "
@@ -1231,6 +1254,52 @@ class DefinitionCutTests(unittest.TestCase):
             definition_clue(roman_law, answer="Roman law", max_words=18),
             "The legal system of ancient Rome, including the legal developments spanning over a thousand years of jurisprudence",
         )
+
+    def test_a_tail_opened_by_with_or_a_participle_is_dropped_when_the_cut_leaves_its_noun_unfinished(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        for sentence, answer, expected in (
+            (
+                "Boden's mate is a checkmating pattern in chess characterized by bishops on two criss-crossing diagonals, with "
+                "possible flight squares for the king being occupied by friendly pieces or under attack by enemy pieces.",
+                "Boden's Mate",
+                "A checkmating pattern in chess characterized by bishops on two criss-crossing diagonals",
+            ),
+            (
+                "Macbeth is an opera in four acts by Giuseppe Verdi, with an Italian libretto by Francesco Maria Piave and "
+                "additions by Andrea Maffei, based on William Shakespeare's play of the same name.",
+                "Macbeth",
+                "An opera in four acts by Giuseppe Verdi",
+            ),
+            (
+                "Evansia is a quarterly, peer-reviewed scientific journal, publishing research on issues in biology and "
+                "environmental preservation related to lichenology and bryology, primarily in North America.",
+                "Evansia",
+                "A quarterly, peer-reviewed scientific journal",
+            ),
+            (
+                "Christiaan Huygens was a Dutch mathematician, physicist, engineer, astronomer, and inventor who is regarded as a "
+                "key figure in the Scientific Revolution.",
+                "Huygens",
+                "A Dutch mathematician, physicist, engineer, astronomer, and inventor",
+            ),
+            # A tail that goes on with something else than a preposition of its last noun is whole, and so is a relative clause.
+            (
+                "Alan Cyril Crundwell was a British bryologist, known for categorizing approximately 20 species of "
+                "bryophytes, around six of which were previously unknown to science.",
+                "Crundwell",
+                "A British bryologist, known for categorizing approximately 20 species of bryophytes",
+            ),
+            (
+                "Garry Kasparov is a Russian chess grandmaster, political activist and writer, who was the World Chess "
+                "Champion from 1985 to 2000.",
+                "Kasparov",
+                "A Russian chess grandmaster, political activist and writer, who was the World Chess Champion",
+            ),
+        ):
+            with self.subTest(answer=answer):
+                self.assertEqual(definition_clue(sentence, answer=answer, nlp=nlp), expected)
 
     def test_the_cut_runs_up_to_the_relative_clause_when_that_is_the_longest_clean_end(self) -> None:
         morisot = (
@@ -1292,11 +1361,12 @@ class DefinitionCutTests(unittest.TestCase):
         self.assertEqual(definition_clue(kent, answer="Adrian Kent", nlp=nlp), "A professor at the University of Cambridge")
         # "Honorius at Mediolanum" is a person and a place: the cut may fall between them.
         claudian = (
-            "Claudius Claudianus, known in English as Claudian, was a Latin poet associated with the court of the Roman "
-            "emperor Honorius at Mediolanum, and particularly with the general Stilicho."
+            "Claudius Claudianus, known in English as Claudian, was a Latin poet of late antiquity associated with the court of "
+            "the Roman emperor Honorius at Mediolanum, and particularly with the general Stilicho."
         )
         self.assertEqual(
-            definition_clue(claudian, answer="Claudian", nlp=nlp), "A Latin poet associated with the court of the Roman emperor Honorius"
+            definition_clue(claudian, answer="Claudian", nlp=nlp),
+            "A Latin poet of late antiquity associated with the court of the Roman emperor Honorius",
         )
         # A date is not cut in two either.
         blue = "Kind of Blue is a studio album by American jazz musician Miles Davis, released on August 17, 1959, by Columbia Records."
@@ -1347,6 +1417,98 @@ class DefinitionCutTests(unittest.TestCase):
             "of the theory of elementary particles."
         )
         self.assertEqual(definition_clue(gell_mann, answer="Murray Gell-Mann", nlp=nlp), "An American theoretical physicist")
+
+    def test_a_relative_clause_may_end_before_a_preposition_with_a_date(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        funk = (
+            "Funk is a music genre that originated in African-American communities in the mid-1960s when musicians "
+            "created a rhythmic and danceable new form of music."
+        )
+        self.assertEqual(definition_clue(funk, answer="Funk", nlp=nlp), "A music genre that originated in African-American communities")
+        # Without a parser nothing tells a date from another noun.
+        self.assertIsNone(definition_clue(funk, answer="Funk"))
+
+    def test_a_cut_may_stop_right_before_the_word_at_the_limit(self) -> None:
+        nlp = _load_nlp()
+        if nlp is None:
+            self.skipTest("spaCy model not available")
+        botany = (
+            "Botany, also called plant science, is the branch of natural science and biology that studies the growth, "
+            "reproduction and evolution of plants over the last 3.5 billion years of life on earth."
+        )
+        self.assertEqual(
+            definition_clue(botany, answer="Botany", nlp=nlp),
+            "The branch of natural science and biology that studies the growth, reproduction and evolution of plants",
+        )
+        # A cut that ends on an adverb is no candidate: the shorter one is still there.
+        synergetics = (
+            "Synergetics is an interdisciplinary science explaining the formation and self-organization of patterns and "
+            "structures in open systems far from thermodynamic equilibrium."
+        )
+        self.assertEqual(
+            definition_clue(synergetics, answer="Synergetics", nlp=nlp),
+            "An interdisciplinary science explaining the formation and self-organization of patterns and structures",
+        )
+
+    def test_a_cut_never_falls_between_a_noun_and_the_preposition_it_wants(self) -> None:
+        duncan = (
+            "Ursula Katherine Duncan was a botanist with a special interest in mosses and lichens, and a lifelong love "
+            "and knowledge of flowers."
+        )
+        self.assertIsNone(definition_clue(duncan, answer="Ursula Katherine Duncan"))
+        self.assertEqual(
+            definition_clue(duncan, answer="Ursula Katherine Duncan", max_words=18),
+            "A botanist with a special interest in mosses and lichens, and a lifelong love and knowledge of flowers",
+        )
+        # "to an Italian libretto" is a complete ending.
+        giovanni = "Don Giovanni is an opera in two acts with music by Wolfgang Amadeus Mozart to an Italian libretto by Lorenzo Da Ponte."
+        self.assertEqual(
+            definition_clue(giovanni, answer="Don Giovanni"), "An opera in two acts with music by Wolfgang Amadeus Mozart to an Italian libretto"
+        )
+
+    def test_the_head_of_a_person_may_stop_at_a_comma_with_fewer_than_five_words(self) -> None:
+        vale = (
+            "Ana Vale was a Danish physicist, one of the main pioneers of the theory of heat flow and a principal "
+            "scientist of the Kyoto program of the war effort."
+        )
+        self.assertIsNone(definition_clue(vale, answer="Vale"))
+        self.assertEqual(definition_clue(vale, answer="Vale", person=True), "A Danish physicist")
+        # Before a preposition a cut still keeps five words.
+        fraser = (
+            "Alex Fraser was a major innovator in the development of the computer modeling of population genetics and "
+            "his work has stimulated many advances in genetic research."
+        )
+        self.assertIsNone(definition_clue(fraser, answer="Fraser", person=True))
+
+    def test_the_head_of_a_person_stops_at_the_only_comma_before_and_a_determiner(self) -> None:
+        oller = (
+            "Francisco Manuel Oller y Cestero was a Puerto Rican painter, and the only Latin American artist to have played "
+            "a role in the development of Impressionism."
+        )
+        self.assertEqual(definition_clue(oller, answer="Oller", person=True), "A Puerto Rican painter")
+        # Not a list: the next comma goes on with it.
+        listed = "Ana Vale was a Danish painter, and the first woman to teach, to write, and to lead the national school of art."
+        self.assertIsNone(definition_clue(listed, answer="Vale", person=True))
+
+    def test_wherein_opens_a_relative_clause_and_which_after_a_preposition_has_no_verb_yet(self) -> None:
+        zugzwang = (
+            "Zugzwang is a situation found in chess and other turn-based games wherein one player is put at a disadvantage "
+            "because of their obligation to make a move."
+        )
+        self.assertEqual(definition_clue(zugzwang, answer="Zugzwang"), "A situation found in chess and other turn-based games")
+        pointillism = "Pointillism is a technique of painting in which small, distinct dots of color are applied in patterns to form an image."
+        self.assertIsNone(definition_clue(pointillism, answer="Pointillism"))
+
+    def test_rich_wants_its_preposition(self) -> None:
+        basalt = (
+            "Basalt is an aphanitic extrusive igneous rock formed from the rapid cooling of low-viscosity lava rich in "
+            "magnesium and iron exposed at or very near the surface of a rocky planet or moon."
+        )
+        self.assertEqual(
+            definition_clue(basalt, answer="Basalt"), "An aphanitic extrusive igneous rock formed from the rapid cooling of low-viscosity lava"
+        )
 
     def test_a_cut_does_not_end_on_a_time_noun_that_waits_for_its_complement(self) -> None:
         laine = (
@@ -1423,10 +1585,19 @@ class FollowUpDefinitionTests(unittest.TestCase):
                 self.assertEqual(follow_up_definition(sentence, answer), expected)
 
     def test_it_cuts_like_definition_clue(self) -> None:
-        self.assertEqual(follow_up_definition(self.PIANO, "Earl Hines", max_words=8), "One of the most influential figures")
+        # No cut between "figures" and the "in ..." it wants.
+        self.assertIsNone(follow_up_definition(self.PIANO, "Earl Hines", max_words=8))
         self.assertEqual(
             follow_up_definition(self.PIANO, "Earl Hines", max_words=18),
             "One of the most influential figures in the development of jazz piano",
+        )
+
+    def test_a_capitalised_compound_does_not_name_the_answer_but_a_lower_case_prefix_does(self) -> None:
+        self.assertIsNone(follow_up_definition("Neo-Impressionism was a movement of French painters in the 1880s.", "Impressionism"))
+        self.assertIsNone(follow_up_definition("Post-bop was a style of jazz that developed in the 1960s.", "Bop"))
+        khwarizmi = "Muhammad ibn Musa al-Khwarizmi was a Persian mathematician, astronomer, and geographer who worked in Baghdad."
+        self.assertEqual(
+            definition_clue(khwarizmi, answer="Khwarizmi"), "A Persian mathematician, astronomer, and geographer who worked in Baghdad"
         )
 
     def test_another_subject_or_a_verb_before_the_copula_is_refused(self) -> None:
@@ -1904,6 +2075,61 @@ class GreekDefinitionTests(unittest.TestCase):
         self.assertIsNone(definition_clue(planet, answer="Πλανήτης", lang="el"))
         self.assertIsNone(definition_clue("Heat is the energy of the following kinds of motion in bodies.", answer="Heat"))
         self.assertIsNone(definition_clue("A bra is likewise a vector of the dual space.", answer="Bra"))
+
+    def test_the_verb_of_a_relative_clause_or_an_aside_is_not_the_copula(self) -> None:
+        expansion = (
+            "Στη Φυσική γενικά με τον όρο εκτόνωση εννοείται η αποδέσμευση των τάσεων που είναι συσσωρευμένες σε ένα "
+            "σύστημα που μπορεί να αποτελείται από στερεά, υγρά, αέρια ή και άλλους συνδυασμούς."
+        )
+        self.assertIsNone(definition_clue(expansion, answer="Εκτόνωση", lang="el"))
+        # "όπως είναι ευρέως γνωστός" is an aside; a relative clause with a verb of its own before the copula is not one.
+        feyerabend = (
+            "Ο Πωλ Φεγεράμπεντ ή, όπως είναι ευρέως γνωστός, Πολ Φεγεράμπεντ ήταν Αυστριακός φιλόσοφος της επιστήμης γνωστός "
+            "για την εργασία του ως καθηγητής φιλοσοφίας στο Πανεπιστήμιο Μπέρκλεϊ της Καλιφόρνιας, όπου και εργάστηκε."
+        )
+        self.assertEqual(
+            definition_clue(feyerabend, answer="Φεγεράμπεντ", lang="el"),
+            "Αυστριακός φιλόσοφος της επιστήμης γνωστός για την εργασία του ως καθηγητής φιλοσοφίας",
+        )
+        statue = (
+            "Η Κόρη της Ακρόπολης που εκτίθεται στο εκεί μουσείο με αριθμό ευρετηρίου 680 είναι γλυπτικό έργο, σημαντικό "
+            "δείγμα κοροπλαστικής με απελευθερωμένη κίνηση."
+        )
+        self.assertEqual(
+            definition_clue(statue, answer="Κόρη Ακρόπολης", lang="el"),
+            "Γλυπτικό έργο, σημαντικό δείγμα κοροπλαστικής με απελευθερωμένη κίνηση",
+        )
+
+    def test_a_hyphenated_prefix_belongs_to_the_subject_and_a_noun_keeps_its_preposition(self) -> None:
+        khwarizmi = "Ο Αμπού Αμπντουλάχ Μοχάμεντ ιμπν Μουσά αλ-Χουαρίζμι ήταν Πέρσης μαθηματικός, αστρονόμος και γεωγράφος, ένας λόγιος στον Οίκο της Σοφίας στη Βαγδάτη."
+        self.assertEqual(
+            definition_clue(khwarizmi, answer="Χουαρίζμι", lang="el"),
+            "Πέρσης μαθηματικός, αστρονόμος και γεωγράφος, ένας λόγιος στον Οίκο της Σοφίας στη Βαγδάτη",
+        )
+        mill = (
+            "Ο Τζον Στιούαρτ Μιλ ήταν Βρετανός φιλόσοφος, πολιτικός οικονομολόγος και δημόσιος υπάλληλος με ισχυρή "
+            "συνεισφορά στην κοινωνική και πολιτική θεωρία καθώς και την οικονομία."
+        )
+        self.assertEqual(
+            definition_clue(mill, answer="Μιλ", lang="el"), "Βρετανός φιλόσοφος, πολιτικός οικονομολόγος και δημόσιος υπάλληλος"
+        )
+
+    def test_the_head_of_a_person_may_be_two_words(self) -> None:
+        messier = (
+            "Ο Σαρλ Μεσιέ ήταν Γάλλος αστρονόμος, γνωστός κυρίως από τη σύνταξη του πρώτου ομώνυμου αστρονομικού καταλόγου "
+            "ουράνιων σωμάτων του «βαθέος ουρανού», όπως νεφελώματα, γαλαξίες και αστρικά σμήνη."
+        )
+        self.assertIsNone(definition_clue(messier, answer="Μεσιέ", lang="el"))
+        self.assertEqual(definition_clue(messier, answer="Μεσιέ", lang="el", person=True), "Γάλλος αστρονόμος")
+        verdet = "Ο Μαρσέλ Εμίλ Βερντέ ήταν Γάλλος φυσικός."
+        self.assertIsNone(definition_clue(verdet, answer="Βερντέ", lang="el"))
+        self.assertEqual(definition_clue(verdet, answer="Βερντέ", lang="el", person=True), "Γάλλος φυσικός")
+        # Before a relative word, with no comma: "που ..." starts the clause that is cut off.
+        bjerknes = (
+            "Ο Βίλχελμ Μπγιέρκνες ήταν Νορβηγός φυσικός και μετεωρολόγος που διακρίθηκε για τη συμβολή του στη σύγχρονη "
+            "πρόγνωση του καιρού και στην ανάπτυξη της μετεωρολογικής θεωρίας."
+        )
+        self.assertEqual(definition_clue(bjerknes, answer="Μπγιέρκνες", lang="el", person=True), "Νορβηγός φυσικός και μετεωρολόγος")
 
     def test_no_copula_or_the_wrong_language_means_no_definition(self) -> None:
         self.assertIsNone(definition_clue("Η Μετεωρολογία ανήκει στις θετικές επιστήμες, με κύριο αντικείμενο την έρευνα.", lang="el"))
